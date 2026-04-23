@@ -1,0 +1,7 @@
+services:
+  ficbook-bot:
+    build: .
+    container_name: ficbook-bot
+    restart: unless-stopped
+    env_file:
+      - .env
