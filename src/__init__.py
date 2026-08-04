@@ -1,0 +1,1 @@
+"""Ficbook bot package."""
