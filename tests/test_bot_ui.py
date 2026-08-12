@@ -15,9 +15,10 @@ class BotUiTests(unittest.TestCase):
         self.assertIn("/broadcast", admin_buttons)
         self.assertIn("/queue", admin_buttons)
 
-    def test_welcome_mentions_temporarily_unavailable_sites(self) -> None:
-        self.assertIn("Litnet и AO3 временно недоступны", WELCOME_TEXT)
-        self.assertIn("Ficbook, Wattpad и Hogwartsnet", WELCOME_TEXT)
+    def test_welcome_mentions_ao3_and_free_litnet_books(self) -> None:
+        self.assertIn("Ficbook, AO3, Wattpad, Hogwartsnet", WELCOME_TEXT)
+        self.assertIn("бесплатные книги Litnet", WELCOME_TEXT)
+        self.assertIn("Платные книги Litnet бот не скачивает", WELCOME_TEXT)
 
     def test_queue_status_shows_position_without_total(self) -> None:
         text = queue_status(("fb2", "epub"), 3, 429 * 60)
@@ -26,6 +27,13 @@ class BotUiTests(unittest.TestCase):
         self.assertNotIn("3/", text)
         self.assertIn("Примерное ожидание: 7 часов 9 минут.", text)
         self.assertIn("\n\nФорматы: FB2, EPUB.", text)
+
+    def test_queue_status_explains_ficbook_outage(self) -> None:
+        text = queue_status(("fb2",), 3, 240, ficbook_unavailable=True)
+
+        self.assertIn("Место в очереди: 3.", text)
+        self.assertIn("до восстановления Ficbook", text)
+        self.assertIn("Фанфик скачается, как только сайт снова заработает", text)
 
     def test_duration_uses_russian_plural_forms(self) -> None:
         cases = {

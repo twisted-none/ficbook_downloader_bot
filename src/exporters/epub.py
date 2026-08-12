@@ -69,7 +69,7 @@ def _intro_body(story: Story) -> str:
     if story.word_count:
         meta.append(f"<p>Слов: {escape(story.word_count)}</p>")
     if story.pairings:
-        meta.append(f"<p>Пейринг: {escape(', '.join(story.pairings))}</p>")
+        meta.append(f"<p>Пейринг и персонажи: {escape(', '.join(story.pairings))}</p>")
     annotation = _clean_blocks(story.annotation_html or story.description, "meta")
     return f'<section class="meta">{"".join(meta)}</section>{annotation}' if meta else annotation
 

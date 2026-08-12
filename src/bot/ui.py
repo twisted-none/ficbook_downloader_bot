@@ -20,8 +20,8 @@ WELCOME_TEXT = "\n".join(
     [
         "✨ <b>Привет! Я помогу сохранить фанфик в удобный файл.</b>",
         "",
-        "📚 Сейчас доступны Ficbook, Wattpad и Hogwartsnet.",
-        "⚠️ Litnet и AO3 временно недоступны.",
+        "📚 Сейчас доступны Ficbook, AO3, Wattpad, Hogwartsnet и бесплатные книги Litnet.",
+        "💳 Платные книги Litnet бот не скачивает.",
         "Я скачаю фанфик и отправлю его в выбранных форматах.",
         "🖼 Если включены обложки, добавлю их в поддерживаемые форматы.",
         "✂️ Если включен выбор глав, сначала спрошу, какие главы скачать.",
@@ -217,12 +217,25 @@ def queue_status(
     formats: tuple[str, ...],
     position: int,
     estimated_wait: float,
+    *,
+    ficbook_unavailable: bool = False,
 ) -> str:
+    wait_line = (
+        "Примерное ожидание: до восстановления Ficbook."
+        if ficbook_unavailable
+        else f"Примерное ожидание: {duration_text(estimated_wait)}."
+    )
+    outage_lines = (
+        ["", "Ficbook сейчас не работает.", "Фанфик скачается, как только сайт снова заработает."]
+        if ficbook_unavailable
+        else []
+    )
     return progress_text(
         "\n".join(
             [
                 f"Место в очереди: {position}.",
-                f"Примерное ожидание: {duration_text(estimated_wait)}.",
+                wait_line,
+                *outage_lines,
                 "",
                 f"Форматы: {format_list(formats)}.",
             ]

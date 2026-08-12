@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from configparser import DuplicateSectionError
 from dataclasses import dataclass
+from enum import Enum
 from http.cookiejar import CookieJar
 import json
 import logging
@@ -21,7 +22,13 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from fanficfare import adapters, exceptions
 from fanficfare.configurable import Configuration
 
-from src.sources.litnet import LitnetClient, LitnetError, LitnetLoginError, LitnetRateLimitError
+from src.sources.litnet import (
+    LitnetClient,
+    LitnetError,
+    LitnetLoginError,
+    LitnetPaidBookError,
+    LitnetRateLimitError,
+)
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
 from src.sources.registry import (
     SUPPORTED_HOST_MARKERS,
@@ -77,6 +84,24 @@ class FicbookLoginError(FicbookError):
     """The account assigned to a queue could not authenticate."""
 
 
+class FicbookPaidContentError(FicbookError):
+    """The requested work requires a purchase that the bot does not perform."""
+
+
+class FicbookSiteUnavailableError(FicbookError):
+    """Ficbook is serving a maintenance page instead of the normal site."""
+
+
+class FicbookChapterDownloadError(FicbookError):
+    """A chapter stayed unavailable after source-specific retries."""
+
+
+class FicbookSiteStatus(Enum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class FicbookAccount:
     login: str = ""
@@ -89,6 +114,8 @@ class FicbookAccount:
 
 BLOCK_HTML_TAGS = {"article", "blockquote", "div", "hr", "li", "ol", "p", "section", "ul"}
 MAX_COVER_BYTES = 8 * 1024 * 1024
+FICBOOK_HOME_URL = "https://ficbook.net/"
+FICBOOK_HOME_MAX_BYTES = 512 * 1024
 DATE_VALUE_PATTERN = r"(?:[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{2,4}|[0-9]{1,2}\s+[А-Яа-яЁё]+\s+[0-9]{4})"
 
 
@@ -117,6 +144,29 @@ class FicbookClient:
         self._account_lock = Lock()
         self._next_account_index: dict[str, int] = {}
 
+    def ficbook_site_status(self) -> FicbookSiteStatus:
+        request = Request(
+            FICBOOK_HOME_URL,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; FicbookDownloaderBot/1.0)",
+                "Accept-Language": "ru-RU,ru;q=0.9",
+            },
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                status = int(getattr(response, "status", 200))
+                html = response.read(FICBOOK_HOME_MAX_BYTES).decode("utf-8", "ignore")
+        except HTTPError as exc:
+            try:
+                html = exc.read(FICBOOK_HOME_MAX_BYTES).decode("utf-8", "ignore")
+            except OSError:
+                html = ""
+            return classify_ficbook_homepage(exc.code, html)
+        except Exception:
+            logger.warning("Could not check Ficbook availability", exc_info=True)
+            return FicbookSiteStatus.UNKNOWN
+        return classify_ficbook_homepage(status, html)
+
     def download(
         self,
         url: str,
@@ -127,6 +177,7 @@ class FicbookClient:
         normalized = normalize_url(url)
         site_name = _site_display_name(normalized)
         last_rate_limit: FicbookRateLimitError | None = None
+        last_transient_error: FicbookError | None = None
         accounts = (
             (account,)
             if account is not None and _is_ficbook_url(normalized)
@@ -139,6 +190,7 @@ class FicbookClient:
                     return self._download_once(normalized, account, progress, chapter_numbers)
                 except FicbookRateLimitError as exc:
                     last_rate_limit = exc
+                    last_transient_error = None
                     logger.warning(
                         "%s rate limit for account %s/%s, attempt %s/%s",
                         site_name,
@@ -158,18 +210,34 @@ class FicbookClient:
                         ),
                     )
                     sleep(delay)
+                except FicbookError as exc:
+                    if not _is_ao3_transient_error(normalized, exc):
+                        raise
+                    last_transient_error = exc
+                    last_rate_limit = None
+                    if attempt >= self.retry_attempts:
+                        break
+                    delay = self._retry_delay(attempt)
+                    _report(
+                        progress,
+                        f"AO3 временно отклонил запрос. Повторю попытку через {delay:.0f} сек.",
+                    )
+                    sleep(delay)
         if last_rate_limit:
             raise FicbookRateLimitError(
                 f"{site_name} временно ограничил запросы. Попробуй повторить позже.",
                 technical=getattr(last_rate_limit, "technical", "") or str(last_rate_limit),
                 retry_after=self.retry_max_delay or None,
             ) from last_rate_limit
+        if last_transient_error:
+            raise last_transient_error
         raise FicbookError("Не удалось загрузить фанфик.")
 
     def preview(self, url: str, progress: Callable[[str], None] | None = None) -> StoryPreview:
         normalized = normalize_url(url)
         site_name = _site_display_name(normalized)
         last_rate_limit: FicbookRateLimitError | None = None
+        last_transient_error: FicbookError | None = None
         accounts = self._accounts_for_url(normalized)
         for index, account in enumerate(accounts, 1):
             for attempt in range(1, self.retry_attempts + 1):
@@ -183,16 +251,29 @@ class FicbookClient:
                     return self._preview_once(normalized, account)
                 except FicbookRateLimitError as exc:
                     last_rate_limit = exc
+                    last_transient_error = None
                     if attempt >= self.retry_attempts:
                         break
                     delay = self._retry_delay(attempt)
                     _report(progress, f"{site_name} временно ограничил запросы. Повторю через {delay:.0f} сек.")
+                    sleep(delay)
+                except FicbookError as exc:
+                    if not _is_ao3_transient_error(normalized, exc):
+                        raise
+                    last_transient_error = exc
+                    last_rate_limit = None
+                    if attempt >= self.retry_attempts:
+                        break
+                    delay = self._retry_delay(attempt)
+                    _report(progress, f"AO3 временно отклонил запрос. Повторю через {delay:.0f} сек.")
                     sleep(delay)
         if last_rate_limit:
             raise FicbookError(
                 f"{site_name} временно ограничил запросы. Попробуй повторить скачивание позже.",
                 technical=getattr(last_rate_limit, "technical", "") or str(last_rate_limit),
             ) from last_rate_limit
+        if last_transient_error:
+            raise last_transient_error
         raise FicbookError("Не удалось получить список глав.")
 
     def _download_once(
@@ -205,6 +286,12 @@ class FicbookClient:
         if _is_litnet_url(normalized):
             try:
                 return self.litnet.download(normalized, progress, chapter_numbers)
+            except LitnetPaidBookError as exc:
+                raise FicbookPaidContentError(
+                    str(exc),
+                    technical=repr(exc),
+                    user_message=exc.user_message,
+                ) from exc
             except LitnetLoginError as exc:
                 raise FicbookLoginError(
                     str(exc),
@@ -257,6 +344,15 @@ class FicbookClient:
         except Exception as exc:
             if _is_rate_limited(exc):
                 raise FicbookRateLimitError("Ficbook временно ограничил запросы.", technical=repr(exc)) from exc
+            if self.ficbook_site_status() is FicbookSiteStatus.UNAVAILABLE:
+                raise FicbookSiteUnavailableError(
+                    "Ficbook сейчас не работает и вместо обычной страницы показывает сообщение о недоступности.",
+                    technical=repr(exc),
+                    user_message=(
+                        "Ficbook сейчас не работает. Фанфик останется в очереди и скачается, "
+                        "как только сайт снова заработает."
+                    ),
+                ) from exc
             raise _friendly_download_error(normalized, exc) from exc
         return Story(
             title=story.getMetadata("title") or "ficbook",
@@ -284,6 +380,12 @@ class FicbookClient:
         if _is_litnet_url(normalized):
             try:
                 return self.litnet.preview(normalized)
+            except LitnetPaidBookError as exc:
+                raise FicbookPaidContentError(
+                    str(exc),
+                    technical=repr(exc),
+                    user_message=exc.user_message,
+                ) from exc
             except LitnetLoginError as exc:
                 raise FicbookLoginError(
                     str(exc),
@@ -369,9 +471,14 @@ class FicbookClient:
                 chapters.append(
                     Chapter(
                         title=chapter.get("title") or f"Глава {chapter_index}",
-                        html=adapter.getChapterTextNum(chapter["url"], chapter_index - 1),
+                        html=self._fanficfare_chapter_html(
+                            adapter, normalized, chapter["url"], chapter_index, position,
+                            len(selected_chapters), progress,
+                        ),
                     )
                 )
+        except FicbookChapterDownloadError:
+            raise
         except exceptions.AdultCheckRequired as exc:
             raise FicbookError(
                 self._adult_message(account),
@@ -390,6 +497,27 @@ class FicbookClient:
                 raise FicbookRateLimitError("Сайт временно ограничил запросы.", technical=repr(exc)) from exc
             raise _friendly_download_error(normalized, exc) from exc
         return self._story_from_fanficfare_metadata(story, normalized, chapters)
+
+    def _fanficfare_chapter_html(
+        self, adapter: Any, url: str, chapter_url: str, chapter_index: int,
+        position: int, total: int, progress: Callable[[str], None] | None,
+    ) -> str:
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                return adapter.getChapterTextNum(chapter_url, chapter_index - 1)
+            except Exception as exc:
+                if not _is_ao3_transient_failure(url, exc):
+                    raise
+                if attempt >= self.retry_attempts:
+                    raise FicbookChapterDownloadError(
+                        f"AO3 не отдал главу {chapter_index} после {attempt} попыток.",
+                        technical=repr(exc),
+                        user_message=f"AO3 временно не отдал главу {chapter_index}. Попробуй повторить позже.",
+                    ) from exc
+                delay = self._retry_delay(attempt)
+                _report(progress, f"AO3 не отдал главу {position}/{total}. Повторю через {delay:.0f} сек.")
+                sleep(delay)
+        raise RuntimeError("Unreachable AO3 chapter retry state")
 
     def _preview_fanficfare_once(self, normalized: str, account: FicbookAccount) -> StoryPreview:
         try:
@@ -655,6 +783,8 @@ class FicbookClient:
         }.items():
             if value:
                 config.set("overrides", key, value)
+        if _site_key(url) == "archiveofourown.org":
+            config.set("overrides", "use_view_full_work", "false")
         return config
 
     def _get_story_metadata(self, adapter: Any, url: str, *, get_cover: bool = True) -> Any:
@@ -701,17 +831,16 @@ class FicbookClient:
         story.clear_processed_metadata_cache()
 
     def _fill_pairing_metadata(self, story: Any, soup: BeautifulSoup) -> None:
-        if story.getList("ships"):
-            return
         label = soup.find(string=re.compile(r"П[эе]йринг\s+и\s+персонажи", re.I))
         container = label.parent.find_next("div") if label and isinstance(label.parent, Tag) else None
         if not isinstance(container, Tag):
             return
+        existing = set(story.getList("ships"))
         for link in container.find_all("a", href=re.compile(r"/pairings/")):
-            classes = {str(value) for value in link.get("class", [])}
             value = self._tag_text(link)
-            if value and ("pairing-highlight" in classes or "/" in value):
+            if value and value not in existing:
                 story.addToList("ships", value)
+                existing.add(value)
 
     def _fill_size_metadata(self, story: Any, soup: BeautifulSoup) -> None:
         if story.getMetadata("pages") and story.getMetadata("numWords"):
@@ -856,11 +985,12 @@ class FicbookClient:
                 "Не удалось скачать одну из глав. Попробуй повторить позже.",
                 technical=f"Failed to extract chapter: {url}",
             )
-        parts: list[str] = [self._chapter_content_html(soup, chapter)]
         note_before = soup.select_one("div.part-comment-top div.text-preline")
         note_after = soup.select_one("div.part-comment-bottom div.text-preline")
+        parts: list[str] = []
         if note_before:
             parts.append(self._chapter_note_html(note_before))
+        parts.append(self._chapter_content_html(soup, chapter))
         if note_after:
             parts.append(self._chapter_note_html(note_after))
         return "".join(parts)
@@ -1174,6 +1304,30 @@ def _friendly_preview_error(url: str, error: Exception) -> FicbookError:
     )
 
 
+def classify_ficbook_homepage(status: int, html: str) -> FicbookSiteStatus:
+    text = re.sub(r"\s+", " ", BeautifulSoup(html, "lxml").get_text(" ", strip=True)).lower()
+    unavailable_markers = (
+        "сайт временно недоступен",
+        "сайт сейчас не работает",
+        "сайт в данный момент не работает",
+        "фикбук временно недоступен",
+        "ведутся технические работы",
+        "проводим технические работы",
+        "скоро всё починим",
+        "скоро все починим",
+        "скоро вернёмся",
+        "скоро вернемся",
+        "service unavailable",
+        "temporarily unavailable",
+        "under maintenance",
+    )
+    if 500 <= status < 600 or any(marker in text for marker in unavailable_markers):
+        return FicbookSiteStatus.UNAVAILABLE
+    if 200 <= status < 400:
+        return FicbookSiteStatus.AVAILABLE
+    return FicbookSiteStatus.UNKNOWN
+
+
 def _is_network_error(error: Exception) -> bool:
     if isinstance(error, (HTTPError, URLError, TimeoutError, ConnectionError)):
         return True
@@ -1186,6 +1340,20 @@ def _is_ao3_shields_error(url: str, error: Exception) -> bool:
         return False
     text = repr(error).lower()
     return any(marker in text for marker in ("shields are up", "not a robot", "cloudflare", "challenge-platform"))
+
+
+def _is_ao3_transient_error(url: str, error: FicbookError) -> bool:
+    return not isinstance(error, FicbookChapterDownloadError) and _is_ao3_transient_failure(url, error)
+
+
+def _is_ao3_transient_failure(url: str, error: Exception) -> bool:
+    if _site_key(url) != "archiveofourown.org":
+        return False
+    text = f"{error!r} {getattr(error, 'technical', '')}".lower()
+    return any(
+        marker in text
+        for marker in ("525", "shields are up", "not a robot", "cloudflare", "challenge-platform")
+    )
 
 
 def select_chapter_links(

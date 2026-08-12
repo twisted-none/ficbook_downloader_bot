@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock, patch
 
 from bs4 import BeautifulSoup
 
 from src.core.models import Story
-from src.sources.ficbook import FicbookAccount, FicbookClient, extract_url, normalize_url
+from src.sources.ficbook import (
+    FicbookAccount,
+    FicbookChapterDownloadError,
+    FicbookClient,
+    FicbookError,
+    FicbookSiteStatus,
+    FicbookSiteUnavailableError,
+    classify_ficbook_homepage,
+    extract_url,
+    normalize_url,
+)
 
 
 class FakeStory:
@@ -33,6 +44,60 @@ class FicbookMetadataTests(unittest.TestCase):
     def test_status_is_not_defaulted_to_in_progress(self) -> None:
         soup = BeautifulSoup("<html><body></body></html>", "lxml")
         self.assertEqual(self.client._status_from_soup(soup), "")
+
+    def test_ficbook_maintenance_page_is_classified_as_unavailable(self) -> None:
+        html = "<html><body><h1>Ведутся технические работы</h1><p>Скоро вернёмся</p></body></html>"
+
+        self.assertIs(
+            classify_ficbook_homepage(200, html),
+            FicbookSiteStatus.UNAVAILABLE,
+        )
+
+    def test_normal_ficbook_page_is_classified_as_available(self) -> None:
+        html = "<html><head><title>Книга Фанфиков</title></head><body>Фикбук</body></html>"
+
+        self.assertIs(
+            classify_ficbook_homepage(200, html),
+            FicbookSiteStatus.AVAILABLE,
+        )
+
+    def test_gateway_error_is_classified_as_unavailable(self) -> None:
+        self.assertIs(
+            classify_ficbook_homepage(503, "Service unavailable"),
+            FicbookSiteStatus.UNAVAILABLE,
+        )
+
+    def test_parser_error_becomes_outage_only_after_homepage_check(self) -> None:
+        self.client._build_config = lambda *_: object()  # type: ignore[method-assign]
+        self.client.ficbook_site_status = lambda: FicbookSiteStatus.UNAVAILABLE  # type: ignore[method-assign]
+
+        with patch("src.sources.ficbook.adapters.getAdapter", side_effect=ValueError("parser drift")):
+            with self.assertRaises(FicbookSiteUnavailableError):
+                self.client._download_once(
+                    "https://ficbook.net/readfic/1",
+                    FicbookAccount(),
+                    None,
+                    None,
+                )
+
+    def test_parser_error_stays_normal_when_ficbook_homepage_is_available(self) -> None:
+        self.client._build_config = lambda *_: object()  # type: ignore[method-assign]
+        self.client.ficbook_site_status = lambda: FicbookSiteStatus.AVAILABLE  # type: ignore[method-assign]
+
+        with patch("src.sources.ficbook.adapters.getAdapter", side_effect=ValueError("parser drift")):
+            with self.assertRaises(FicbookError) as raised:
+                self.client._download_once(
+                    "https://ficbook.net/readfic/1",
+                    FicbookAccount(),
+                    None,
+                    None,
+                )
+
+        self.assertNotIsInstance(raised.exception, FicbookSiteUnavailableError)
+        self.assertEqual(
+            str(raised.exception),
+            "Не удалось скачать фанфик с Ficbook. Возможно, сайт изменил страницу или временно отдает неполный ответ.",
+        )
 
     def test_status_and_dates_are_read_from_ficbook_markup(self) -> None:
         soup = BeautifulSoup(
@@ -75,7 +140,7 @@ class FicbookMetadataTests(unittest.TestCase):
         self.assertIn("Дата начала", annotation)
         self.assertIn("Дата завершения", annotation)
 
-    def test_pairing_is_recovered_from_ficbook_markup(self) -> None:
+    def test_pairing_and_characters_are_recovered_from_ficbook_markup(self) -> None:
         story = FakeStory()
         soup = BeautifulSoup(
             """
@@ -90,7 +155,31 @@ class FicbookMetadataTests(unittest.TestCase):
 
         self.client._fill_pairing_metadata(story, soup)
 
-        self.assertEqual(story.getList("ships"), ["Гарри Поттер/Драко Малфой"])
+        self.assertEqual(
+            story.getList("ships"),
+            ["Гарри Поттер/Драко Малфой", "Гермиона Грейнджер"],
+        )
+
+    def test_ficbook_characters_extend_existing_pairings_without_duplicates(self) -> None:
+        story = FakeStory()
+        story.lists["ships"] = ["Гарри Поттер/Драко Малфой"]
+        soup = BeautifulSoup(
+            """
+            <strong>Пейринг и персонажи:</strong>
+            <div>
+              <a class="pairing-highlight" href="/pairings/1">Гарри Поттер/Драко Малфой</a>
+              <a href="/pairings/2">Гермиона Грейнджер</a>
+            </div>
+            """,
+            "lxml",
+        )
+
+        self.client._fill_pairing_metadata(story, soup)
+
+        self.assertEqual(
+            story.getList("ships"),
+            ["Гарри Поттер/Драко Малфой", "Гермиона Грейнджер"],
+        )
 
     def test_interactive_footnotes_are_rendered_after_chapter(self) -> None:
         soup = BeautifulSoup(
@@ -118,6 +207,21 @@ class FicbookMetadataTests(unittest.TestCase):
 
         self.assertIn("[1]", html)
         self.assertIn("Подсказка", html)
+
+    def test_chapter_notes_keep_their_position_around_text(self) -> None:
+        source = """
+            <div class="part-comment-top"><div class="text-preline">Перед главой</div></div>
+            <div id="content"><p>Текст главы</p></div>
+            <div class="part-comment-bottom"><div class="text-preline">После главы</div></div>
+        """
+        adapter = Mock()
+        adapter.get_request.return_value = source
+        adapter.make_soup.side_effect = lambda html: BeautifulSoup(html, "lxml")
+
+        html = self.client._load_chapter_html(adapter, "https://ficbook.net/readfic/1/1")
+
+        self.assertLess(html.index("Перед главой"), html.index("Текст главы"))
+        self.assertLess(html.index("Текст главы"), html.index("После главы"))
 
     def test_supported_site_urls_are_extracted(self) -> None:
         urls = [
@@ -148,6 +252,57 @@ class FicbookMetadataTests(unittest.TestCase):
 
         self.assertEqual(first[0].login, "one")
         self.assertEqual(second[0].login, "two")
+
+    def test_ao3_disables_full_work_request(self) -> None:
+        config = self.client._build_config(
+            "https://archiveofourown.org/works/10057010",
+            FicbookAccount(),
+        )
+
+        self.assertEqual(config.get("overrides", "use_view_full_work"), "false")
+
+    def test_ao3_transient_525_is_retried(self) -> None:
+        client = FicbookClient(retry_attempts=2, retry_base_delay=0)
+        attempts = 0
+
+        def fake_download(normalized, account, progress, chapter_numbers):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise FicbookError("AO3 temporary response", technical="HTTP 525")
+            return Story(title="Title", author="Author", source_url=normalized)
+
+        client._download_once = fake_download  # type: ignore[method-assign]
+
+        story = client.download("https://archiveofourown.org/works/10057010")
+
+        self.assertEqual(story.title, "Title")
+        self.assertEqual(attempts, 2)
+
+    def test_ao3_525_retries_only_current_chapter(self) -> None:
+        client = FicbookClient(retry_attempts=2, retry_base_delay=0)
+        adapter = Mock()
+        adapter.getChapterTextNum.side_effect = [RuntimeError("HTTP 525"), "<p>Chapter</p>"]
+        updates: list[str] = []
+
+        html = client._fanficfare_chapter_html(
+            adapter, "https://archiveofourown.org/works/1", "chapter-url", 4, 4, 10, updates.append,
+        )
+
+        self.assertEqual(html, "<p>Chapter</p>")
+        self.assertEqual(adapter.getChapterTextNum.call_count, 2)
+        self.assertIn("главу 4/10", updates[0])
+
+    def test_exhausted_ao3_chapter_retry_is_not_restarted_from_beginning(self) -> None:
+        client = FicbookClient(retry_attempts=3, retry_base_delay=0)
+        client._download_once = Mock(
+            side_effect=FicbookChapterDownloadError("chapter failed", technical="HTTP 525")
+        )
+
+        with self.assertRaises(FicbookChapterDownloadError):
+            client.download("https://archiveofourown.org/works/1")
+
+        self.assertEqual(client._download_once.call_count, 1)
 
     def test_download_uses_explicit_queue_account_only(self) -> None:
         first = FicbookAccount("one", "p")

@@ -186,6 +186,8 @@ class DownloadQueuePool:
         self._disabled_slots: set[int] = set()
         self._cooldown_until: dict[int, float] = {}
         self._assignment_lock = Lock()
+        self._site_state_lock = Lock()
+        self._unavailable_sites: set[str] = set()
 
     def assign(self, url: str) -> QueueAssignment:
         key = site_key(url)
@@ -226,6 +228,18 @@ class DownloadQueuePool:
         queues = [*self._ficbook_queues, *self._site_queues.values()]
         counts = await asyncio.gather(*(queue.total_jobs() for queue in queues))
         return sum(counts)
+
+    def mark_site_unavailable(self, key: str) -> None:
+        with self._site_state_lock:
+            self._unavailable_sites.add(key)
+
+    def mark_site_available(self, key: str) -> None:
+        with self._site_state_lock:
+            self._unavailable_sites.discard(key)
+
+    def is_site_unavailable(self, key: str) -> bool:
+        with self._site_state_lock:
+            return key in self._unavailable_sites
 
     def for_url(self, url: str) -> DownloadQueue:
         return self.assign(url).queue

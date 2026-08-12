@@ -6,7 +6,7 @@ from urllib.parse import parse_qs
 from bs4 import BeautifulSoup
 
 from src.core.models import Chapter
-from src.sources.litnet import LitnetClient, LitnetError, LitnetLoginError
+from src.sources.litnet import LitnetClient, LitnetError, LitnetLoginError, LitnetPaidBookError
 from src.sources.registry import extract_url, normalize_url
 
 
@@ -92,6 +92,27 @@ class LitnetTests(unittest.TestCase):
 
         with self.assertRaisesRegex(LitnetError, "нет доступа"):
             client._chapter_html(soup)
+
+    def test_paid_book_returns_clear_user_message(self) -> None:
+        client = LitnetClient()
+        soup = BeautifulSoup(
+            "<div class='buy-button-container'><a class='js-start-buy-metrics'>Купить 159 RUB</a></div>",
+            "lxml",
+        )
+
+        with self.assertRaises(LitnetPaidBookError) as raised:
+            client._ensure_free_book(soup)
+
+        self.assertEqual(
+            raised.exception.user_message,
+            "Эта книга платная. Бот скачивает только бесплатные книги Litnet.",
+        )
+
+    def test_free_book_without_purchase_button_is_allowed(self) -> None:
+        client = LitnetClient()
+        soup = BeautifulSoup("<button>Читать</button><span>Бесплатно</span>", "lxml")
+
+        client._ensure_free_book(soup)
 
     def test_public_preview_does_not_require_configured_login(self) -> None:
         client = LitnetClient("configured", "configured")

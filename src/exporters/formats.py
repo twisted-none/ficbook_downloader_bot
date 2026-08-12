@@ -53,7 +53,7 @@ def build_txt(story: Story) -> bytes:
     if story.word_count:
         parts.append(f"Слов: {story.word_count}")
     if story.pairings:
-        parts.append(f"Пейринг: {_pairing_text(story)}")
+        parts.append(f"Пейринг и персонажи: {_pairing_text(story)}")
     annotation = _html_to_text(story.annotation_html or story.description)
     if annotation:
         parts.extend(["Аннотация:", annotation])
@@ -77,7 +77,7 @@ def build_docx(story: Story) -> bytes:
     if story.word_count:
         document.add_paragraph(f"Слов: {story.word_count}")
     if story.pairings:
-        document.add_paragraph(f"Пейринг: {_pairing_text(story)}")
+        document.add_paragraph(f"Пейринг и персонажи: {_pairing_text(story)}")
     _add_docx_toc(document, story)
     annotation = _html_to_blocks(story.annotation_html or story.description)
     if annotation:
@@ -117,7 +117,7 @@ def build_pdf(story: Story) -> bytes:
     if story.word_count:
         flow.append(Paragraph(f"Слов: {_pdf_escape(story.word_count)}", styles["Meta"]))
     if story.pairings:
-        flow.append(Paragraph(f"Пейринг: {_pdf_escape(_pairing_text(story))}", styles["Meta"]))
+        flow.append(Paragraph(f"Пейринг и персонажи: {_pdf_escape(_pairing_text(story))}", styles["Meta"]))
     flow.append(Spacer(1, 0.5 * cm))
     annotation = _html_to_blocks(story.annotation_html or story.description)
     if annotation:

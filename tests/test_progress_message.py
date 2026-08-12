@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import unittest
 import asyncio
+from time import monotonic
+from types import SimpleNamespace
 
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import EditMessageText
 
-from src.bot.app import DownloadProgressState, ProgressMessage
+from src.bot.app import DownloadProgressState, ProgressMessage, TelegramEditGate
 
 
 class FakeProgressMessage:
@@ -52,7 +54,25 @@ class NotModifiedProgressMessage:
         )
 
 
+class TimedProgressMessage:
+    def __init__(self, chat_id: int) -> None:
+        self.chat = SimpleNamespace(id=chat_id)
+        self.edited_at = 0.0
+
+    async def edit_text(self, _: str) -> None:
+        self.edited_at = monotonic()
+
+
 class ProgressMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_edit_gate_serializes_parallel_edits(self) -> None:
+        gate = TelegramEditGate(min_interval=0.02)
+        first = TimedProgressMessage(1)
+        second = TimedProgressMessage(1)
+
+        await asyncio.gather(gate.edit(first, "first"), gate.edit(second, "second"))
+
+        self.assertGreaterEqual(abs(second.edited_at - first.edited_at), 0.015)
+
     async def test_retry_after_is_swallowed_and_throttles_next_edits(self) -> None:
         message = FakeProgressMessage()
         progress = ProgressMessage(message, min_interval=0)

@@ -72,7 +72,10 @@ from src.sources.ficbook import (
     FicbookError,
     FicbookLoginError,
     FicbookNotFoundError,
+    FicbookPaidContentError,
     FicbookRateLimitError,
+    FicbookSiteStatus,
+    FicbookSiteUnavailableError,
     extract_url,
 )
 from src.exporters.formats import ALLOWED_FORMATS, build_docx, build_pdf, build_txt, normalize_formats
@@ -88,6 +91,51 @@ _support_waiting: set[int] = set()
 _reply_waiting: dict[int, int] = {}
 _settings_drafts: dict[int, "SettingsSession"] = {}
 _chapter_waiting: dict[int, "PendingChapterSelection"] = {}
+FICBOOK_SITE_RECHECK_SECONDS = 60.0
+ACTIVE_PROGRESS_UPDATE_SECONDS = 5.0
+
+
+class TelegramEditGate:
+    _MAX_TRACKED_CHATS = 1024
+    _STALE_CHAT_SECONDS = 600.0
+
+    def __init__(self, min_interval: float = 1.1) -> None:
+        self._min_interval = min_interval
+        self._guard = asyncio.Lock()
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._last_edit: dict[int, float] = {}
+
+    async def edit(self, message: Message, text: str) -> None:
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        if chat_id is None:
+            await message.edit_text(text)
+            return
+        async with self._guard:
+            if chat_id not in self._locks and len(self._locks) >= self._MAX_TRACKED_CHATS:
+                self._prune_stale_chats()
+            lock = self._locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            delay = self._min_interval - (monotonic() - self._last_edit.get(chat_id, 0.0))
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                await message.edit_text(text)
+            finally:
+                self._last_edit[chat_id] = monotonic()
+
+    def _prune_stale_chats(self) -> None:
+        cutoff = monotonic() - self._STALE_CHAT_SECONDS
+        stale = [
+            chat_id
+            for chat_id, edited_at in self._last_edit.items()
+            if edited_at < cutoff and not self._locks[chat_id].locked()
+        ]
+        for chat_id in stale:
+            self._locks.pop(chat_id, None)
+            self._last_edit.pop(chat_id, None)
+
+
+_telegram_edit_gate = TelegramEditGate()
 
 
 class ProgressMessage:
@@ -123,18 +171,22 @@ class ProgressMessage:
                 self._schedule_pending_locked(text, force=force, delay=self._min_interval - (now - self._last_edited_at))
                 return
             try:
-                await self._message.edit_text(text)
+                await _telegram_edit_gate.edit(self._message, text)
             except TelegramRetryAfter as exc:
                 retry_after = float(getattr(exc, "retry_after", 60))
                 self._retry_after_until = monotonic() + retry_after + 1.0
                 self._schedule_pending_locked(text, force=force, delay=retry_after + 1.0)
                 logger.warning("Telegram throttled progress edit for %.0f seconds", retry_after)
                 return
-            except TelegramBadRequest:
-                logger.debug("Failed to edit progress message", exc_info=True)
+            except TelegramBadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    self._last_text = text
+                    self._last_edited_at = monotonic()
+                    return
+                logger.warning("Failed to edit progress message: %s", exc)
                 return
             self._last_text = text
-            self._last_edited_at = now
+            self._last_edited_at = monotonic()
 
     async def set_required(self, text: str) -> bool:
         while True:
@@ -151,7 +203,7 @@ class ProgressMessage:
                     delay = self._retry_after_until - now
                 else:
                     try:
-                        await self._message.edit_text(text)
+                        await _telegram_edit_gate.edit(self._message, text)
                     except TelegramRetryAfter as exc:
                         retry_after = float(getattr(exc, "retry_after", 60))
                         self._retry_after_until = monotonic() + retry_after + 1.0
@@ -653,6 +705,9 @@ async def _ask_chapter_selection(
     progress = ProgressMessage(status)
     try:
         preview = await asyncio.to_thread(ficbook_client.preview, url, progress.from_thread)
+    except FicbookPaidContentError as exc:
+        await _replace_status_with_notice(message, status, admin_chat_id, _user_error_message(exc))
+        return
     except FicbookNotFoundError as exc:
         await _replace_status_with_error(
             message,
@@ -718,6 +773,10 @@ async def _process_download(
                     formats,
                     estimate.position,
                     estimate.estimated_wait_seconds,
+                    ficbook_unavailable=(
+                        current.ficbook_slot is not None
+                        and download_queues.is_site_unavailable("ficbook.net")
+                    ),
                 )
                 if status is None or progress is None:
                     status = await message.answer(
@@ -749,41 +808,47 @@ async def _process_download(
                 if progress is None:
                     raise RuntimeError("Active download status was not created")
                 active_progress = progress
-                first_progress_update: Future[None] | None = None
+                while True:
+                    site_unavailable = False
 
-                def observe_progress(text: str) -> None:
-                    nonlocal first_progress_update
-                    progress_state.observe(text)
-                    update = active_progress.from_thread(
-                        _active_download_status(formats, progress_state.percent())
+                    def observe_progress(text: str) -> None:
+                        progress_state.observe(text)
+
+                    updater = asyncio.create_task(
+                        _active_progress_updater(active_progress, progress_state, formats)
                     )
-                    if first_progress_update is None:
-                        first_progress_update = update
-
-                updater = asyncio.create_task(
-                    _active_progress_updater(active_progress, progress_state, formats)
-                )
-                try:
-                    async with ChatActionSender.upload_document(bot=message.bot, chat_id=message.chat.id):
-                        story = await asyncio.to_thread(
-                            ficbook_client.download,
-                            url,
-                            observe_progress,
-                            chapter_numbers=chapter_numbers,
-                            account=current.account,
-                        )
-                        if first_progress_update is not None:
-                            await asyncio.gather(
-                                asyncio.wrap_future(first_progress_update),
-                                return_exceptions=True,
+                    try:
+                        async with ChatActionSender.upload_document(bot=message.bot, chat_id=message.chat.id):
+                            story = await asyncio.to_thread(
+                                ficbook_client.download,
+                                url,
+                                observe_progress,
+                                chapter_numbers=chapter_numbers,
+                                account=current.account,
                             )
-                        if not cover_enabled:
-                            story.cover = None
-                        files = await _build_selected_files(story, formats, progress_state)
-                        return story, files
-                finally:
-                    updater.cancel()
-                    await asyncio.gather(updater, return_exceptions=True)
+                    except FicbookSiteUnavailableError:
+                        if current.ficbook_slot is None:
+                            raise
+                        site_unavailable = True
+                    finally:
+                        updater.cancel()
+                        await asyncio.gather(updater, return_exceptions=True)
+                    if not site_unavailable:
+                        if current.ficbook_slot is not None:
+                            download_queues.mark_site_available("ficbook.net")
+                        break
+                    download_queues.mark_site_unavailable("ficbook.net")
+                    await _wait_for_ficbook_recovery(
+                        ficbook_client,
+                        download_queues,
+                        active_progress,
+                        formats,
+                    )
+                    progress_state.start_attempt()
+                if not cover_enabled:
+                    story.cover = None
+                files = await _build_selected_files(story, formats, progress_state)
+                return story, files
 
             level = PREMIUM_PRIORITY if priority else FAILOVER_PRIORITY if failover else 0
             try:
@@ -837,6 +902,9 @@ async def _process_download(
             await status.delete()
         except TelegramBadRequest:
             logger.debug("Failed to delete completed progress message", exc_info=True)
+    except FicbookPaidContentError as exc:
+        await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
+        await _replace_status_with_notice(message, status, admin_chat_id, _user_error_message(exc))
     except FicbookNotFoundError as exc:
         await _discard_download(analytics_store, download_id)
         await _replace_status_with_error(
@@ -869,8 +937,28 @@ async def _active_progress_updater(
     formats: tuple[str, ...],
 ) -> None:
     while True:
-        await asyncio.sleep(5.0)
+        await asyncio.sleep(ACTIVE_PROGRESS_UPDATE_SECONDS)
         await progress.set(_active_download_status(formats, state.percent()))
+
+
+async def _wait_for_ficbook_recovery(
+    client: FicbookClient,
+    queues: DownloadQueuePool,
+    progress: ProgressMessage,
+    formats: tuple[str, ...],
+) -> None:
+    await progress.set(
+        _queue_status(formats, 1, 0, ficbook_unavailable=True),
+        force=True,
+    )
+    while True:
+        await asyncio.sleep(FICBOOK_SITE_RECHECK_SECONDS)
+        status = await asyncio.to_thread(client.ficbook_site_status)
+        if status is not FicbookSiteStatus.AVAILABLE:
+            continue
+        queues.mark_site_available("ficbook.net")
+        await progress.set(_active_download_status(formats, 0), force=True)
+        return
 
 
 async def _replace_status_with_error(
@@ -891,6 +979,23 @@ async def _replace_status_with_error(
     await message.answer(
         _download_error_text(error, admin_notified=admin_notified),
         reply_markup=reply_markup,
+    )
+
+
+async def _replace_status_with_notice(
+    message: Message,
+    status: Message | None,
+    admin_chat_id: int | None,
+    text: str,
+) -> None:
+    if status is not None:
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            logger.debug("Failed to delete progress message before notice", exc_info=True)
+    await message.answer(
+        text,
+        reply_markup=_main_keyboard_for_message(message, admin_chat_id),
     )
 
 

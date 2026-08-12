@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import unittest
 
 from src.bot.app import _notify_admin, _user_error_message
-from src.sources.ficbook import FicbookAccount, FicbookClient, FicbookLoginError
-from src.sources.litnet import LitnetLoginError
+from src.sources.ficbook import FicbookAccount, FicbookClient, FicbookError, FicbookLoginError
+from src.sources.litnet import LitnetLoginError, LitnetPaidBookError
 
 
 DETAIL = "Не удалось войти в Litnet. Проверь LITNET_LOGIN и LITNET_PASSWORD."
@@ -43,6 +43,26 @@ class ErrorMessageTests(unittest.IsolatedAsyncioTestCase):
         error = FicbookLoginError("Проверь SITE_LOGIN и SITE_PASSWORD в .env.")
 
         self.assertEqual(_user_error_message(error), "Авторизация на сайте не сработала.")
+
+    def test_paid_litnet_book_keeps_clear_user_message(self) -> None:
+        client = FicbookClient()
+
+        def fail(*_: object) -> None:
+            raise LitnetPaidBookError()
+
+        client.litnet.download = fail  # type: ignore[method-assign]
+        with self.assertRaises(FicbookError) as raised:
+            client._download_once(
+                "https://litnet.com/ru/reader/test-b1",
+                FicbookAccount(),
+                None,
+                None,
+            )
+
+        self.assertEqual(
+            _user_error_message(raised.exception),
+            "Эта книга платная. Бот скачивает только бесплатные книги Litnet.",
+        )
 
     async def test_alert_bot_still_receives_detailed_message(self) -> None:
         alert_bot = AlertBot()

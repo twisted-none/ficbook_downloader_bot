@@ -74,6 +74,19 @@ class DownloadQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(ao3_first.queue, ao3_second.queue)
         self.assertIsNot(ao3_first.queue, litnet.queue)
 
+    async def test_pool_shares_ficbook_outage_state_across_account_queues(self) -> None:
+        accounts = tuple(FakeAccount(str(index)) for index in range(1, 3))
+        pool = DownloadQueuePool(ficbook_accounts=accounts)
+
+        pool.mark_site_unavailable("ficbook.net")
+        first = pool.assign("https://ficbook.net/readfic/1")
+        second = pool.assign("https://ficbook.net/readfic/2")
+
+        self.assertIsNot(first.queue, second.queue)
+        self.assertTrue(pool.is_site_unavailable("ficbook.net"))
+        pool.mark_site_available("ficbook.net")
+        self.assertFalse(pool.is_site_unavailable("ficbook.net"))
+
     async def test_priorities_are_ordered_without_preempting_active_job(self) -> None:
         queue = DownloadQueue()
         release = asyncio.Event()

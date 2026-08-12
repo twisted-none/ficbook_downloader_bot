@@ -41,6 +41,14 @@ class LitnetAccessError(LitnetError):
     pass
 
 
+class LitnetPaidBookError(LitnetAccessError):
+    def __init__(self, message: str = "Litnet book requires purchase") -> None:
+        super().__init__(
+            message,
+            user_message="Эта книга платная. Бот скачивает только бесплатные книги Litnet.",
+        )
+
+
 class LitnetRateLimitError(LitnetError):
     pass
 
@@ -69,6 +77,7 @@ class LitnetClient:
         with self._lock:
             reader = self._soup(url)
             book = self._soup(url.replace("/reader/", "/book/"))
+            self._ensure_free_book(book)
             try:
                 chapters = self._chapters(reader)
             except LitnetAccessError:
@@ -96,6 +105,8 @@ class LitnetClient:
     def preview(self, url: str) -> StoryPreview:
         with self._lock:
             reader = self._soup(url)
+            book = self._soup(url.replace("/reader/", "/book/"))
+            self._ensure_free_book(book)
             try:
                 chapters = self._chapters(reader)
             except LitnetAccessError:
@@ -234,6 +245,14 @@ class LitnetClient:
         if not BeautifulSoup(html, "lxml").get_text(" ", strip=True):
             raise LitnetError("Litnet вернул пустой текст главы.")
         return html
+
+    def _ensure_free_book(self, soup: BeautifulSoup) -> None:
+        purchase = soup.select_one(".buy-button-container .js-start-buy-metrics")
+        if not isinstance(purchase, Tag):
+            return
+        text = self._text(purchase)
+        if re.search(r"\b(?:купить|подписка)\b", text, re.I):
+            raise LitnetPaidBookError(f"Litnet purchase button found: {text}")
 
     def _select_chapters(
         self,

@@ -48,7 +48,7 @@ def _info_section_xml(story: Story) -> str:
         ("Автор", story.author),
         ("Страниц", story.page_count),
         ("Слов", story.word_count),
-        ("Пейринг", ", ".join(story.pairings)),
+        ("Пейринг и персонажи", ", ".join(story.pairings)),
         ("Ссылка", story.source_url),
     ]
     paragraphs = "".join(f"<p>{escape(label)}: {escape(value)}</p>" for label, value in rows if value)
