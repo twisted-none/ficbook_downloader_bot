@@ -14,7 +14,13 @@ from typing import Any
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
@@ -93,6 +99,8 @@ _settings_drafts: dict[int, "SettingsSession"] = {}
 _chapter_waiting: dict[int, "PendingChapterSelection"] = {}
 FICBOOK_SITE_RECHECK_SECONDS = 60.0
 ACTIVE_PROGRESS_UPDATE_SECONDS = 5.0
+TELEGRAM_SEND_ATTEMPTS = 3
+TELEGRAM_SEND_RETRY_DELAY_SECONDS = 3.0
 
 
 class TelegramEditGate:
@@ -178,6 +186,10 @@ class ProgressMessage:
                 self._schedule_pending_locked(text, force=force, delay=retry_after + 1.0)
                 logger.warning("Telegram throttled progress edit for %.0f seconds", retry_after)
                 return
+            except (TelegramNetworkError, TelegramServerError) as exc:
+                logger.warning("Telegram transient error while editing progress: %s", exc)
+                self._schedule_pending_locked(text, force=force, delay=TELEGRAM_SEND_RETRY_DELAY_SECONDS)
+                return
             except TelegramBadRequest as exc:
                 if "message is not modified" in str(exc).lower():
                     self._last_text = text
@@ -208,6 +220,9 @@ class ProgressMessage:
                         retry_after = float(getattr(exc, "retry_after", 60))
                         self._retry_after_until = monotonic() + retry_after + 1.0
                         delay = retry_after + 1.0
+                    except (TelegramNetworkError, TelegramServerError) as exc:
+                        logger.warning("Telegram transient error while setting required progress: %s", exc)
+                        return False
                     except TelegramBadRequest as exc:
                         if "message is not modified" in str(exc).lower():
                             self._last_text = text
@@ -889,17 +904,25 @@ async def _process_download(
         final_status_updated = await progress.set_required(final_text)
         if not final_status_updated:
             logger.warning(
-                "Sending completed download after Telegram rejected final status edit: chat_id=%s",
+                "Sending completed download after Telegram did not update final status: chat_id=%s",
                 message.chat.id,
             )
         for index, (fmt, payload) in enumerate(files, 1):
-            await message.answer_document(
-                BufferedInputFile(payload, filename=f"{file_stem}.{fmt}"),
+            await _answer_document_with_retry(
+                message,
+                payload,
+                filename=f"{file_stem}.{fmt}",
                 caption=f"{story.title} ({fmt.upper()})",
-                reply_markup=_main_keyboard_for_message(message, admin_chat_id) if index == len(files) else None,
+                reply_markup=(
+                    _main_keyboard_for_message(message, admin_chat_id)
+                    if index == len(files)
+                    else None
+                ),
             )
         try:
             await status.delete()
+        except (TelegramNetworkError, TelegramServerError):
+            logger.warning("Telegram transient error while deleting completed progress message", exc_info=True)
         except TelegramBadRequest:
             logger.debug("Failed to delete completed progress message", exc_info=True)
     except FicbookPaidContentError as exc:
@@ -941,6 +964,42 @@ async def _active_progress_updater(
         await progress.set(_active_download_status(formats, state.percent()))
 
 
+async def _answer_document_with_retry(
+    message: Message,
+    payload: bytes,
+    *,
+    filename: str,
+    caption: str,
+    reply_markup: Any,
+) -> None:
+    for attempt in range(1, TELEGRAM_SEND_ATTEMPTS + 1):
+        try:
+            await message.answer_document(
+                BufferedInputFile(payload, filename=filename),
+                caption=caption,
+                reply_markup=reply_markup,
+            )
+            return
+        except (TelegramNetworkError, TelegramServerError) as exc:
+            if attempt >= TELEGRAM_SEND_ATTEMPTS:
+                raise FicbookError(
+                    "Telegram API не принял файл после нескольких попыток.",
+                    technical=repr(exc),
+                    user_message=(
+                        "Не удалось отправить готовый файл из-за временного сбоя Telegram. "
+                        "Попробуй повторить позже."
+                    ),
+                ) from exc
+            logger.warning(
+                "Telegram transient error while sending %s, retrying attempt %s/%s",
+                filename,
+                attempt + 1,
+                TELEGRAM_SEND_ATTEMPTS,
+                exc_info=True,
+            )
+            await asyncio.sleep(TELEGRAM_SEND_RETRY_DELAY_SECONDS)
+
+
 async def _wait_for_ficbook_recovery(
     client: FicbookClient,
     queues: DownloadQueuePool,
@@ -973,6 +1032,11 @@ async def _replace_status_with_error(
     if status is not None:
         try:
             await status.delete()
+        except (TelegramNetworkError, TelegramServerError):
+            logger.warning(
+                "Telegram transient error while deleting progress message before error response",
+                exc_info=True,
+            )
         except TelegramBadRequest:
             logger.debug("Failed to delete progress message before error response", exc_info=True)
     reply_markup = _support_keyboard() if support else _main_keyboard_for_message(message, admin_chat_id)
@@ -991,6 +1055,11 @@ async def _replace_status_with_notice(
     if status is not None:
         try:
             await status.delete()
+        except (TelegramNetworkError, TelegramServerError):
+            logger.warning(
+                "Telegram transient error while deleting progress message before notice",
+                exc_info=True,
+            )
         except TelegramBadRequest:
             logger.debug("Failed to delete progress message before notice", exc_info=True)
     await message.answer(
