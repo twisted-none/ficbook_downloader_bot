@@ -4,7 +4,8 @@ Telegram-бот на `aiogram`, который принимает ссылки �
 
 ## Возможности
 
-- принимает ссылки Ficbook, AO3, Wattpad, Hogwartsnet и Litnet
+- принимает ссылки Ficbook, AO3, Wattpad, Hogwartsnet, RanobeLIB и Litnet
+- скачивает публичные книги RanobeLIB без аккаунта, включая обложку и выбранные главы
 - скачивает бесплатные книги Litnet и сразу сообщает, если книга платная
 - скачивает многоглавные фанфики по главам
 - умеет скачивать только выбранные главы в формате `1,2,5-10,17`
@@ -49,6 +50,7 @@ docker compose up --build -d
 - `WATTPAD_LOGIN`, `WATTPAD_PASSWORD` — логин и пароль Wattpad, если работа требует вход
 - `HOGWARTSNET_LOGIN`, `HOGWARTSNET_PASSWORD` — логин и пароль Hogwartsnet для закрытого доступа
 - `LITNET_LOGIN`, `LITNET_PASSWORD` — необязательные данные Litnet; бесплатные книги работают без входа
+- `RANOBELIB_LOGIN`, `RANOBELIB_PASSWORD` — аккаунт RanobeLIB для закрытых глав
 - `FICBOOK_MAX_CONCURRENT_DOWNLOADS` — устаревшая совместимая настройка; параллельность определяется аккаунтами
 - `FICBOOK_DOWNLOAD_INTERVAL_SECONDS` — минимальная пауза между стартами скачиваний, по умолчанию `8`
 - `FICBOOK_REQUEST_DELAY_SECONDS` — пауза между запросами к Ficbook внутри одного скачивания, по умолчанию `1.5`
@@ -79,7 +81,7 @@ docker compose up --build -d
 src/
 ├── bot/          # Telegram handlers, keyboards and session types
 ├── core/         # configuration, models, chapter parser and queues
-├── sources/      # Ficbook, Litnet and source URL adapters
+├── sources/      # Ficbook, RanobeLIB, Litnet and source URL adapters
 ├── exporters/    # FB2, EPUB, TXT, DOCX and PDF generation
 ├── storage/      # PostgreSQL analytics and user settings
 ├── monitoring/   # Prometheus metrics endpoint

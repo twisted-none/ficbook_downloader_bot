@@ -70,9 +70,12 @@ class DownloadQueueTests(unittest.IsolatedAsyncioTestCase):
         ao3_first = pool.assign("https://archiveofourown.org/works/1")
         ao3_second = pool.assign("https://archiveofourown.org/works/2")
         litnet = pool.assign("https://litnet.com/ru/reader/book-b1")
+        ranobelib = pool.assign("https://ranobelib.me/ru/42--test-novel")
 
         self.assertIs(ao3_first.queue, ao3_second.queue)
         self.assertIsNot(ao3_first.queue, litnet.queue)
+        self.assertIsNot(ranobelib.queue, litnet.queue)
+        self.assertIsNot(ranobelib.queue, ao3_first.queue)
 
     async def test_pool_shares_ficbook_outage_state_across_account_queues(self) -> None:
         accounts = tuple(FakeAccount(str(index)) for index in range(1, 3))

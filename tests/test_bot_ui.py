@@ -17,6 +17,7 @@ class BotUiTests(unittest.TestCase):
 
     def test_welcome_mentions_ao3_and_free_litnet_books(self) -> None:
         self.assertIn("Ficbook, AO3, Wattpad, Hogwartsnet", WELCOME_TEXT)
+        self.assertIn("RanobeLIB", WELCOME_TEXT)
         self.assertIn("бесплатные книги Litnet", WELCOME_TEXT)
         self.assertIn("Платные книги Litnet бот не скачивает", WELCOME_TEXT)
 

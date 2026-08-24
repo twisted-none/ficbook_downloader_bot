@@ -1062,6 +1062,7 @@ async def run_bot(settings: Settings) -> None:
     analytics_store = AnalyticsStore(settings.database_url)
     ficbook_accounts = _ficbook_accounts(settings)
     _account_pair(settings.litnet_login, settings.litnet_password, "LITNET_LOGIN")
+    _account_pair(settings.ranobelib_login, settings.ranobelib_password, "RANOBELIB_LOGIN")
     dispatcher = create_dispatcher(
         FicbookClient(
             accounts=ficbook_accounts,
@@ -1072,6 +1073,8 @@ async def run_bot(settings: Settings) -> None:
             retry_max_delay=settings.ficbook_retry_max_delay_seconds,
             litnet_login=settings.litnet_login,
             litnet_password=settings.litnet_password,
+            ranobelib_login=settings.ranobelib_login,
+            ranobelib_password=settings.ranobelib_password,
         ),
         settings.admin_chat_id,
         alert_bot,

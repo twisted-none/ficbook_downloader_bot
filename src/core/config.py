@@ -30,6 +30,8 @@ class Settings:
     hogwartsnet_password: str
     litnet_login: str
     litnet_password: str
+    ranobelib_login: str
+    ranobelib_password: str
     admin_chat_id: int | None
     log_level: str
     data_dir: Path
@@ -71,6 +73,8 @@ def load_settings() -> Settings:
         hogwartsnet_password=os.getenv("HOGWARTSNET_PASSWORD", "").strip(),
         litnet_login=os.getenv("LITNET_LOGIN", "").strip(),
         litnet_password=os.getenv("LITNET_PASSWORD", "").strip(),
+        ranobelib_login=os.getenv("RANOBELIB_LOGIN", "").strip(),
+        ranobelib_password=os.getenv("RANOBELIB_PASSWORD", "").strip(),
         admin_chat_id=_parse_chat_id(os.getenv("ADMIN_CHAT_ID", "").strip()),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         data_dir=Path(os.getenv("DATA_DIR", "data")).resolve(),

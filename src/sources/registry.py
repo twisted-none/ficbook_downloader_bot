@@ -10,6 +10,7 @@ SUPPORTED_HOST_MARKERS = (
     "wattpad.com",
     "hogwartsnet.ru",
     "litnet.com",
+    "ranobelib.me",
 )
 
 
@@ -33,6 +34,9 @@ def normalize_url(url: str) -> str:
     if host.replace("www.", "") == "litnet.com":
         scheme = "https"
         host = "litnet.com"
+    if host.replace("www.", "") == "ranobelib.me":
+        scheme = "https"
+        host = "ranobelib.me"
     path = parts.path.rstrip("/")
     query = parts.query
     if "readfic" in path:
@@ -48,6 +52,14 @@ def normalize_url(url: str) -> str:
         match = re.match(r"/([a-z]{2})/(?:book|reader)/([^/?]+-b\d+)", path, re.I)
         if match:
             path = f"/{match.group(1).lower()}/reader/{match.group(2)}"
+            query = ""
+    if host == "ranobelib.me":
+        slug = next(
+            (segment for segment in path.split("/") if re.fullmatch(r"\d+--[A-Za-z0-9_-]+", segment)),
+            "",
+        )
+        if slug:
+            path = f"/ru/{slug}"
             query = ""
     cleaned = urlunsplit((scheme, host, path, query, ""))
     return cleaned.split("#", 1)[0]
@@ -68,6 +80,8 @@ def is_supported_story_url(url: str) -> bool:
         return "/mfanf/ffshowfic.php" in path and bool(parse_qs(parts.query).get("fid"))
     if host == "litnet.com":
         return bool(re.match(r"/[a-z]{2}/(?:book|reader)/[^/]+-b\d+", path))
+    if host == "ranobelib.me":
+        return any(re.fullmatch(r"\d+--[a-z0-9_-]+", segment) for segment in path.split("/"))
     return False
 
 
@@ -83,6 +97,8 @@ def site_key(url: str) -> str:
         return "hogwartsnet.ru"
     if host == "litnet.com":
         return "litnet.com"
+    if host == "ranobelib.me":
+        return "ranobelib.me"
     return host
 
 
@@ -98,6 +114,10 @@ def is_litnet_url(url: str) -> bool:
     return site_key(url) == "litnet.com"
 
 
+def is_ranobelib_url(url: str) -> bool:
+    return site_key(url) == "ranobelib.me"
+
+
 def site_display_name(url: str) -> str:
     site = site_key(url)
     labels = {
@@ -106,5 +126,6 @@ def site_display_name(url: str) -> str:
         "www.wattpad.com": "Wattpad",
         "hogwartsnet.ru": "Hogwartsnet",
         "litnet.com": "Litnet",
+        "ranobelib.me": "RanobeLIB",
     }
     return labels.get(site, site or "Сайт")

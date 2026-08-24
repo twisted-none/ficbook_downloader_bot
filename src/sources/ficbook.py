@@ -29,6 +29,14 @@ from src.sources.litnet import (
     LitnetPaidBookError,
     LitnetRateLimitError,
 )
+from src.sources.ranobelib import (
+    RanobelibAccessError,
+    RanobelibClient,
+    RanobelibError,
+    RanobelibLoginError,
+    RanobelibNotFoundError,
+    RanobelibRateLimitError,
+)
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
 from src.sources.registry import (
     SUPPORTED_HOST_MARKERS,
@@ -36,6 +44,7 @@ from src.sources.registry import (
     is_ficbook_url as _is_ficbook_url,
     is_hogwartsnet_url as _is_hogwartsnet_url,
     is_litnet_url as _is_litnet_url,
+    is_ranobelib_url as _is_ranobelib_url,
     is_supported_story_url,
     normalize_url,
     site_display_name as _site_display_name,
@@ -132,6 +141,8 @@ class FicbookClient:
         retry_max_delay: float = 45.0,
         litnet_login: str = "",
         litnet_password: str = "",
+        ranobelib_login: str = "",
+        ranobelib_password: str = "",
     ) -> None:
         self.accounts = accounts or (FicbookAccount(login, password),)
         self.site_accounts = site_accounts or {}
@@ -140,6 +151,7 @@ class FicbookClient:
         self.retry_base_delay = max(0.0, retry_base_delay)
         self.retry_max_delay = max(0.0, retry_max_delay)
         self.litnet = LitnetClient(litnet_login, litnet_password)
+        self.ranobelib = RanobelibClient(ranobelib_login, ranobelib_password)
         self.defaults_ini = Path(fanficfare.__file__).with_name("defaults.ini")
         self._account_lock = Lock()
         self._next_account_index: dict[str, int] = {}
@@ -283,6 +295,17 @@ class FicbookClient:
         progress: Callable[[str], None] | None,
         chapter_numbers: set[int] | frozenset[int] | None,
     ) -> Story:
+        if _is_ranobelib_url(normalized):
+            try:
+                return self.ranobelib.download(normalized, progress, chapter_numbers)
+            except RanobelibNotFoundError as exc:
+                raise FicbookNotFoundError(str(exc), technical=repr(exc), user_message=exc.user_message) from exc
+            except RanobelibRateLimitError as exc:
+                raise FicbookRateLimitError(str(exc), technical=repr(exc), user_message=exc.user_message) from exc
+            except RanobelibLoginError as exc:
+                raise FicbookLoginError(str(exc), technical=repr(exc), user_message=exc.user_message) from exc
+            except (RanobelibAccessError, RanobelibError) as exc:
+                raise FicbookError(str(exc), technical=repr(exc), user_message=exc.user_message) from exc
         if _is_litnet_url(normalized):
             try:
                 return self.litnet.download(normalized, progress, chapter_numbers)
@@ -377,6 +400,17 @@ class FicbookClient:
         )
 
     def _preview_once(self, normalized: str, account: FicbookAccount) -> StoryPreview:
+        if _is_ranobelib_url(normalized):
+            try:
+                return self.ranobelib.preview(normalized)
+            except RanobelibNotFoundError as exc:
+                raise FicbookNotFoundError(str(exc), technical=repr(exc), user_message=exc.user_message) from exc
+            except RanobelibRateLimitError as exc:
+                raise FicbookRateLimitError(str(exc), technical=repr(exc), user_message=exc.user_message) from exc
+            except RanobelibLoginError as exc:
+                raise FicbookLoginError(str(exc), technical=repr(exc), user_message=exc.user_message) from exc
+            except (RanobelibAccessError, RanobelibError) as exc:
+                raise FicbookError(str(exc), technical=repr(exc), user_message=exc.user_message) from exc
         if _is_litnet_url(normalized):
             try:
                 return self.litnet.preview(normalized)
