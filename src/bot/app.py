@@ -688,7 +688,15 @@ async def on_link(
     cover_enabled = settings.cover_enabled
     chapter_selection_enabled = settings.chapter_selection_enabled
     if chapter_selection_enabled and message.from_user:
-        await _ask_chapter_selection(message, ficbook_client, admin_chat_id, alert_bot, url, formats, cover_enabled)
+        await _ask_chapter_selection(
+            message,
+            ficbook_client,
+            admin_chat_id,
+            alert_bot,
+            url,
+            formats,
+            cover_enabled,
+        )
         return
     await _process_download(
         message,
@@ -720,6 +728,17 @@ async def _ask_chapter_selection(
     progress = ProgressMessage(status)
     try:
         preview = await asyncio.to_thread(ficbook_client.preview, url, progress.from_thread)
+    except FicbookSiteUnavailableError:
+        await progress.close()
+        await _replace_status_with_error(
+            message,
+            status,
+            admin_chat_id,
+            "Ficbook сейчас не работает, поэтому список глав получить не удалось.",
+            admin_notified=False,
+            support=False,
+        )
+        return
     except FicbookPaidContentError as exc:
         await _replace_status_with_notice(message, status, admin_chat_id, _user_error_message(exc))
         return

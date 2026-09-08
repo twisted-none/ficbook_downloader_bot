@@ -36,6 +36,39 @@ class FakeStory:
     def addToList(self, key: str, value: str) -> None:
         self.lists.setdefault(key, []).append(value)
 
+    def clear_processed_metadata_cache(self) -> None:
+        return None
+
+
+class FakeFicbookAdapter:
+    def __init__(self, html: str) -> None:
+        self.story = FakeStory({"storyId": "018f3425-37e3-7752-9c98-c6b1b22ca383"})
+        self.url = "https://ficbook.net/readfic/018f3425-37e3-7752-9c98-c6b1b22ca383"
+        self.metadataDone = False
+        self._html = html
+        self._chapters: list[dict[str, str]] = []
+
+    def getSiteDomain(self) -> str:
+        return "ficbook.net"
+
+    def getStoryMetadataOnly(self, *, get_cover: bool = True) -> object:
+        raise AttributeError("'NoneType' object has no attribute 'text'")
+
+    def get_request(self, url: str) -> str:
+        return self._html
+
+    def make_soup(self, html: str) -> BeautifulSoup:
+        return BeautifulSoup(html, "lxml")
+
+    def get_chapters(self) -> list[dict[str, str]]:
+        return [dict(chapter) for chapter in self._chapters]
+
+    def add_chapter(self, title: str, url: str) -> None:
+        self._chapters.append({"title": title, "url": url})
+
+    def setCoverImage(self, url: str, cover_url: str) -> None:
+        return None
+
 
 class FicbookMetadataTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -98,6 +131,103 @@ class FicbookMetadataTests(unittest.TestCase):
             str(raised.exception),
             "Не удалось скачать фанфик с Ficbook. Возможно, сайт изменил страницу или временно отдает неполный ответ.",
         )
+
+    def test_ficbook_metadata_recovers_from_missing_text_element(self) -> None:
+        adapter = FakeFicbookAdapter(
+            """
+            <section class="chapter-info"><h1>Чертовски хорошо<sup>+</sup></h1></section>
+            <a href="/authors/42">Автор</a>
+            <ul class="list-of-fanfic-parts">
+              <li class="part"><a href="/readfic/018f3425-37e3-7752-9c98-c6b1b22ca383/1#part_content">Глава 1</a></li>
+              <li class="part"><a href="/readfic/018f3425-37e3-7752-9c98-c6b1b22ca383/2#part_content">Глава 2</a></li>
+            </ul>
+            <strong>Размер:</strong><div>12 страниц, 3456 слов</div>
+            """
+        )
+
+        story = self.client._get_story_metadata(adapter, adapter.url)
+
+        self.assertTrue(adapter.metadataDone)
+        self.assertEqual(story.getMetadata("title"), "Чертовски хорошо")
+        self.assertEqual(story.getMetadata("author"), "Автор")
+        self.assertEqual(story.getMetadata("authorUrl"), "https://ficbook.net/authors/42")
+        self.assertEqual([chapter["title"] for chapter in adapter.get_chapters()], ["Глава 1", "Глава 2"])
+        self.assertEqual(story.getMetadata("pages"), "12")
+        self.assertEqual(story.getMetadata("numWords"), "3456")
+
+    def test_primary_parser_with_real_adapter(self) -> None:
+        from fanficfare import adapters
+        url = "https://ficbook.net/readfic/123"
+        adapter = adapters.getAdapter(self.client._build_config(url, FicbookAccount()), url)
+        html = """
+        <section class="chapter-info"><h1>Title</h1></section>
+        <header><a href="/fanfiction/books/test">Fandom</a></header>
+        <div class="tags"><a href="/tags/1">Tag</a></div>
+        <meta property="og:image" content="https://ficbook.net/cover.jpg">
+        <ul class="list-of-fanfic-parts"><li class="part">
+          <a href="/readfic/123/1#part_content">Part</a>
+          <a href="/readfic/123/1?x=1">Duplicate</a>
+          <a href="/readfic/123/reviews">Reviews</a>
+          <a href="https://example.org/readfic/123/2">External</a>
+          <a href="/readfic/456/2">Other story</a>
+          <span title="8 сентября 2026 г. в 12:00"></span>
+        </li></ul>
+        """
+        with patch.object(adapter, "get_request", return_value=html), patch.object(
+            adapter, "getStoryMetadataOnly", side_effect=AssertionError("Legacy parser called")
+        ), patch.object(adapter, "setCoverImage") as cover:
+            story = self.client._get_story_metadata(adapter, url, get_cover=False)
+        self.assertEqual(story.getMetadata("title"), "Title")
+        self.assertEqual(story.getMetadata("numChapters"), "1")
+        self.assertEqual(story.getList("category"), ["Fandom"])
+        self.assertEqual(story.getList("genre"), ["Tag"])
+        self.assertEqual(story.getMetadataRaw("datePublished").year, 2026)
+        self.assertEqual(len(adapter.get_chapters()), 1)
+        cover.assert_not_called()
+
+    def test_primary_parser_rejects_missing_chapters(self) -> None:
+        adapter = FakeFicbookAdapter('<section class="chapter-info"><h1>Title</h1></section>')
+        with self.assertRaises(FicbookError):
+            self.client._get_story_metadata(adapter, adapter.url)
+        self.assertFalse(adapter.metadataDone)
+
+    def test_primary_parser_accepts_single_chapter_without_optional_metadata(self) -> None:
+        adapter = FakeFicbookAdapter(
+            '<section class="chapter-info"><h1>Title</h1></section><div id="content">Text</div>'
+        )
+        self.client._get_story_metadata(adapter, adapter.url)
+        self.assertEqual(adapter.get_chapters(), [{"title": "Title", "url": adapter.url}])
+
+    def test_primary_parser_preserves_access_and_not_found_errors(self) -> None:
+        from fanficfare import adapters, exceptions
+        url = "https://ficbook.net/readfic/123"
+        adapter = adapters.getAdapter(self.client._build_config(url, FicbookAccount()), url)
+        with patch.object(adapter, "get_request", side_effect=exceptions.HTTPErrorFFF(url, 404, "Missing")):
+            with self.assertRaises(exceptions.StoryDoesNotExist):
+                self.client._get_story_metadata(adapter, url)
+        with patch.object(adapter, "get_request", return_value='<div id="adultCoverWarning"></div>'), patch.object(
+            adapter, "getConfig", return_value=False
+        ):
+            adapter.is_adult = False
+            with self.assertRaises(exceptions.AdultCheckRequired):
+                self.client._get_story_metadata(adapter, url)
+        self.assertFalse(adapter.metadataDone)
+
+    def test_broken_contents_is_not_treated_as_single_chapter(self) -> None:
+        adapter = FakeFicbookAdapter(
+            '<section class="chapter-info"><h1>Title</h1></section>'
+            '<ul class="list-of-fanfic-parts"><li class="part">Missing link</li></ul>'
+            '<div id="content">Preview text</div>'
+        )
+        with self.assertRaises(FicbookError):
+            self.client._get_story_metadata(adapter, adapter.url)
+
+    def test_other_sites_use_fanficfare_parser(self) -> None:
+        adapter = Mock()
+        adapter.getSiteDomain.return_value = "archiveofourown.org"
+        story = self.client._get_story_metadata(adapter, "https://archiveofourown.org/works/1", get_cover=False)
+        self.assertIs(story, adapter.getStoryMetadataOnly.return_value)
+        adapter.getStoryMetadataOnly.assert_called_once_with(get_cover=False)
 
     def test_status_and_dates_are_read_from_ficbook_markup(self) -> None:
         soup = BeautifulSoup(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from configparser import DuplicateSectionError
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from http.cookiejar import CookieJar
 import json
@@ -21,6 +22,7 @@ import fanficfare
 from bs4 import BeautifulSoup, NavigableString, Tag
 from fanficfare import adapters, exceptions
 from fanficfare.configurable import Configuration
+from fanficfare.exceptions import HTTPErrorFFF
 
 from src.sources.litnet import (
     LitnetClient,
@@ -367,15 +369,8 @@ class FicbookClient:
         except Exception as exc:
             if _is_rate_limited(exc):
                 raise FicbookRateLimitError("Ficbook временно ограничил запросы.", technical=repr(exc)) from exc
-            if self.ficbook_site_status() is FicbookSiteStatus.UNAVAILABLE:
-                raise FicbookSiteUnavailableError(
-                    "Ficbook сейчас не работает и вместо обычной страницы показывает сообщение о недоступности.",
-                    technical=repr(exc),
-                    user_message=(
-                        "Ficbook сейчас не работает. Фанфик останется в очереди и скачается, "
-                        "как только сайт снова заработает."
-                    ),
-                ) from exc
+            if self.ficbook_site_status() is not FicbookSiteStatus.AVAILABLE:
+                raise _ficbook_site_unavailable_error(exc) from exc
             raise _friendly_download_error(normalized, exc) from exc
         return Story(
             title=story.getMetadata("title") or "ficbook",
@@ -465,6 +460,8 @@ class FicbookClient:
         except Exception as exc:
             if _is_rate_limited(exc):
                 raise FicbookRateLimitError("Ficbook временно ограничил запросы.", technical=repr(exc)) from exc
+            if self.ficbook_site_status() is not FicbookSiteStatus.AVAILABLE:
+                raise _ficbook_site_unavailable_error(exc) from exc
             raise _friendly_preview_error(normalized, exc) from exc
         return StoryPreview(
             title=story.getMetadata("title") or "ficbook",
@@ -822,23 +819,116 @@ class FicbookClient:
         return config
 
     def _get_story_metadata(self, adapter: Any, url: str, *, get_cover: bool = True) -> Any:
-        try:
+        if getattr(adapter, "getSiteDomain", lambda: "")() != "ficbook.net":
             return adapter.getStoryMetadataOnly(get_cover=get_cover)
-        except AttributeError as exc:
-            if "NoneType" not in str(exc) or "find" not in str(exc):
+        if not adapter.metadataDone:
+            try:
+                self._parse_ficbook_metadata(adapter, url, get_cover=get_cover)
+            except HTTPErrorFFF as exc:
+                if exc.status_code in (404, 410):
+                    raise exceptions.StoryDoesNotExist(url) from exc
                 raise
-            if getattr(adapter, "getSiteDomain", lambda: "")() != "ficbook.net":
-                raise
-            if not adapter.get_chapters() or not adapter.story.getMetadata("title"):
-                raise
-            logger.warning("Recovering Ficbook metadata after FanFicFare parser error: %s", exc)
-            soup = adapter.make_soup(adapter.get_request(url))
-            self._fill_optional_ficbook_metadata(adapter, soup)
-            adapter.story.clear_processed_metadata_cache()
             adapter.metadataDone = True
-            return adapter.story
+        return adapter.story
 
-    def _fill_optional_ficbook_metadata(self, adapter: Any, soup: BeautifulSoup) -> None:
+    def _parse_ficbook_metadata(self, adapter: Any, url: str, *, get_cover: bool = True) -> None:
+        soup = adapter.make_soup(adapter.get_request(url))
+        if soup.find(id="adultCoverWarning") and not (adapter.is_adult or adapter.getConfig("is_adult")):
+            raise exceptions.AdultCheckRequired(url)
+        story = adapter.story
+        if not story.getMetadata("title"):
+            title = self._ficbook_title_from_soup(soup)
+            if title:
+                story.setMetadata("title", title)
+        if not story.getMetadata("title"):
+            raise FicbookError(
+                "Не удалось прочитать название фанфика Ficbook.",
+                technical=f"Failed to recover Ficbook title: {url}",
+            )
+        self._fill_ficbook_author_metadata(story, soup)
+        if not adapter.get_chapters():
+            self._fill_ficbook_chapter_links(adapter, soup, url)
+        if not adapter.get_chapters():
+            raise FicbookError(
+                "Не удалось прочитать список глав Ficbook.",
+                technical=f"Failed to recover Ficbook chapters: {url}",
+            )
+        story.setMetadata("language", "Russian")
+        for key, selector in (("category", 'header a[href^="/fanfiction/"]'), ("genre", '.tags a[href^="/tags/"]')):
+            for link in soup.select(selector):
+                value = self._tag_text(link)
+                if value and value not in story.getList(key):
+                    story.addToList(key, value)
+        if len(story.getList("category")) > 1:
+            story.addToList("genre", "Кроссовер")
+        self._fill_ficbook_part_dates(story, soup)
+        self._fill_optional_ficbook_metadata(adapter, soup, get_cover=get_cover)
+        story.clear_processed_metadata_cache()
+
+    def _fill_ficbook_part_dates(self, story: Any, soup: BeautifulSoup) -> None:
+        months = "января февраля марта апреля мая июня июля августа сентября октября ноября декабря".split()
+        dates: list[datetime] = []
+        for node in soup.select("ul.list-of-fanfic-parts li.part span[title], .part-date span[title]"):
+            value = self._safe_text(node.get("title")).lower()
+            for number, month in enumerate(months, 1):
+                value = value.replace(month, str(number))
+            match = re.search(r"(\d{1,2})\s+(\d{1,2})\s+(\d{4})", value)
+            if match:
+                day, month, year = map(int, match.groups())
+                try:
+                    dates.append(datetime(year, month, day))
+                except ValueError:
+                    continue
+        if dates:
+            story.setMetadata("datePublished", min(dates))
+            story.setMetadata("dateUpdated", max(dates))
+
+    def _ficbook_title_from_soup(self, soup: BeautifulSoup) -> str:
+        title = soup.select_one("section.chapter-info h1")
+        if isinstance(title, Tag):
+            for marker in title.find_all("sup"):
+                marker.decompose()
+            return self._tag_text(title)
+        meta = soup.find("meta", property="og:title")
+        if isinstance(meta, Tag):
+            return self._safe_text(meta.get("content"))
+        return ""
+
+    def _fill_ficbook_author_metadata(self, story: Any, soup: BeautifulSoup) -> None:
+        if story.getMetadata("author"):
+            return
+        author = soup.select_one("a.creator-username") or soup.find("a", href=re.compile(r"^/authors/"))
+        if not isinstance(author, Tag):
+            return
+        name = self._tag_text(author)
+        if not name:
+            return
+        story.setMetadata("author", name)
+        story.setMetadata("authorId", name)
+        href = self._safe_text(author.get("href"))
+        if href:
+            story.setMetadata("authorUrl", f"https://ficbook.net{href}" if href.startswith("/") else href)
+
+    def _fill_ficbook_chapter_links(self, adapter: Any, soup: BeautifulSoup, url: str) -> None:
+        story_id = self._safe_text(adapter.story.getMetadata("storyId"))
+        pattern = re.compile(rf"/readfic/{re.escape(story_id)}/\d+/?$")
+        seen: set[str] = set()
+        for link in soup.select("ul.list-of-fanfic-parts li.part a[href]"):
+            if not isinstance(link, Tag):
+                continue
+            href = self._safe_text(link.get("href"))
+            parsed = urlsplit(href)
+            if parsed.netloc not in ("", "ficbook.net") or parsed.scheme not in ("", "https", "http"):
+                continue
+            if not story_id or not pattern.fullmatch(parsed.path) or parsed.path.rstrip("/") in seen:
+                continue
+            seen.add(parsed.path.rstrip("/"))
+            chapter_url = f"https://ficbook.net{parsed.path.rstrip('/')}#part_content"
+            adapter.add_chapter(self._tag_text(link) or f"Глава {len(seen)}", chapter_url)
+        if not seen and not soup.select_one("ul.list-of-fanfic-parts") and soup.find("div", {"id": "content"}):
+            adapter.add_chapter(adapter.story.getMetadata("title"), url)
+
+    def _fill_optional_ficbook_metadata(self, adapter: Any, soup: BeautifulSoup, *, get_cover: bool = True) -> None:
         story = adapter.story
         rating = soup.select_one('header div[class*="badge-rating-"] span')
         if rating:
@@ -861,7 +951,8 @@ class FicbookClient:
             story.setMetadata("authorcomment", comment)
         self._fill_pairing_metadata(story, soup)
         self._fill_size_metadata(story, soup)
-        self._fill_cover_image(adapter, soup)
+        if get_cover:
+            self._fill_cover_image(adapter, soup)
         story.clear_processed_metadata_cache()
 
     def _fill_pairing_metadata(self, story: Any, soup: BeautifulSoup) -> None:
@@ -1316,6 +1407,17 @@ def _friendly_download_error(url: str, error: Exception) -> FicbookError:
     return FicbookError(
         f"Не удалось скачать фанфик с {site_name}. Возможно, сайт изменил страницу или временно отдает неполный ответ.",
         technical=repr(error),
+    )
+
+
+def _ficbook_site_unavailable_error(error: Exception) -> FicbookSiteUnavailableError:
+    return FicbookSiteUnavailableError(
+        "Ficbook сейчас не работает или не проходит проверку доступности.",
+        technical=repr(error),
+        user_message=(
+            "Ficbook сейчас не работает. Фанфик останется в очереди и скачается, "
+            "как только сайт снова заработает."
+        ),
     )
 
 
