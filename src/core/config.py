@@ -45,6 +45,7 @@ class Settings:
     ficbook_retry_base_delay_seconds: float
     ficbook_retry_max_delay_seconds: float
     premium_queue_user_ids: frozenset[int]
+    history_retention_days: int = 30
 
 
 def load_settings() -> Settings:
@@ -91,6 +92,7 @@ def load_settings() -> Settings:
         ficbook_retry_base_delay_seconds=max(0.0, float(os.getenv("FICBOOK_RETRY_BASE_DELAY_SECONDS", "8"))),
         ficbook_retry_max_delay_seconds=max(0.0, float(os.getenv("FICBOOK_RETRY_MAX_DELAY_SECONDS", "45"))),
         premium_queue_user_ids=_parse_user_ids(os.getenv("PREMIUM_QUEUE_USER_IDS", "")),
+        history_retention_days=history_retention_days(),
     )
 
 
@@ -105,6 +107,13 @@ def _parse_chat_id(value: str) -> int | None:
     if not value:
         return None
     return int(value)
+
+
+def history_retention_days() -> int:
+    days = int(os.getenv("HISTORY_RETENTION_DAYS", "30"))
+    if days < 30:
+        raise ValueError("HISTORY_RETENTION_DAYS must be at least 30 to preserve active_users_30d")
+    return days
 
 
 def _parse_user_ids(value: str) -> frozenset[int]:

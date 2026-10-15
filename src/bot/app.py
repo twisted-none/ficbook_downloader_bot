@@ -32,7 +32,7 @@ from aiogram.types import (
 from aiogram.utils.chat_action import ChatActionSender
 
 from src.storage.analytics import AnalyticsStore, UserDownloadSettings
-from src.bot.types import PendingChapterSelection, SettingsDraft, SettingsSession
+from src.bot.types import PendingChapterSelection, PendingSupportMessage, SettingsDraft, SettingsSession
 from src.bot.ui import (
     active_download_status as _active_download_status,
     cancel_keyboard as _cancel_keyboard,
@@ -60,6 +60,7 @@ from src.bot.ui import (
     settings_unsaved_keyboard as _settings_unsaved_keyboard,
     settings_unsaved_text as _settings_unsaved_text,
     support_keyboard as _support_keyboard,
+    support_confirmation_keyboard as _support_confirmation_keyboard,
     WELCOME_TEXT,
 )
 from src.core.chapter_selection import ChapterSelectionError, parse_chapter_selection
@@ -82,10 +83,11 @@ from src.sources.ficbook import (
     FicbookRateLimitError,
     FicbookSiteStatus,
     FicbookSiteUnavailableError,
-    extract_url,
 )
 from src.exporters.formats import ALLOWED_FORMATS, build_docx, build_pdf, build_txt, normalize_formats
+from src.sources.share_links import ShareLinkError, extract_download_url, is_google_share_url, resolve_share_url
 from src.monitoring.metrics import run_metrics_server
+from src.storage.retention import run_history_retention
 from src.core.models import Story, StoryPreview
 from src.storage.users import UserStore
 
@@ -94,6 +96,7 @@ URL_RE = re.compile(r"https?://[^\s]+")
 logger = logging.getLogger(__name__)
 _broadcast_waiting: set[int] = set()
 _support_waiting: set[int] = set()
+_support_pending: dict[int, PendingSupportMessage] = {}
 _reply_waiting: dict[int, int] = {}
 _settings_drafts: dict[int, "SettingsSession"] = {}
 _chapter_waiting: dict[int, "PendingChapterSelection"] = {}
@@ -353,6 +356,7 @@ async def on_help(message: Message, admin_chat_id: int | None) -> None:
     if admin_chat_id is None:
         await message.answer("Поддержка сейчас недоступна.", reply_markup=_main_keyboard_for_message(message, admin_chat_id))
         return
+    _support_pending.pop(message.from_user.id, None)
     _support_waiting.add(message.from_user.id)
     await message.answer(
         "Напиши сообщение для поддержки следующим сообщением. /cancel — отменить.",
@@ -407,7 +411,10 @@ async def on_cancel(message: Message, admin_chat_id: int | None) -> None:
     if _chapter_waiting.pop(message.from_user.id, None):
         await message.answer("Выбор глав отменен.", reply_markup=_main_keyboard_for_message(message, admin_chat_id))
         cancelled = True
-    if message.from_user.id in _support_waiting:
+    pending_support = _support_pending.pop(message.from_user.id, None)
+    if pending_support:
+        await _clear_support_confirmation(pending_support.confirmation)
+    if message.from_user.id in _support_waiting or pending_support:
         _support_waiting.discard(message.from_user.id)
         await message.answer("Сообщение в поддержку отменено.", reply_markup=_main_keyboard_for_message(message, admin_chat_id))
         cancelled = True
@@ -426,6 +433,7 @@ async def on_support_click(callback: CallbackQuery, admin_chat_id: int | None) -
     if admin_chat_id is None:
         await callback.message.answer("Поддержка сейчас недоступна.", reply_markup=_main_keyboard())  # type: ignore[union-attr]
         return
+    _support_pending.pop(callback.from_user.id, None)
     _support_waiting.add(callback.from_user.id)
     await callback.message.answer(  # type: ignore[union-attr]
         "Напиши сообщение для поддержки следующим сообщением. /cancel — отменить.",
@@ -604,7 +612,74 @@ async def on_support_text(message: Message, admin_chat_id: int | None) -> None:
     if not text:
         await message.answer("Нужен текст сообщения.", reply_markup=_main_keyboard_for_message(message, admin_chat_id))
         return
+    if extract_download_url(text):
+        confirmation = await message.answer(
+            "Вы уверены, что хотите отправить это сообщение в поддержку, "
+            "или вы хотели скачать фанфик?",
+            reply_markup=_support_confirmation_keyboard(),
+        )
+        _support_pending[message.from_user.id] = PendingSupportMessage(message, confirmation)
+        return
     await _send_support_message(message, admin_chat_id, "Ficbook Downloader", text)
+
+
+async def _clear_support_confirmation(message: Message) -> None:
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except (TelegramBadRequest, TelegramNetworkError, TelegramForbiddenError, TelegramRetryAfter, TelegramServerError):
+        logger.warning("Could not clear support confirmation buttons")
+
+
+async def _delete_support_confirmation(message: Message) -> None:
+    try:
+        await message.delete()
+    except (TelegramBadRequest, TelegramNetworkError, TelegramForbiddenError, TelegramRetryAfter, TelegramServerError):
+        logger.warning("Could not delete support confirmation; clearing buttons")
+        await _clear_support_confirmation(message)
+
+
+@router.callback_query(F.data.in_({"support:download", "support:send"}))
+async def on_support_decision(
+    callback: CallbackQuery,
+    ficbook_client: FicbookClient,
+    admin_chat_id: int | None,
+    alert_bot: Bot | None,
+    analytics_store: AnalyticsStore,
+    download_queues: DownloadQueuePool,
+    premium_queue_user_ids: frozenset[int],
+) -> None:
+    pending = _support_pending.get(callback.from_user.id)
+    if (
+        pending is None or callback.message is None
+        or callback.message.chat.id != pending.confirmation.chat.id
+        or callback.message.message_id != pending.confirmation.message_id
+    ):
+        await callback.answer("Этот запрос уже обработан или отменён.", show_alert=True)
+        return
+    # Consume before any await so concurrent clicks cannot repeat the action.
+    _support_pending.pop(callback.from_user.id)
+    _support_waiting.discard(callback.from_user.id)
+    try:
+        await callback.answer()
+    except (TelegramBadRequest, TelegramNetworkError, TelegramForbiddenError, TelegramRetryAfter, TelegramServerError):
+        logger.warning("Could not acknowledge support confirmation")
+    await _delete_support_confirmation(pending.confirmation)
+    await pending.message.answer(
+        "Отправляю сообщение в поддержку." if callback.data == "support:send" else "Готовлю скачивание.",
+        reply_markup=_main_keyboard_for_message(pending.message, admin_chat_id),
+    )
+    if callback.data == "support:send":
+        await _send_support_message(pending.message, admin_chat_id, "Ficbook Downloader", (pending.message.text or "").strip())
+    else:
+        await on_link(
+            pending.message,
+            ficbook_client=ficbook_client,
+            admin_chat_id=admin_chat_id,
+            alert_bot=alert_bot,
+            analytics_store=analytics_store,
+            download_queues=download_queues,
+            premium_queue_user_ids=premium_queue_user_ids,
+        )
 
 
 @router.message(lambda message: message.from_user and message.from_user.id in _broadcast_waiting)
@@ -647,6 +722,10 @@ async def on_chapter_selection_text(
         return
     chapter_numbers = set(parsed_chapters) if parsed_chapters is not None else None
     _chapter_waiting.pop(message.from_user.id, None)
+    await message.answer(
+        "Главы выбраны.",
+        reply_markup=_main_keyboard_for_message(message, admin_chat_id),
+    )
     await _process_download(
         message,
         ficbook_client,
@@ -672,13 +751,19 @@ async def on_link(
     download_queues: DownloadQueuePool,
     premium_queue_user_ids: frozenset[int],
 ) -> None:
-    url = extract_url(message.text or "")
+    url = extract_download_url(message.text or "")
     if not url:
         await message.answer(
-            "Нужна ссылка на Ficbook, AO3, Wattpad, Hogwartsnet или Litnet.",
+            "Нужна ссылка на Ficbook, AO3, Wattpad, Hogwartsnet, RanobeLIB или Litnet.",
             reply_markup=_main_keyboard_for_message(message, admin_chat_id),
         )
         return
+    if is_google_share_url(url):
+        try:
+            url = await resolve_share_url(url)
+        except ShareLinkError as exc:
+            await message.answer(escape(str(exc)), reply_markup=_main_keyboard_for_message(message, admin_chat_id))
+            return
     settings = (
         await _get_user_download_settings(analytics_store, message.from_user.id)
         if message.from_user
@@ -813,10 +898,7 @@ async def _process_download(
                     ),
                 )
                 if status is None or progress is None:
-                    status = await message.answer(
-                        text,
-                        reply_markup=_main_keyboard_for_message(message, admin_chat_id),
-                    )
+                    status = await message.answer(text)
                     progress = ProgressMessage(status, min_interval=5.0, initial_text=text)
                     return
                 await progress.set(text, force=True)
@@ -832,10 +914,7 @@ async def _process_download(
                     except TelegramBadRequest:
                         logger.debug("Failed to delete queued status message", exc_info=True)
                 active_text = _active_download_status(formats, progress_state.percent())
-                status = await message.answer(
-                    active_text,
-                    reply_markup=_main_keyboard_for_message(message, admin_chat_id),
-                )
+                status = await message.answer(active_text)
                 progress = ProgressMessage(status, min_interval=5.0, initial_text=active_text)
 
             async def download_job() -> tuple[Story, list[tuple[str, bytes]]]:
@@ -847,6 +926,9 @@ async def _process_download(
 
                     def observe_progress(text: str) -> None:
                         progress_state.observe(text)
+                        active_progress.from_thread(
+                            _active_download_status(formats, progress_state.percent())
+                        )
 
                     updater = asyncio.create_task(
                         _active_progress_updater(active_progress, progress_state, formats)
@@ -931,7 +1013,7 @@ async def _process_download(
                 message,
                 payload,
                 filename=f"{file_stem}.{fmt}",
-                caption=f"{story.title} ({fmt.upper()})",
+                caption=f"{escape(story.title)} ({fmt.upper()})",
                 reply_markup=(
                     _main_keyboard_for_message(message, admin_chat_id)
                     if index == len(files)
@@ -1147,7 +1229,9 @@ async def run_bot(settings: Settings) -> None:
         if settings.alert_bot_token
         else None
     )
-    analytics_store = AnalyticsStore(settings.database_url)
+    analytics_store = await asyncio.to_thread(
+        AnalyticsStore, settings.database_url, history_retention_days=settings.history_retention_days
+    )
     ficbook_accounts = _ficbook_accounts(settings)
     _account_pair(settings.litnet_login, settings.litnet_password, "LITNET_LOGIN")
     _account_pair(settings.ranobelib_login, settings.ranobelib_password, "RANOBELIB_LOGIN")
@@ -1178,11 +1262,14 @@ async def run_bot(settings: Settings) -> None:
     metrics_task = asyncio.create_task(
         run_metrics_server(analytics_store, settings.metrics_host, settings.metrics_port)
     )
+    retention_task = asyncio.create_task(run_history_retention(analytics_store))
     try:
         await _set_bot_commands(bot, settings.admin_chat_id)
         await dispatcher.start_polling(bot)
     finally:
         metrics_task.cancel()
+        retention_task.cancel()
+        await asyncio.gather(metrics_task, retention_task, return_exceptions=True)
         if alert_bot:
             await alert_bot.session.close()
 

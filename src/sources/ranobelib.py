@@ -16,11 +16,12 @@ from time import monotonic, sleep
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
-from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, Request, build_opener, urlopen
+from urllib.request import Request
 
 from bs4 import BeautifulSoup
 
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.sources.safe_http import SafeRedirectHandler, UnsafeRequestError, build_safe_opener, require_https_url
 
 API_ROOT = "https://api.cdnlibs.org/api/manga"
 AUTH_AUTHORIZE_URL = "https://auth.lib.social/auth/oauth/authorize"
@@ -29,6 +30,16 @@ AUTH_TOKEN_URL = "https://api.cdnlibs.org/api/auth/oauth/token"
 AUTH_CALLBACK_URL = "https://ranobelib.me/ru/front/auth/oauth/callback"
 ALTCHA_CHALLENGE_URL = "https://auth.lib.social/altcha/challenge"
 MAX_COVER_BYTES = 8 * 1024 * 1024
+API_HOSTS = frozenset({"api.cdnlibs.org"})
+AUTH_HOSTS = frozenset({"auth.lib.social"})
+
+
+def _is_oauth_callback(url: str) -> bool:
+    try:
+        parts = require_https_url(url, frozenset({"ranobelib.me"}))
+        return parts.path == urlsplit(AUTH_CALLBACK_URL).path
+    except UnsafeRequestError:
+        return False
 
 
 class RanobelibError(Exception):
@@ -56,11 +67,14 @@ class RanobelibLoginError(RanobelibError):
 
 class _OAuthCallback(Exception):
     def __init__(self, url: str) -> None:
-        super().__init__(url)
+        super().__init__("OAuth callback received")
         self.url = url
 
 
-class _OAuthRedirectHandler(HTTPRedirectHandler):
+class _OAuthRedirectHandler(SafeRedirectHandler):
+    def __init__(self) -> None:
+        super().__init__(AUTH_HOSTS)
+
     def redirect_request(
         self,
         req: Any,
@@ -70,7 +84,8 @@ class _OAuthRedirectHandler(HTTPRedirectHandler):
         headers: Any,
         newurl: str,
     ) -> Any:
-        if newurl.startswith(AUTH_CALLBACK_URL):
+        require_https_url(req.full_url, AUTH_HOSTS)
+        if _is_oauth_callback(newurl):
             raise _OAuthCallback(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -102,7 +117,9 @@ class RanobelibClient:
         self._auth_lock = Lock()
         self._access_token = ""
         self._refresh_token = ""
-        self._auth_opener = build_opener(HTTPCookieProcessor(CookieJar()), _OAuthRedirectHandler())
+        self._auth_opener = build_safe_opener(AUTH_HOSTS, cookie_jar=CookieJar(), redirect_handler=_OAuthRedirectHandler())
+        self._api_opener = build_safe_opener(API_HOSTS)
+        self._cover_opener = build_safe_opener()
 
     def download(
         self,
@@ -124,7 +141,7 @@ class RanobelibClient:
                     f"RanobeLIB вернул пустую главу {chapter.index}.",
                     user_message=f"Глава {chapter.index} сейчас недоступна на RanobeLIB.",
                 )
-            chapters.append(Chapter(chapter.title, html))
+            chapters.append(Chapter(chapter.title, html, f"https://ranobelib.me/{slug}/v{chapter.volume}/c{chapter.number}"))
         return self._story(url, info, chapters)
 
     def preview(self, url: str) -> StoryPreview:
@@ -206,13 +223,17 @@ class RanobelibClient:
         )
 
     def _request_json(self, url: str) -> Any:
+        try:
+            require_https_url(url, API_HOSTS)
+        except UnsafeRequestError:
+            raise RanobelibError("RanobeLIB: request blocked by security policy.") from None
         self._ensure_authenticated()
         auth_retried = False
         total_attempts = self._retry_attempts + int(bool(self.login))
         for attempt in range(1, total_attempts + 1):
             self._wait_for_request_slot()
             try:
-                with urlopen(self._api_request(url), timeout=30) as response:
+                with self._api_opener.open(self._api_request(url), timeout=30) as response:
                     payload = json.load(response)
                 break
             except HTTPError as exc:
@@ -226,19 +247,25 @@ class RanobelibClient:
                     sleep(self._retry_delay(exc, attempt))
                     continue
                 self._raise_http_error(exc)
-            except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            except UnsafeRequestError:
+                raise RanobelibError(
+                    "RanobeLIB request blocked by security policy.",
+                    user_message="Не удалось безопасно подключиться к RanobeLIB. Проверь настройки сети и прокси.",
+                ) from None
+            except (URLError, TimeoutError, json.JSONDecodeError):
                 if attempt < self._retry_attempts:
                     sleep(float(attempt))
                     continue
                 raise RanobelibError(
-                    f"RanobeLIB request failed: {exc!r}",
+                    "RanobeLIB request failed.",
                     user_message="RanobeLIB сейчас не отвечает. Попробуй повторить позже.",
-                ) from exc
+                ) from None
         else:
             raise RanobelibError("RanobeLIB request retry state exhausted.")
         return payload.get("data") if isinstance(payload, dict) else None
 
     def _api_request(self, url: str) -> Request:
+        require_https_url(url, API_HOSTS)
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; FicbookDownloaderBot/1.0)",
             "Accept": "application/json",
@@ -268,7 +295,7 @@ class RanobelibClient:
     def _login_locked(self) -> None:
         if not (self.login and self.password):
             raise RanobelibLoginError("RanobeLIB credentials are not configured.")
-        self._auth_opener = build_opener(HTTPCookieProcessor(CookieJar()), _OAuthRedirectHandler())
+        self._auth_opener = build_safe_opener(AUTH_HOSTS, cookie_jar=CookieJar(), redirect_handler=_OAuthRedirectHandler())
         verifier = secrets.token_urlsafe(96)
         state = secrets.token_urlsafe(30)
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
@@ -284,6 +311,7 @@ class RanobelibClient:
             }
         )
         page_url, body = self._auth_open(f"{AUTH_AUTHORIZE_URL}?{query}")
+        self._require_auth_host(page_url)
         soup = BeautifulSoup(body, "lxml")
         form = soup.find("form", action=re.compile(r"/auth/login(?:$|\?)"))
         if not form:
@@ -321,8 +349,8 @@ class RanobelibClient:
                 return response.geturl(), response.read()
         except _OAuthCallback as exc:
             return exc.url, b""
-        except (HTTPError, URLError, TimeoutError) as exc:
-            raise RanobelibLoginError(f"RanobeLIB authorization page failed: {exc!r}") from exc
+        except (HTTPError, URLError, TimeoutError):
+            raise RanobelibLoginError("RanobeLIB authorization page failed or was blocked by security policy.") from None
 
     def _auth_submit(
         self,
@@ -331,6 +359,7 @@ class RanobelibClient:
         referer: str,
     ) -> tuple[str, str, bytes]:
         self._require_auth_host(url)
+        self._require_auth_host(referer)
         request = Request(
             url,
             data=urlencode(payload).encode("utf-8"),
@@ -342,14 +371,15 @@ class RanobelibClient:
         try:
             with self._auth_opener.open(request, timeout=30) as response:
                 result_url = response.geturl()
-                callback = result_url if result_url.startswith(AUTH_CALLBACK_URL) else ""
+                callback = result_url if _is_oauth_callback(result_url) else ""
                 return callback, result_url, response.read()
         except _OAuthCallback as exc:
             return exc.url, exc.url, b""
-        except (HTTPError, URLError, TimeoutError) as exc:
-            raise RanobelibLoginError(f"RanobeLIB login request failed: {exc!r}") from exc
+        except (HTTPError, URLError, TimeoutError):
+            raise RanobelibLoginError("RanobeLIB login request failed or was blocked by security policy.") from None
 
     def _submit_consent_if_present(self, body: bytes, referer: str) -> str:
+        self._require_auth_host(referer)
         soup = BeautifulSoup(body, "lxml")
         if soup.find("form", action=re.compile(r"/auth/login(?:$|\?)")):
             raise RanobelibLoginError("RanobeLIB rejected the configured login or password.")
@@ -359,6 +389,7 @@ class RanobelibClient:
         if not form:
             raise RanobelibLoginError("RanobeLIB did not return an OAuth authorization code.")
         action = urljoin(referer, str(form.get("action") or AUTH_AUTHORIZE_URL))
+        self._require_auth_host(action)
         payload = self._hidden_form_values(form)
         buttons = form.select("button[type='submit'], input[type='submit']")
         def button_text(button: Any) -> str:
@@ -424,13 +455,14 @@ class RanobelibClient:
         try:
             with self._auth_opener.open(request, timeout=30) as response:
                 payload = json.load(response)
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise RanobelibLoginError(f"RanobeLIB authentication challenge failed: {exc!r}") from exc
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            raise RanobelibLoginError("RanobeLIB authentication challenge failed or was blocked by security policy.") from None
         if not isinstance(payload, dict):
             raise RanobelibLoginError("RanobeLIB returned an invalid authentication challenge.")
         return payload
 
     def _token_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        require_https_url(AUTH_TOKEN_URL, API_HOSTS)
         request = Request(
             AUTH_TOKEN_URL,
             data=json.dumps(payload).encode("utf-8"),
@@ -444,10 +476,10 @@ class RanobelibClient:
             },
         )
         try:
-            with urlopen(request, timeout=30) as response:
+            with self._api_opener.open(request, timeout=30) as response:
                 token = json.load(response)
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise RanobelibLoginError(f"RanobeLIB token request failed: {exc!r}") from exc
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            raise RanobelibLoginError("RanobeLIB token request failed or was blocked by security policy.") from None
         if not isinstance(token, dict):
             raise RanobelibLoginError("RanobeLIB returned an invalid OAuth token.")
         return token
@@ -474,10 +506,13 @@ class RanobelibClient:
         self._refresh_token = str(token.get("refresh_token") or self._refresh_token).strip()
 
     def _oauth_code(self, callback_url: str, expected_state: str) -> str:
+        if not _is_oauth_callback(callback_url):
+            raise RanobelibLoginError("RanobeLIB returned an invalid OAuth callback.")
         query = parse_qs(urlsplit(callback_url).query)
         code = str(query.get("code", [""])[0])
         state = str(query.get("state", [""])[0])
-        if not code or not state or not hmac.compare_digest(state, expected_state):
+        if (len(query.get("code", [])) != 1 or len(query.get("state", [])) != 1
+                or not code or not state or not state.isascii() or not hmac.compare_digest(state, expected_state)):
             raise RanobelibLoginError("RanobeLIB returned an invalid OAuth callback.")
         return code
 
@@ -496,9 +531,10 @@ class RanobelibClient:
         }
 
     def _require_auth_host(self, url: str) -> None:
-        parsed = urlsplit(url)
-        if parsed.scheme != "https" or parsed.hostname != "auth.lib.social":
-            raise RanobelibLoginError("RanobeLIB attempted to send credentials to an unexpected host.")
+        try:
+            require_https_url(url, AUTH_HOSTS)
+        except UnsafeRequestError:
+            raise RanobelibLoginError("RanobeLIB attempted to send credentials to an unexpected host.") from None
 
     def _wait_for_request_slot(self) -> None:
         with self._request_lock:
@@ -536,11 +572,12 @@ class RanobelibClient:
         if not url:
             return None
         try:
+            require_https_url(url)
             request = Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://ranobelib.me/"})
-            with urlopen(request, timeout=30) as response:
+            with self._cover_opener.open(request, timeout=30) as response:
                 data = response.read(MAX_COVER_BYTES + 1)
                 mime = response.headers.get_content_type().lower()
-        except (HTTPError, URLError, TimeoutError):
+        except (URLError, OSError, ValueError):
             return None
         if not data or len(data) > MAX_COVER_BYTES or not mime.startswith("image/"):
             return None
@@ -562,35 +599,37 @@ class RanobelibClient:
             return ""
         kind = str(node.get("type") or "")
         attrs = node.get("attrs") if isinstance(node.get("attrs"), dict) else {}
+        anchor = f' id="{escape(str(attrs["id"]), quote=True)}"' if attrs.get("id") else ''
         children = "".join(self._render_node(child, attachments) for child in node.get("content") or [])
         if kind == "text":
-            return self._render_text(str(node.get("text") or ""), node.get("marks"))
+            text = self._render_text(str(node.get("text") or ""), node.get("marks"))
+            return f'<span{anchor}>{text}</span>' if anchor else text
         if kind in {"doc", "fragment"}:
-            return children
+            return f'<div{anchor}>{children}</div>' if anchor else children
         if kind == "paragraph":
-            return f"<p>{children}</p>"
+            return f"<p{anchor}>{children}</p>"
         if kind == "heading":
             level = min(6, max(1, int(attrs.get("level") or 2)))
-            return f"<h{level}>{children}</h{level}>"
+            return f"<h{level}{anchor}>{children}</h{level}>"
         if kind == "blockquote":
-            return f"<blockquote>{children}</blockquote>"
+            return f"<blockquote{anchor}>{children}</blockquote>"
         if kind == "bullet_list":
-            return f"<ul>{children}</ul>"
+            return f"<ul{anchor}>{children}</ul>"
         if kind == "ordered_list":
             start = int(attrs.get("start") or 1)
-            return f'<ol start="{start}">{children}</ol>'
+            return f'<ol{anchor} start="{start}">{children}</ol>'
         if kind == "list_item":
-            return f"<li>{children}</li>"
+            return f"<li{anchor}>{children}</li>"
         if kind == "hard_break":
-            return "<br/>"
+            return f"<br{anchor}/>"
         if kind == "horizontal_rule":
-            return "<hr/>"
+            return f"<hr{anchor}/>"
         if kind in {"image", "image_block"}:
             src = str(attrs.get("src") or attrs.get("url") or "")
             src = attachments.get(src, src)
             alt = escape(str(attrs.get("alt") or attrs.get("title") or ""), quote=True)
             return f'<p><img src="{escape(src, quote=True)}" alt="{alt}"/></p>' if src else ""
-        return children
+        return f'<div{anchor}>{children}</div>' if anchor else children
 
     def _render_text(self, value: str, marks: Any) -> str:
         text = escape(value)
@@ -602,7 +641,8 @@ class RanobelibClient:
             if kind == "link":
                 attrs = mark.get("attrs") if isinstance(mark.get("attrs"), dict) else {}
                 href = escape(str(attrs.get("href") or ""), quote=True)
-                text = f'<a href="{href}">{text}</a>' if href else text
+                anchor = f' id="{escape(str(attrs["id"]), quote=True)}"' if attrs.get("id") else ''
+                text = f'<a{anchor} href="{href}">{text}</a>' if href else text
             elif kind in wrappers:
                 tag = wrappers[kind]
                 text = f"<{tag}>{text}</{tag}>"

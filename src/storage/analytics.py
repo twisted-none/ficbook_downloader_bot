@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 from threading import Lock
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from aiogram.types import User
 import psycopg
 from psycopg.rows import dict_row
 
 from src.exporters.formats import DEFAULT_FORMATS, normalize_formats
+from src.sources.registry import is_supported_story_url, normalize_url
 
 logger = logging.getLogger(__name__)
 
@@ -47,39 +49,52 @@ class UserDownloadSettings:
     cover_enabled: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class RetentionPreview:
+    download_records: int
+    profile_records: int
+
+
 class AnalyticsStore:
-    def __init__(self, database_url: str) -> None:
+    def __init__(self, database_url: str, *, history_retention_days: int = 30, initialize: bool = True) -> None:
+        if history_retention_days < 30:
+            raise ValueError("History retention must be at least 30 days to preserve active_users_30d")
         self.database_url = database_url
+        self.history_retention_days = history_retention_days
         self.lock = Lock()
-        self._initialize()
+        if initialize:
+            self._initialize()
 
     def record_user(self, user: User, *, started: bool = False) -> None:
         with self.lock, self._connect() as db:
             db.execute(
                 """
-                INSERT INTO bot_users (user_id, username, full_name, first_seen_at, last_seen_at, started_at)
-                VALUES (%s, %s, %s, now(), now(), CASE WHEN %s THEN now() ELSE NULL END)
+                INSERT INTO bot_users
+                    (user_id, username, full_name, first_seen_at, last_seen_at, started_at, profile_expires_at)
+                VALUES (%s, %s, %s, now(), now(), CASE WHEN %s THEN now() ELSE NULL END,
+                        now() + %s * interval '1 day')
                 ON CONFLICT (user_id) DO UPDATE SET
                     username = EXCLUDED.username,
                     full_name = EXCLUDED.full_name,
                     last_seen_at = now(),
+                    profile_expires_at = EXCLUDED.profile_expires_at,
                     started_at = CASE
                         WHEN %s THEN COALESCE(bot_users.started_at, now())
                         ELSE bot_users.started_at
                     END
                 """,
-                (user.id, user.username or "", user.full_name or "", started, started),
+                (user.id, user.username or "", user.full_name or "", started, self.history_retention_days, started),
             )
 
     def start_download(self, user_id: int, url: str) -> int:
         with self.lock, self._connect() as db:
             row = db.execute(
                 """
-                INSERT INTO downloads (user_id, url, status, attempted_at)
-                VALUES (%s, %s, 'attempt', now())
+                INSERT INTO downloads (user_id, url, status, attempted_at, privacy_expires_at)
+                VALUES (%s, %s, 'attempt', now(), now() + %s * interval '1 day')
                 RETURNING id
                 """,
-                (user_id, url),
+                (user_id, _public_story_url(url), self.history_retention_days),
             ).fetchone()
             return int(row["id"])
 
@@ -90,14 +105,101 @@ class AnalyticsStore:
                 """
                 UPDATE downloads
                 SET status = %s, url = %s, title = %s, error = %s, finished_at = now()
-                WHERE id = %s
+                WHERE id = %s AND user_id IS NOT NULL
                 """,
-                (status, url, title, error[:500], download_id),
+                (status, _public_story_url(url), title, error[:500], download_id),
             )
 
     def discard_download(self, download_id: int) -> None:
         with self.lock, self._connect() as db:
-            db.execute("DELETE FROM downloads WHERE id = %s", (download_id,))
+            db.execute("DELETE FROM downloads WHERE id = %s AND user_id IS NOT NULL", (download_id,))
+
+    def enroll_legacy_history(self) -> int:
+        """Opt existing records into retention only through an explicit maintenance command."""
+        with self.lock, self._connect() as db, db.transaction():
+            db.execute("SET LOCAL statement_timeout = '15s'")
+            result = db.execute(
+                """
+                UPDATE downloads
+                SET privacy_expires_at = attempted_at + %s * interval '1 day'
+                WHERE privacy_expires_at IS NULL AND user_id IS NOT NULL
+                """,
+                (self.history_retention_days,),
+            )
+            db.execute(
+                """
+                UPDATE bot_users
+                SET profile_expires_at = last_seen_at + %s * interval '1 day'
+                WHERE profile_expires_at IS NULL
+                """,
+                (self.history_retention_days,),
+            )
+            return result.rowcount
+
+    def cleanup_expired_history(self, *, batch_size: int = 1000) -> int:
+        if not 1 <= batch_size <= 10000:
+            raise ValueError("Cleanup batch size must be between 1 and 10000")
+        with self.lock, self._connect() as db, db.transaction():
+            db.execute("SET LOCAL statement_timeout = '15s'")
+            expired = list(db.execute(
+                """
+                SELECT id, url FROM downloads
+                WHERE user_id IS NOT NULL AND privacy_expires_at <= now()
+                ORDER BY privacy_expires_at, id
+                LIMIT %s FOR UPDATE SKIP LOCKED
+                """,
+                (batch_size,),
+            ))
+            if expired:
+                ids = [row["id"] for row in expired]
+                db.execute(
+                    """
+                    UPDATE bot_users u
+                    SET archived_successful_downloads = u.archived_successful_downloads + totals.successes
+                    FROM (
+                        SELECT user_id, COUNT(*) AS successes FROM downloads
+                        WHERE id = ANY(%s) AND status = 'success' GROUP BY user_id
+                    ) totals
+                    WHERE u.user_id = totals.user_id
+                    """,
+                    (ids,),
+                )
+                with db.cursor() as cursor:
+                    cursor.executemany(
+                        "UPDATE downloads SET user_id = NULL, error = '', url = %s WHERE id = %s",
+                        [(_public_story_url(row["url"]), row["id"]) for row in expired],
+                    )
+            db.execute(
+                """
+                UPDATE bot_users SET username = '', full_name = ''
+                WHERE profile_expires_at <= now() AND (username <> '' OR full_name <> '')
+                """
+            )
+            return len(expired)
+
+    def retention_preview(self, *, include_legacy: bool = False) -> RetentionPreview:
+        with self.lock, self._connect() as db, db.transaction():
+            db.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            db.execute("SET LOCAL statement_timeout = '15s'")
+            downloads = db.execute(
+                """
+                SELECT COUNT(*) FROM downloads WHERE user_id IS NOT NULL AND (
+                    privacy_expires_at <= now() OR
+                    (%s AND privacy_expires_at IS NULL AND attempted_at <= now() - %s * interval '1 day')
+                )
+                """,
+                (include_legacy, self.history_retention_days),
+            ).fetchone()["count"]
+            profiles = db.execute(
+                """
+                SELECT COUNT(*) FROM bot_users WHERE (username <> '' OR full_name <> '') AND (
+                    profile_expires_at <= now() OR
+                    (%s AND profile_expires_at IS NULL AND last_seen_at <= now() - %s * interval '1 day')
+                )
+                """,
+                (include_legacy, self.history_retention_days),
+            ).fetchone()["count"]
+        return RetentionPreview(int(downloads), int(profiles))
 
     def get_user_formats(self, user_id: int) -> tuple[str, ...]:
         return self.get_user_download_settings(user_id).formats
@@ -173,8 +275,10 @@ class AnalyticsStore:
                 ),
             )
 
-    def snapshot(self) -> AnalyticsSnapshot:
-        with self.lock, self._connect() as db:
+    def snapshot(self, *, include_users: bool = True) -> AnalyticsSnapshot:
+        with self.lock, self._connect() as db, db.transaction():
+            db.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            db.execute("SET LOCAL statement_timeout = '15s'")
             started = _scalar(db, "SELECT COUNT(*) FROM bot_users WHERE started_at IS NOT NULL")
             active = _scalar(
                 db,
@@ -197,11 +301,12 @@ class AnalyticsStore:
                 for row in db.execute(
                     """
                     SELECT u.user_id, u.username, u.full_name,
-                        COUNT(d.id) AS downloads,
+                        u.archived_successful_downloads + COUNT(d.id) AS downloads,
                         (
                             SELECT d2.url
                             FROM downloads d2
                             WHERE d2.user_id = u.user_id AND d2.status = 'success'
+                              AND (d2.privacy_expires_at IS NULL OR d2.privacy_expires_at > now())
                             ORDER BY d2.finished_at DESC NULLS LAST, d2.id DESC
                             LIMIT 1
                         ) AS last_download_url
@@ -211,7 +316,7 @@ class AnalyticsStore:
                     ORDER BY downloads DESC, u.last_seen_at DESC
                     """
                 )
-            ]
+            ] if include_users else []
             top = [
                 FanficStats(url=row["url"], title=row["title"] or row["url"], downloads=int(row["downloads"]))
                 for row in db.execute(
@@ -229,7 +334,7 @@ class AnalyticsStore:
         return AnalyticsSnapshot(started, active, attempts, successes, ratio, users, top)
 
     def _initialize(self) -> None:
-        with self.lock, self._connect() as db:
+        with self.lock, self._connect() as db, db.transaction():
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bot_users (
@@ -246,7 +351,7 @@ class AnalyticsStore:
                 """
                 CREATE TABLE IF NOT EXISTS downloads (
                     id BIGSERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL REFERENCES bot_users(user_id) ON DELETE CASCADE,
+                    user_id BIGINT REFERENCES bot_users(user_id) ON DELETE CASCADE,
                     url TEXT NOT NULL,
                     title TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL CHECK (status IN ('attempt', 'success', 'error')),
@@ -256,6 +361,10 @@ class AnalyticsStore:
                 )
                 """
             )
+            db.execute("ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS archived_successful_downloads BIGINT NOT NULL DEFAULT 0")
+            db.execute("ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS profile_expires_at TIMESTAMPTZ")
+            db.execute("ALTER TABLE downloads ADD COLUMN IF NOT EXISTS privacy_expires_at TIMESTAMPTZ")
+            db.execute("ALTER TABLE downloads ALTER COLUMN user_id DROP NOT NULL")
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_format_settings (
@@ -279,6 +388,7 @@ class AnalyticsStore:
                         FROM pg_constraint c
                         JOIN pg_class t ON t.oid = c.conrelid
                         WHERE t.relname = 'user_format_settings'
+                          AND t.relnamespace = to_regnamespace(current_schema())
                           AND c.contype = 'c'
                           AND pg_get_constraintdef(c.oid) LIKE '%<@%'
                     LOOP
@@ -310,6 +420,10 @@ class AnalyticsStore:
             db.execute("CREATE INDEX IF NOT EXISTS idx_downloads_attempted_at ON downloads(attempted_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_downloads_url_status ON downloads(url, status)")
             db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_downloads_privacy_expiry ON downloads(privacy_expires_at, id) "
+                "WHERE user_id IS NOT NULL"
+            )
+            db.execute(
                 """
                 CREATE OR REPLACE VIEW analytics_summary AS
                 SELECT
@@ -332,11 +446,12 @@ class AnalyticsStore:
                 """
                 CREATE OR REPLACE VIEW analytics_users AS
                 SELECT u.user_id, u.username, u.full_name,
-                    COUNT(d.id) AS downloaded_fanfics,
+                    u.archived_successful_downloads + COUNT(d.id) AS downloaded_fanfics,
                     (
                         SELECT d2.url
                         FROM downloads d2
                         WHERE d2.user_id = u.user_id AND d2.status = 'success'
+                          AND (d2.privacy_expires_at IS NULL OR d2.privacy_expires_at > now())
                         ORDER BY d2.finished_at DESC NULLS LAST, d2.id DESC
                         LIMIT 1
                     ) AS last_download_url,
@@ -361,7 +476,7 @@ class AnalyticsStore:
             )
 
     def _connect(self) -> psycopg.Connection:
-        return psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row)
+        return psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row, connect_timeout=5)
 
 
 def render_prometheus(snapshot: AnalyticsSnapshot) -> str:
@@ -381,17 +496,7 @@ def render_prometheus(snapshot: AnalyticsSnapshot) -> str:
         "# HELP ficbook_bot_download_success_ratio Successful downloads divided by all attempts.",
         "# TYPE ficbook_bot_download_success_ratio gauge",
         f"ficbook_bot_download_success_ratio {snapshot.success_ratio:.6f}",
-        "# HELP ficbook_bot_user_downloads_total Successful downloads by user.",
-        "# TYPE ficbook_bot_user_downloads_total gauge",
     ]
-    for user in snapshot.users:
-        labels = _labels(
-            user_id=str(user.user_id),
-            username=user.username,
-            full_name=user.full_name,
-            last_download_url=user.last_download_url,
-        )
-        lines.append(f"ficbook_bot_user_downloads_total{{{labels}}} {user.downloads}")
     lines.extend(
         [
             "# HELP ficbook_bot_top_fanfic_downloads Top 5 fanfics by successful downloads.",
@@ -399,7 +504,7 @@ def render_prometheus(snapshot: AnalyticsSnapshot) -> str:
         ]
     )
     for rank, fanfic in enumerate(snapshot.top_fanfics, 1):
-        labels = _labels(rank=str(rank), title=fanfic.title, url=fanfic.url)
+        labels = _labels(rank=str(rank))
         lines.append(f"ficbook_bot_top_fanfic_downloads{{{labels}}} {fanfic.downloads}")
     return "\n".join(lines) + "\n"
 
@@ -414,3 +519,20 @@ def _escape_label(value: str) -> str:
 
 def _scalar(db: psycopg.Connection, query: str) -> int:
     return int(db.execute(query).fetchone()["count"] or 0)
+
+
+def _public_story_url(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        if parts.scheme not in {"http", "https"} or parts.username or parts.password:
+            return ""
+        query = ""
+        if parts.hostname in {"hogwartsnet.ru", "www.hogwartsnet.ru"}:
+            fid = parse_qs(parts.query).get("fid", [""])[0]
+            if not fid.isdecimal():
+                return ""
+            query = urlencode({"fid": fid})
+        public_url = urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
+        return normalize_url(public_url) if is_supported_story_url(public_url) else ""
+    except ValueError:
+        return ""

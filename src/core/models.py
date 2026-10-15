@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 class Chapter:
     title: str
     html: str
+    source_url: str = ""
 
 
 @dataclass(slots=True)
@@ -51,3 +52,6 @@ class Story:
     word_count: str = ""
     cover: CoverImage | None = None
     chapters: list[Chapter] = field(default_factory=list)
+    translator: str = ""
+    # Full frontmatter already includes title, credits and size.
+    annotation_complete: bool = False

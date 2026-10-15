@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import EditMessageText
+from aiogram.types import ReplyKeyboardMarkup
 
 from src.bot.app import _process_download
 from src.core.download_queue import DownloadQueuePool
@@ -16,14 +17,27 @@ from src.sources.ficbook import FicbookPaidContentError, FicbookSiteStatus, Ficb
 
 
 class SentMessage:
-    def __init__(self, text: str, events: list[str], reject_final: bool = False) -> None:
+    def __init__(
+        self,
+        text: str,
+        events: list[str],
+        reject_final: bool = False,
+        *,
+        reply_markup: object = None,
+    ) -> None:
         self.text = text
         self.events = events
         self.reject_final = reject_final
+        self.reply_markup = reply_markup
         self.edits: list[str] = []
         self.deleted = False
 
     async def edit_text(self, text: str) -> None:
+        if isinstance(self.reply_markup, ReplyKeyboardMarkup):
+            raise TelegramBadRequest(
+                method=EditMessageText(chat_id=1, message_id=1, text=text),
+                message="Bad Request: message can't be edited",
+            )
         if self.reject_final and "Отправляем..." in text:
             raise TelegramBadRequest(
                 method=EditMessageText(chat_id=1, message_id=1, text=text),
@@ -45,14 +59,21 @@ class IncomingMessage:
         self.reject_final = reject_final
         self.events: list[str] = []
         self.statuses: list[SentMessage] = []
+        self.documents: list[dict[str, object]] = []
 
-    async def answer(self, text: str, **_: object) -> SentMessage:
-        status = SentMessage(text, self.events, self.reject_final and bool(self.statuses))
+    async def answer(self, text: str, **kwargs: object) -> SentMessage:
+        status = SentMessage(
+            text,
+            self.events,
+            self.reject_final and bool(self.statuses),
+            reply_markup=kwargs.get("reply_markup"),
+        )
         self.statuses.append(status)
         self.events.append(f"answer:{text}")
         return status
 
-    async def answer_document(self, *_: object, **__: object) -> None:
+    async def answer_document(self, *_: object, **kwargs: object) -> None:
+        self.documents.append(kwargs)
         self.events.append("document")
 
 
@@ -61,6 +82,18 @@ class FakeClient:
         progress("Скачиваю страницу фанфика")
         sleep(0.03)
         return Story("Test", "Author", url)
+
+
+class FastClient(FakeClient):
+    def download(self, url: str, progress, **_: object) -> Story:
+        progress("Скачиваю страницу фанфика")
+        return Story("Test", "Author", url)
+
+
+class HtmlTitleClient(FakeClient):
+    def download(self, url: str, progress, **_: object) -> Story:
+        progress("Скачиваю страницу фанфика")
+        return Story('<hacker kook="taehyung pawn">', "Author", url)
 
 
 class OutageThenSuccessClient(FakeClient):
@@ -99,13 +132,15 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
         message: IncomingMessage,
         client: FakeClient | None = None,
         url: str = "https://archiveofourown.org/works/1",
+        *,
+        update_interval: float = 0.005,
     ) -> None:
         patches = (
             patch("src.bot.app._start_download", AsyncMock(return_value=None)),
             patch("src.bot.app._finish_download", AsyncMock()),
             patch("src.bot.app._build_selected_files", AsyncMock(return_value=[("txt", b"file")])),
             patch("src.bot.app.ChatActionSender.upload_document", return_value=NoopAction()),
-            patch("src.bot.app.ACTIVE_PROGRESS_UPDATE_SECONDS", 0.005),
+            patch("src.bot.app.ACTIVE_PROGRESS_UPDATE_SECONDS", update_interval),
         )
         with patches[0], patches[1], patches[2], patches[3], patches[4]:
             await _process_download(
@@ -126,12 +161,48 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Отправляем...", active.edits[-1])
         self.assertLess(message.events.index(f"edit:{active.edits[-1]}"), message.events.index("document"))
 
+    async def test_fast_download_updates_progress_before_timer_and_sending(self) -> None:
+        message = IncomingMessage()
+
+        await self._run_download(message, FastClient(), update_interval=60.0)
+
+        active = message.statuses[1]
+        progress_edit = next((text for text in active.edits if "20%" in text), None)
+        self.assertIsNotNone(progress_edit)
+        final_edit = active.edits[-1]
+        self.assertIn("Отправляем...", final_edit)
+        self.assertLess(
+            message.events.index(f"edit:{progress_edit}"),
+            message.events.index(f"edit:{final_edit}"),
+        )
+        self.assertLess(message.events.index(f"edit:{final_edit}"), message.events.index("document"))
+
+    async def test_status_messages_allow_edits_and_document_restores_keyboard(self) -> None:
+        message = IncomingMessage()
+
+        await self._run_download(message)
+
+        queued, active = message.statuses
+        self.assertIsNone(queued.reply_markup)
+        self.assertIsNone(active.reply_markup)
+        self.assertIsInstance(message.documents[-1]["reply_markup"], ReplyKeyboardMarkup)
+
     async def test_rejected_final_edit_does_not_discard_completed_file(self) -> None:
         message = IncomingMessage(reject_final=True)
 
         await self._run_download(message)
 
         self.assertIn("document", message.events)
+
+    async def test_document_caption_escapes_html_title(self) -> None:
+        message = IncomingMessage()
+
+        await self._run_download(message, HtmlTitleClient())
+
+        self.assertEqual(
+            message.documents[0]["caption"],
+            "&lt;hacker kook=&quot;taehyung pawn&quot;&gt; (TXT)",
+        )
 
     async def test_ficbook_outage_keeps_active_job_and_retries_after_recovery(self) -> None:
         message = IncomingMessage()

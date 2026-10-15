@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from aiogram.types import Message
+
 from src.core.models import StoryPreview
 
 
@@ -25,3 +27,9 @@ class PendingChapterSelection:
     formats: tuple[str, ...]
     cover_enabled: bool
     preview: StoryPreview
+
+
+@dataclass(slots=True)
+class PendingSupportMessage:
+    message: Message
+    confirmation: Message

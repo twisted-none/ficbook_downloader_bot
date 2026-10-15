@@ -5,18 +5,20 @@ from configparser import DuplicateSectionError
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from html import escape
 from http.cookiejar import CookieJar
 import json
 import logging
 import mimetypes
 from pathlib import Path
 import re
+import ssl
 from threading import Lock
 from time import sleep
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
-from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, HTTPSHandler, Request, build_opener, urlopen
 
 import fanficfare
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -24,6 +26,7 @@ from fanficfare import adapters, exceptions
 from fanficfare.configurable import Configuration
 from fanficfare.exceptions import HTTPErrorFFF
 
+from src.sources.ao3 import download_html_chapters
 from src.sources.litnet import (
     LitnetClient,
     LitnetError,
@@ -93,6 +96,35 @@ class FicbookRateLimitError(FicbookError):
 
 class FicbookLoginError(FicbookError):
     """The account assigned to a queue could not authenticate."""
+
+
+def _require_hogwartsnet_https(url: str) -> None:
+    try:
+        parts = urlsplit(url)
+        safe = (
+            parts.scheme == "https"
+            and parts.hostname in {"hogwartsnet.ru", "www.hogwartsnet.ru"}
+            and parts.port in {None, 443}
+            and parts.username is None
+            and parts.password is None
+            and "\\" not in url
+            and not any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)
+        )
+    except ValueError:
+        safe = False
+    if not safe:
+        raise FicbookError(
+            "Не удалось установить безопасное соединение с Hogwartsnet. Попробуй повторить позже.",
+            technical="Hogwartsnet rejected an insecure URL or redirect.",
+        )
+
+
+class _HogwartsnetHTTPSRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str,
+    ) -> Any:
+        _require_hogwartsnet_https(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class FicbookPaidContentError(FicbookError):
@@ -353,7 +385,7 @@ class FicbookClient:
             for position, (chapter_index, chapter) in enumerate(selected_chapters, 1):
                 _report(progress, f"Скачиваю главы: {position}/{len(selected_chapters)}")
                 self._pause_between_requests()
-                chapters.append(Chapter(title=chapter["title"], html=self._load_chapter_html(adapter, chapter["url"])))
+                chapters.append(Chapter(title=chapter["title"], html=self._load_chapter_html(adapter, chapter["url"]), source_url=chapter["url"]))
         except exceptions.AdultCheckRequired as exc:
             raise FicbookError(
                 self._adult_message(account),
@@ -366,6 +398,8 @@ class FicbookClient:
             ) from exc
         except (exceptions.UnknownSite, exceptions.StoryDoesNotExist) as exc:
             raise FicbookNotFoundError("Не удалось найти фанфик по этой ссылке.") from exc
+        except FicbookError:
+            raise
         except Exception as exc:
             if _is_rate_limited(exc):
                 raise FicbookRateLimitError("Ficbook временно ограничил запросы.", technical=repr(exc)) from exc
@@ -378,6 +412,8 @@ class FicbookClient:
             source_url=normalized,
             description=story.getMetadata("description") or "",
             annotation_html=self._build_annotation_html(story, page_soup, normalized),
+            annotation_complete=True,
+            translator=self._safe_text(story.getMetadata("translator")),
             language=story.getMetadata("language") or "ru",
             published=story.getMetadata("datePublished") or "",
             updated=story.getMetadata("dateUpdated") or "",
@@ -457,6 +493,8 @@ class FicbookClient:
             ) from exc
         except (exceptions.UnknownSite, exceptions.StoryDoesNotExist) as exc:
             raise FicbookNotFoundError("Не удалось найти фанфик по этой ссылке.") from exc
+        except FicbookError:
+            raise
         except Exception as exc:
             if _is_rate_limited(exc):
                 raise FicbookRateLimitError("Ficbook временно ограничил запросы.", technical=repr(exc)) from exc
@@ -495,6 +533,13 @@ class FicbookClient:
             story = self._get_story_metadata(adapter, normalized)
             chapter_links = adapter.get_chapters()
             selected_chapters = select_chapter_links(chapter_links, chapter_numbers)
+            if _site_key(normalized) == 'archiveofourown.org':
+                downloaded = download_html_chapters(
+                    adapter, normalized, chapter_links, selected_chapters,
+                    story.getMetadata('description') or '', progress, self._pause_between_requests,
+                )
+                if downloaded is not None:
+                    return self._story_from_fanficfare_metadata(story, normalized, downloaded)
             chapters: list[Chapter] = []
             for position, (chapter_index, chapter) in enumerate(selected_chapters, 1):
                 _report(progress, f"Скачиваю главы: {position}/{len(selected_chapters)}")
@@ -502,6 +547,7 @@ class FicbookClient:
                 chapters.append(
                     Chapter(
                         title=chapter.get("title") or f"Глава {chapter_index}",
+                        source_url=chapter["url"],
                         html=self._fanficfare_chapter_html(
                             adapter, normalized, chapter["url"], chapter_index, position,
                             len(selected_chapters), progress,
@@ -651,7 +697,7 @@ class FicbookClient:
                     user_message=self._adult_user_message(normalized),
                 )
             title, html = self._hogwartsnet_chapter(chapter_soup, chapter.get("title") or f"Глава {chapter_index}")
-            chapters.append(Chapter(title=title, html=html))
+            chapters.append(Chapter(title=title, html=html, source_url=chapter["url"]))
         return Story(
             title=metadata["title"],
             author=metadata["author"],
@@ -685,7 +731,12 @@ class FicbookClient:
         )
 
     def _hogwartsnet_opener(self, url: str, account: FicbookAccount) -> Any:
-        opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        _require_hogwartsnet_https(url)
+        opener = build_opener(
+            HTTPCookieProcessor(CookieJar()),
+            HTTPSHandler(context=ssl.create_default_context()),
+            _HogwartsnetHTTPSRedirectHandler(),
+        )
         if account.login and account.password:
             payload = urlencode({"id": account.login, "pwd": account.password}).encode("cp1251")
             self._hogwartsnet_open(opener, url, data=payload)
@@ -695,6 +746,7 @@ class FicbookClient:
         return BeautifulSoup(self._hogwartsnet_open(opener, url), "lxml")
 
     def _hogwartsnet_open(self, opener: Any, url: str, data: bytes | None = None) -> str:
+        _require_hogwartsnet_https(url)
         request = Request(
             url,
             data=data,
@@ -709,6 +761,11 @@ class FicbookClient:
         except (HTTPError, URLError) as exc:
             if _is_rate_limited(exc):
                 raise FicbookRateLimitError("Hogwartsnet временно ограничил запросы.", technical=repr(exc)) from exc
+            if isinstance(exc, URLError) and isinstance(exc.reason, ssl.SSLError):
+                raise FicbookError(
+                    "Не удалось проверить защищённое соединение с Hogwartsnet. Попробуй повторить позже.",
+                    technical="Hogwartsnet TLS verification failed.",
+                ) from exc
             raise _friendly_download_error(url, exc) from exc
 
     def _hogwartsnet_metadata(self, soup: BeautifulSoup, source_url: str) -> dict[str, Any]:
@@ -801,6 +858,8 @@ class FicbookClient:
     def _build_config(self, url: str, account: FicbookAccount) -> Configuration:
         config = Configuration(adapters.getConfigSectionsFor(url), "epub")
         config.read([str(self.defaults_ini)])
+        if urlsplit(url).hostname == "ficbook.net":
+            config.set("ficbook.net", "add_to_extra_valid_entries", ",translator,translatorUrl")
         try:
             config.add_section("overrides")
         except DuplicateSectionError:
@@ -846,9 +905,14 @@ class FicbookClient:
                 technical=f"Failed to recover Ficbook title: {url}",
             )
         self._fill_ficbook_author_metadata(story, soup)
+        self._fill_size_metadata(story, soup)
         if not adapter.get_chapters():
             self._fill_ficbook_chapter_links(adapter, soup, url)
         if not adapter.get_chapters():
+            if story.getMetadata("pages") == "0" and story.getMetadata("numWords") == "0":
+                raise FicbookNotFoundError(
+                    "В фанфике нет доступного текста: Ficbook сообщает 0 страниц и 0 слов."
+                )
             raise FicbookError(
                 "Не удалось прочитать список глав Ficbook.",
                 technical=f"Failed to recover Ficbook chapters: {url}",
@@ -895,19 +959,49 @@ class FicbookClient:
         return ""
 
     def _fill_ficbook_author_metadata(self, story: Any, soup: BeautifulSoup) -> None:
-        if story.getMetadata("author"):
-            return
-        author = soup.select_one("a.creator-username") or soup.find("a", href=re.compile(r"^/authors/"))
-        if not isinstance(author, Tag):
-            return
-        name = self._tag_text(author)
-        if not name:
-            return
-        story.setMetadata("author", name)
-        story.setMetadata("authorId", name)
-        href = self._safe_text(author.get("href"))
-        if href:
-            story.setMetadata("authorUrl", f"https://ficbook.net{href}" if href.startswith("/") else href)
+        credits: dict[str, list[tuple[str, str]]] = {"author": [], "translator": []}
+        links = soup.select(".hat-creator-container .creator-username, .creator-info .creator-username")
+        if not links:
+            links = soup.select("a.creator-username")
+        for link in links:
+            container = link.find_parent(class_=re.compile(r"^(hat-creator-container|creator-info)$"))
+            role_node = container.select_one(".small-text.text-muted") if container else None
+            role = self._tag_text(role_node).lower() if role_node else ""
+            key = "translator" if "переводчик" in role else "author"
+            if role and not any(word in role for word in ("автор", "переводчик")):
+                continue
+            name = self._tag_text(link)
+            href = self._safe_text(link.get("href"))
+            url = f"https://ficbook.net{href}" if href.startswith("/") else href
+            if name and (name, url) not in credits[key]:
+                credits[key].append((name, url))
+        for label in soup.find_all(["strong", "b", "dt"]):
+            if not re.fullmatch(r"Автор(?:ы)? оригинала\s*:?", self._tag_text(label), re.I):
+                continue
+            value = label.find_next_sibling()
+            if not isinstance(value, Tag):
+                continue
+            name = self._tag_text(value)
+            if not name:
+                continue
+            link = value if value.name == "a" else value.find("a", href=True)
+            credits["author"] = [(name, self._safe_text(link.get("href")) if link else "")]
+            break
+        # Legacy pages may have a bare author link, but role-labelled pages must
+        # never substitute a translator or beta for a missing original author.
+        if not links and not credits["author"]:
+            link = soup.find("a", href=re.compile(r"^/authors/"))
+            if isinstance(link, Tag) and self._tag_text(link):
+                credits["author"].append((self._tag_text(link), f"https://ficbook.net{link['href']}"))
+        for key, people in credits.items():
+            if people:
+                story.setMetadata(key, ", ".join(name for name, _ in people))
+                story.setMetadata(key + "Url", people[0][1] if len(people) == 1 else "")
+        if credits["author"]:
+            story.setMetadata("authorId", story.getMetadata("author"))
+        elif credits["translator"]:
+            story.setMetadata("author", "")
+            story.setMetadata("authorUrl", "")
 
     def _fill_ficbook_chapter_links(self, adapter: Any, soup: BeautifulSoup, url: str) -> None:
         story_id = self._safe_text(adapter.story.getMetadata("storyId"))
@@ -925,7 +1019,8 @@ class FicbookClient:
             seen.add(parsed.path.rstrip("/"))
             chapter_url = f"https://ficbook.net{parsed.path.rstrip('/')}#part_content"
             adapter.add_chapter(self._tag_text(link) or f"Глава {len(seen)}", chapter_url)
-        if not seen and not soup.select_one("ul.list-of-fanfic-parts") and soup.find("div", {"id": "content"}):
+        chapter = soup.select_one("div#content, div.public_beta_disabled")
+        if not seen and not soup.select_one("ul.list-of-fanfic-parts li.part") and chapter:
             adapter.add_chapter(adapter.story.getMetadata("title"), url)
 
     def _fill_optional_ficbook_metadata(self, adapter: Any, soup: BeautifulSoup, *, get_cover: bool = True) -> None:
@@ -1104,7 +1199,7 @@ class FicbookClient:
 
     def _load_chapter_html(self, adapter: Any, url: str) -> str:
         soup = adapter.make_soup(adapter.get_request(url))
-        chapter = soup.find("div", {"id": "content"}) or soup.find("div", {"class": "public_beta_disabled"})
+        chapter = soup.select_one("div#content, div.public_beta_disabled")
         if chapter is None:
             raise FicbookError(
                 "Не удалось скачать одну из глав. Попробуй повторить позже.",
@@ -1127,29 +1222,35 @@ class FicbookClient:
         )
 
     def _build_annotation_html(self, story: Any, page_soup: BeautifulSoup, source_url: str) -> str:
-        parts: list[str] = [
-            f"<p>{self._text_line(story.getMetadata('title'), source_url)}</p>",
-            f"<p>Направленность: {self._safe_text(story.getMetadata('classification'))}</p>",
-            f"<p>{self._text_line(story.getMetadata('author'), story.getMetadata('authorUrl'), 'Автор')}</p>",
-        ]
-        self._append_label_value(parts, "Фэндом", story.getList("category"))
-        if story.getMetadata("rating"):
-            parts.append(f"<p>Рейтинг: {self._safe_text(story.getMetadata('rating'))}</p>")
-        if story.getMetadata("numChapters"):
-            parts.append(f"<p>Кол-во частей:{self._safe_text(story.getMetadata('numChapters'))}</p>")
+        parts: list[str] = []
+        def row(label: str, value: Any) -> None:
+            text = self._safe_text(value)
+            if text:
+                parts.append(f"<p>{escape(label)}: {escape(text)}</p>")
+        parts.append(f"<p>{escape(self._safe_text(story.getMetadata('title')))}</p>")
+        row("Ссылка", source_url)
+        row("Автор", self._text_line(story.getMetadata("author"), story.getMetadata("authorUrl")))
+        row("Переводчик", self._text_line(story.getMetadata("translator"), story.getMetadata("translatorUrl")))
+        row("Направленность", story.getMetadata("classification"))
+        row("Фэндом", ", ".join(story.getList("category")))
+        row("Пейринг и персонажи", ", ".join(story.getList("ships")))
+        row("Рейтинг", story.getMetadata("rating"))
+        row("Страниц", story.getMetadata("pages"))
+        row("Слов", self._safe_text(story.getMetadata("numWords")).replace(",", " "))
+        row("Кол-во частей", story.getMetadata("numChapters"))
         status = self._status_text(story.getMetadata("status"))
         if status:
             parts.append("<p>Статус:</p>")
-            parts.append(f"<p>{status}</p>")
+            parts.append(f"<p>{escape(status)}</p>")
         start_date = self._safe_text(story.getMetadata("dateStart") or story.getMetadata("datePublished"))
         if start_date:
             parts.append("<p>Дата начала:</p>")
-            parts.append(f"<p>{start_date}</p>")
+            parts.append(f"<p>{escape(start_date)}</p>")
         finish_date = self._safe_text(story.getMetadata("dateFinish"))
         if finish_date:
             parts.append("<p>Дата завершения:</p>")
-            parts.append(f"<p>{finish_date}</p>")
-        self._append_label_value(parts, "Метки", story.getList("genre"))
+            parts.append(f"<p>{escape(finish_date)}</p>")
+        row("Метки", ", ".join(story.getList("genre")))
         description = story.getMetadata("description")
         if description:
             parts.append("<p>Описание:</p>")
@@ -1161,7 +1262,7 @@ class FicbookClient:
         publication = self._publication_notice(page_soup)
         if publication:
             parts.append("<p>Публикация на других ресурсах:</p>")
-            parts.append(f"<p>{publication}</p>")
+            parts.append(f"<p>{escape(publication)}</p>")
         return "".join(part for part in parts if part)
 
     def _build_generic_annotation_html(
@@ -1244,13 +1345,15 @@ class FicbookClient:
                 assigned[note_id] = number
                 rendered_notes.append((number, self._sanitize_note_html(raw_note)))
             marker = soup.new_tag("sup", attrs={"class": "footnote-ref"})
-            marker.string = f"[{number}]"
+            link = soup.new_tag("a", href=f"#footnote-{number}")
+            link.string = f"[{number}]"
+            marker.append(link)
             reference.replace_with(marker)
         parts = [self._render_preline_container(chapter)]
         if rendered_notes:
             parts.append('<div class="interactive-footnotes"><p><b>Интерактивные примечания:</b></p>')
             for number, note_html in rendered_notes:
-                parts.extend((f"<p><b>[{number}]</b></p>", self._render_preline_html(note_html)))
+                parts.extend((f'<div id="footnote-{number}"><p><b>[{number}]</b></p>', self._render_preline_html(note_html), '</div>'))
             parts.append("</div>")
         return "".join(parts)
 

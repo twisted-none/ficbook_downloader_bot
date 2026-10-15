@@ -11,6 +11,7 @@ from src.sources.ficbook import (
     FicbookChapterDownloadError,
     FicbookClient,
     FicbookError,
+    FicbookNotFoundError,
     FicbookSiteStatus,
     FicbookSiteUnavailableError,
     classify_ficbook_homepage,
@@ -193,10 +194,28 @@ class FicbookMetadataTests(unittest.TestCase):
 
     def test_primary_parser_accepts_single_chapter_without_optional_metadata(self) -> None:
         adapter = FakeFicbookAdapter(
-            '<section class="chapter-info"><h1>Title</h1></section><div id="content">Text</div>'
+            '<section class="chapter-info"><h1>Title</h1></section>'
+            '<ul class="list-of-fanfic-parts"></ul>'
+            '<a href="/readfic/018f3425-37e3-7752-9c98-c6b1b22ca383#part_content">Начать читать</a>'
+            '<div id="content" class="part_text">Text</div>'
         )
         self.client._get_story_metadata(adapter, adapter.url)
         self.assertEqual(adapter.get_chapters(), [{"title": "Title", "url": adapter.url}])
+        self.assertEqual(self.client._load_chapter_html(adapter, adapter.url), "<p>Text</p>")
+
+    def test_empty_ficbook_reports_missing_text(self) -> None:
+        adapter = FakeFicbookAdapter(
+            '<section class="chapter-info"><h1>Empty</h1></section>'
+            '<ul class="list-of-fanfic-parts"></ul>'
+            '<article id="part_content"><h2>Содержание</h2></article>'
+            '<strong>Размер:</strong><div>0 страниц, 0 слов, 1 часть</div>'
+        )
+
+        with self.assertRaisesRegex(
+            FicbookNotFoundError,
+            "Ficbook сообщает 0 страниц и 0 слов",
+        ):
+            self.client._get_story_metadata(adapter, adapter.url)
 
     def test_primary_parser_preserves_access_and_not_found_errors(self) -> None:
         from fanficfare import adapters, exceptions
@@ -371,7 +390,7 @@ class FicbookMetadataTests(unittest.TestCase):
     def test_hogwartsnet_url_is_normalized_to_story_root(self) -> None:
         self.assertEqual(
             normalize_url("https://hogwartsnet.ru/mfanf/ffshowfic.php?fid=123&chapter=4"),
-            "http://hogwartsnet.ru/mfanf/ffshowfic.php?fid=123",
+            "https://hogwartsnet.ru/mfanf/ffshowfic.php?fid=123",
         )
 
     def test_ficbook_accounts_rotate_for_parallel_downloads(self) -> None:

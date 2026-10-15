@@ -28,8 +28,8 @@ def normalize_url(url: str) -> str:
     host = parts.netloc.lower()
     if "ficbook." in host:
         host = host.replace("www.", "").replace("ficbook.com", "ficbook.net")
-    if "hogwartsnet.ru" in host:
-        scheme = "http"
+    if host in {"hogwartsnet.ru", "www.hogwartsnet.ru"}:
+        scheme = "https"
         host = "hogwartsnet.ru"
     if host.replace("www.", "") == "litnet.com":
         scheme = "https"
@@ -44,7 +44,7 @@ def normalize_url(url: str) -> str:
         if len(segments) >= 2:
             path = f"/{segments[0]}/{segments[1]}"
             query = ""
-    if "hogwartsnet.ru" in host:
+    if host == "hogwartsnet.ru":
         params = parse_qs(query)
         fid = params.get("fid", [""])[0]
         query = urlencode({"fid": fid}) if fid else query

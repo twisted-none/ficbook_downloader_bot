@@ -59,6 +59,13 @@ def support_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def support_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Скачать фанфик", callback_data="support:download")],
+        [InlineKeyboardButton(text="Отправить в поддержку", callback_data="support:send")],
+    ])
+
+
 def reply_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"support:reply:{user_id}")]]

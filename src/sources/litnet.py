@@ -10,13 +10,15 @@ from threading import Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import Request
 
 from bs4 import BeautifulSoup, Tag
 
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.sources.safe_http import UnsafeRequestError, build_safe_opener, require_https_url
 
 MAX_COVER_BYTES = 8 * 1024 * 1024
+LITNET_HOSTS = frozenset({"litnet.com", "www.litnet.com"})
 LOGIN_URL = (
     "https://litnet.com/auth/login?classic=1&"
     "link=https%3A%2F%2Flitnet.com%2Fru%2Fsite%2Flibrary"
@@ -64,7 +66,8 @@ class LitnetClient:
     def __init__(self, login: str = "", password: str = "") -> None:
         self.login = login
         self.password = password
-        self._opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        self._opener = build_safe_opener(LITNET_HOSTS, cookie_jar=CookieJar())
+        self._cover_opener = build_safe_opener()
         self._authenticated = False
         self._lock = Lock()
 
@@ -99,7 +102,7 @@ class LitnetClient:
                     except LitnetLoginError as exc:
                         raise self._protected_chapter_login_error(chapter.index, exc) from exc
                     html = self._chapter_html(self._soup(f"{url}?c={chapter.chapter_id}"))
-                bodies.append(Chapter(chapter.title, html))
+                bodies.append(Chapter(chapter.title, html, f"{url}?c={chapter.chapter_id}"))
             return self._story(url, reader, book, bodies)
 
     def preview(self, url: str) -> StoryPreview:
@@ -138,6 +141,12 @@ class LitnetClient:
         payload["LoginForm[login]"] = self.login
         payload["LoginForm[password]"] = self.password
         action = urljoin(LOGIN_URL, str(form.get("action") or LOGIN_URL))
+        try:
+            parts = require_https_url(action, frozenset({"litnet.com"}))
+            if parts.path not in {"/auth/login", "/auth/login/"}:
+                raise UnsafeRequestError()
+        except UnsafeRequestError:
+            raise LitnetLoginError("Litnet вернул небезопасный адрес формы входа.") from None
         response = self._soup(action, urlencode(payload).encode("utf-8"))
         if response.select_one("input[name='LoginForm[login]']"):
             if self._requires_captcha(response):
@@ -272,8 +281,12 @@ class LitnetClient:
         if not url:
             return None
         try:
-            data, content_type = self._open_bytes(url)
-        except LitnetError:
+            require_https_url(url)
+            request = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; FicbookDownloaderBot/1.0)"})
+            with self._cover_opener.open(request, timeout=30) as response:
+                data = response.read(MAX_COVER_BYTES + 1)
+                content_type = response.headers.get_content_type()
+        except (URLError, OSError, ValueError):
             return None
         if not data or len(data) > MAX_COVER_BYTES:
             return None
@@ -287,6 +300,10 @@ class LitnetClient:
         return BeautifulSoup(payload.decode("utf-8", "ignore"), "lxml")
 
     def _open_bytes(self, url: str, data: bytes | None = None) -> tuple[bytes, str]:
+        try:
+            require_https_url(url, LITNET_HOSTS)
+        except UnsafeRequestError:
+            raise LitnetError("Litnet: запрос заблокирован проверкой безопасности.") from None
         request = Request(
             url,
             data=data,
@@ -298,6 +315,8 @@ class LitnetClient:
         try:
             with self._opener.open(request, timeout=30) as response:
                 return response.read(), response.headers.get_content_type()
+        except UnsafeRequestError:
+            raise LitnetError("Не удалось безопасно подключиться к Litnet. Проверь настройки сети и прокси.") from None
         except HTTPError as exc:
             if exc.code == 429:
                 raise LitnetRateLimitError("Litnet временно ограничил запросы.") from exc

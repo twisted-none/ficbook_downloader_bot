@@ -10,6 +10,7 @@ from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from src.core.models import Chapter, Story
+from src.exporters.navigation import chapter_id, prepare_chapters
 
 SKIP_TAGS = {"audio", "iframe", "img", "script", "style", "video"}
 CONTAINER_TAGS = {"article", "div", "section"}
@@ -31,7 +32,7 @@ li { margin: 0.25em 0; }
 
 def build_epub(story: Story) -> bytes:
     book_id = str(uuid5(NAMESPACE_URL, story.source_url))
-    chapters = [_chapter_page(index, chapter) for index, chapter in enumerate(story.chapters, 1)]
+    chapters = [_chapter_page(index, chapter) for index, chapter in enumerate(prepare_chapters(story), 1)]
     intro = _page("intro.xhtml", "Аннотация", _intro_body(story))
     files = [intro, *chapters]
     if story.cover:
@@ -52,8 +53,15 @@ def build_epub(story: Story) -> bytes:
 
 
 def _chapter_page(index: int, chapter: Chapter) -> dict[str, str]:
-    body = _clean_blocks(chapter.html) or "<p></p>"
-    return _page(f"chapter-{index:04}.xhtml", chapter.title or f"Глава {index}", body)
+    soup = BeautifulSoup(chapter.html, 'lxml')
+    for link in soup.select('a[href^="#"]'):
+        destination = str(link['href'])[1:]
+        match = re.match(r'(?:c(\d+)-|chapter-(\d+)$)', destination)
+        if match:
+            target_index = int(match.group(1) or match.group(2))
+            link['href'] = f'chapter-{target_index:04d}.xhtml#{destination}'
+    body = _clean_blocks((soup.body or soup).decode_contents()) or "<p></p>"
+    return _page(f"chapter-{index:04}.xhtml", chapter.title or f"Глава {index}", body, chapter_id(index))
 
 
 def _cover_page(story: Story) -> dict[str, str]:
@@ -63,6 +71,8 @@ def _cover_page(story: Story) -> dict[str, str]:
 
 
 def _intro_body(story: Story) -> str:
+    if story.annotation_complete:
+        return _clean_blocks(story.annotation_html or story.description, "meta")
     meta = []
     if story.page_count:
         meta.append(f"<p>Страниц: {escape(story.page_count)}</p>")
@@ -74,12 +84,13 @@ def _intro_body(story: Story) -> str:
     return f'<section class="meta">{"".join(meta)}</section>{annotation}' if meta else annotation
 
 
-def _page(href: str, title: str, body: str) -> dict[str, str]:
+def _page(href: str, title: str, body: str, anchor: str = '') -> dict[str, str]:
     safe_title = escape(title)
+    heading_id = f' id="{escape(anchor, quote=True)}"' if anchor else ''
     content = f"""<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" lang="ru">
 <head><title>{safe_title}</title><link rel="stylesheet" href="styles/book.css" type="text/css"/></head>
-<body><h1>{safe_title}</h1>{body}</body></html>"""
+<body><h1{heading_id}>{safe_title}</h1>{body}</body></html>"""
     return {"href": href, "title": title, "content": content}
 
 
@@ -94,6 +105,11 @@ def _clean_blocks(html: str, css_class: str = "") -> str:
 
 
 def _render_block(node: Tag | NavigableString) -> str:
+    anchor = _anchor(node)
+    return anchor + _render_block_content(node)
+
+
+def _render_block_content(node: Tag | NavigableString) -> str:
     if isinstance(node, NavigableString):
         text = _normalize_text(str(node))
         return f"<p>{escape(text)}</p>" if text else ""
@@ -118,13 +134,14 @@ def _render_block(node: Tag | NavigableString) -> str:
 
 
 def _render_list_item(node: Tag | NavigableString) -> str:
+    anchor = _anchor(node)
     if isinstance(node, NavigableString):
         text = escape(_normalize_text(str(node)))
-        return f"<li>{text}</li>" if text else ""
+        return f"<li>{anchor}{text}</li>" if text else ""
     if node.name != "li":
-        return _render_block(node)
+        return anchor + _render_block(node)
     content = _render_inline_children(node) or "".join(_render_block(child) for child in node.children)
-    return f"<li>{content}</li>" if content else ""
+    return f"<li>{anchor}{content}</li>" if content or anchor else ""
 
 
 def _render_inline_children(node: Tag) -> str:
@@ -132,6 +149,16 @@ def _render_inline_children(node: Tag) -> str:
 
 
 def _render_inline(node: Tag | NavigableString) -> str:
+    anchor = _anchor(node)
+    return anchor + _render_inline_content(node)
+
+
+def _anchor(node: Tag | NavigableString) -> str:
+    value = node.attrs.pop('id', '') if isinstance(node, Tag) else ''
+    return f'<a id="{escape(str(value), quote=True)}"></a>' if value else ''
+
+
+def _render_inline_content(node: Tag | NavigableString) -> str:
     if isinstance(node, NavigableString):
         return escape(_normalize_text(str(node)))
     if node.name in SKIP_TAGS:
@@ -140,11 +167,13 @@ def _render_inline(node: Tag | NavigableString) -> str:
         return "<br />"
     content = _render_inline_children(node)
     mapped = INLINE_TAGS.get(node.name)
+    if node.name in {'sup', 'sub'}:
+        return f'<{node.name}>{content}</{node.name}>'
     if mapped and content:
         return f"<{mapped}>{content}</{mapped}>"
     if node.name == "a" and content:
         href = escape(str(node.get("href", "")).strip(), quote=True)
-        return f'<a href="{href}">{content}</a>' if href.startswith(("http://", "https://")) else content
+        return f'<a href="{href}">{content}</a>' if href.startswith(("http://", "https://", "#", "chapter-")) else content
     return content
 
 
@@ -166,7 +195,7 @@ def _container_xml() -> str:
 
 def _opf(story: Story, book_id: str, pages: list[dict[str, str]]) -> str:
     items = "".join(f'<item id="p{i}" href="{p["href"]}" media-type="application/xhtml+xml"/>' for i, p in enumerate(pages))
-    spine = "".join(f'<itemref idref="p{i}"/>' for i, _ in enumerate(pages))
+    spine = '<itemref idref="nav"/>' + "".join(f'<itemref idref="p{i}"/>' for i, _ in enumerate(pages))
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     subjects = "".join(
         f"<dc:subject>{escape(item)}</dc:subject>"
@@ -187,6 +216,7 @@ def _opf(story: Story, book_id: str, pages: list[dict[str, str]]) -> str:
 <package version="3.0" unique-identifier="bookid" xmlns="http://www.idpf.org/2007/opf">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">{book_id}</dc:identifier>
 <dc:title>{escape(story.title)}</dc:title><dc:creator>{escape(story.author)}</dc:creator>
+{f'<dc:contributor>{escape(story.translator)}</dc:contributor>' if story.translator else ''}
 <dc:language>{escape(_normalize_language(story.language))}</dc:language><dc:source>{escape(story.source_url)}</dc:source>
 {subjects}{description}{dates}{cover_meta}{pages_meta}<meta property="dcterms:modified">{modified}</meta></metadata>
 <manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>

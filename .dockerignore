@@ -1,9 +1,9 @@
 .git/
 .agents/
 .env*
-.venv
-.venv_lib
+.venv*
 venv/
+graphify-out/
 __pycache__/
 *.pyc
 *.pyo

@@ -3,8 +3,9 @@
 !.env.example
 !.env.*.example
 
-.venv/
+.venv*/
 venv/
+graphify-out/
 data/
 downloads/
 output/

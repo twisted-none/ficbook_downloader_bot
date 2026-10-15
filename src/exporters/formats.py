@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from html import unescape
+from html import escape, unescape
 from io import BytesIO
 from typing import Any
 
@@ -12,7 +12,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.image.exceptions import UnrecognizedImageError
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.shared import Inches, Pt, RGBColor
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -23,6 +24,7 @@ from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, S
 
 from src.exporters.html_utils import html_to_text, html_to_text_blocks, normalize_inline_text, normalize_text, tag_text
 from src.core.models import Story
+from src.exporters.navigation import chapter_id, prepare_chapters
 
 ALLOWED_FORMATS: tuple[str, ...] = ("fb2", "epub", "txt", "docx", "pdf")
 DEFAULT_FORMATS: tuple[str, ...] = ALLOWED_FORMATS
@@ -47,16 +49,19 @@ def normalize_formats(values: list[str] | tuple[str, ...]) -> tuple[str, ...]:
 
 
 def build_txt(story: Story) -> bytes:
-    parts = [story.title, f"Автор: {story.author}", f"Ссылка: {story.source_url}"]
-    if story.page_count:
+    parts = [] if story.annotation_complete else [story.title, f"Автор: {story.author}", f"Ссылка: {story.source_url}"]
+    if story.page_count and not story.annotation_complete:
         parts.append(f"Страниц: {story.page_count}")
-    if story.word_count:
+    if story.word_count and not story.annotation_complete:
         parts.append(f"Слов: {story.word_count}")
-    if story.pairings:
+    if story.pairings and not story.annotation_complete:
         parts.append(f"Пейринг и персонажи: {_pairing_text(story)}")
     annotation = _html_to_text(story.annotation_html or story.description)
     if annotation:
         parts.extend(["Аннотация:", annotation])
+    if story.chapters:
+        parts.append('Оглавление:')
+        parts.extend(f'{index}. {chapter.title or f"Глава {index}"}' for index, chapter in enumerate(story.chapters, 1))
     for index, chapter in enumerate(story.chapters, 1):
         title = chapter.title or f"Глава {index}"
         body = _html_to_text(chapter.html)
@@ -69,22 +74,27 @@ def build_docx(story: Story) -> bytes:
     _configure_docx(document, story)
     _add_docx_page_footer(document)
     _add_docx_cover(document, story)
-    document.add_heading(story.title, level=0)
-    document.add_paragraph(f"Автор: {story.author}")
-    document.add_paragraph(f"Ссылка: {story.source_url}")
-    if story.page_count:
-        document.add_paragraph(f"Страниц: {story.page_count}")
-    if story.word_count:
-        document.add_paragraph(f"Слов: {story.word_count}")
-    if story.pairings:
-        document.add_paragraph(f"Пейринг и персонажи: {_pairing_text(story)}")
-    _add_docx_toc(document, story)
+    if not story.annotation_complete:
+        document.add_heading(story.title, level=0)
+        document.add_paragraph(f"Автор: {story.author}")
+        document.add_paragraph(f"Ссылка: {story.source_url}")
+        if story.page_count:
+            document.add_paragraph(f"Страниц: {story.page_count}")
+        if story.word_count:
+            document.add_paragraph(f"Слов: {story.word_count}")
+        if story.pairings:
+            document.add_paragraph(f"Пейринг и персонажи: {_pairing_text(story)}")
+        _add_docx_toc(document, story)
     annotation = _html_to_blocks(story.annotation_html or story.description)
     if annotation:
-        document.add_heading("Аннотация", level=1)
+        heading = document.add_heading("Аннотация", level=1)
+        _add_docx_bookmark(heading, 'annotation')
         _add_html_to_document(document, story.annotation_html or story.description)
-    for index, chapter in enumerate(story.chapters, 1):
-        document.add_heading(chapter.title or f"Глава {index}", level=1)
+    if story.annotation_complete:
+        _add_docx_toc(document, story)
+    for index, chapter in enumerate(prepare_chapters(story), 1):
+        heading = document.add_heading(chapter.title or f"Глава {index}", level=1)
+        _add_docx_bookmark(heading, chapter_id(index))
         _add_html_to_document(document, chapter.html)
     buffer = BytesIO()
     document.save(buffer)
@@ -105,29 +115,37 @@ def build_pdf(story: Story) -> bytes:
     )
     flow: list[Any] = []
     _add_pdf_cover(flow, story)
-    flow.extend(
-        [
-            Paragraph(_pdf_escape(story.title), styles["Title"]),
-            Paragraph(f"Автор: {_pdf_escape(story.author)}", styles["Meta"]),
-            Paragraph(f"Ссылка: {_pdf_escape(story.source_url)}", styles["Meta"]),
-        ]
-    )
-    if story.page_count:
-        flow.append(Paragraph(f"Страниц Ficbook: {_pdf_escape(story.page_count)}", styles["Meta"]))
-    if story.word_count:
-        flow.append(Paragraph(f"Слов: {_pdf_escape(story.word_count)}", styles["Meta"]))
-    if story.pairings:
-        flow.append(Paragraph(f"Пейринг и персонажи: {_pdf_escape(_pairing_text(story))}", styles["Meta"]))
+    if not story.annotation_complete:
+        flow.extend(
+            [
+                Paragraph(_pdf_escape(story.title), styles["Title"]),
+                Paragraph(f"Автор: {_pdf_escape(story.author)}", styles["Meta"]),
+                Paragraph(f"Ссылка: {_pdf_escape(story.source_url)}", styles["Meta"]),
+            ]
+        )
+        if story.page_count:
+            flow.append(Paragraph(f"Страниц Ficbook: {_pdf_escape(story.page_count)}", styles["Meta"]))
+        if story.word_count:
+            flow.append(Paragraph(f"Слов: {_pdf_escape(story.word_count)}", styles["Meta"]))
+        if story.pairings:
+            flow.append(Paragraph(f"Пейринг и персонажи: {_pdf_escape(_pairing_text(story))}", styles["Meta"]))
     flow.append(Spacer(1, 0.5 * cm))
     annotation = _html_to_blocks(story.annotation_html or story.description)
     if annotation:
         flow.append(Paragraph("Аннотация", styles["Heading1"]))
         _add_pdf_blocks(flow, annotation, styles)
-    for index, chapter in enumerate(story.chapters, 1):
+    if story.chapters:
+        flow.append(Paragraph('Оглавление', styles['Heading1']))
+        for index, chapter in enumerate(story.chapters, 1):
+            title = _pdf_escape(chapter.title or f'Глава {index}')
+            flow.append(Paragraph(f'<link href="#{chapter_id(index)}" color="blue">{title}</link>', styles['Body']))
+    for index, chapter in enumerate(prepare_chapters(story), 1):
         if flow:
             flow.append(PageBreak())
-        flow.append(Paragraph(_pdf_escape(chapter.title or f"Глава {index}"), styles["Heading1"]))
-        _add_pdf_blocks(flow, _html_to_blocks(chapter.html), styles)
+        title = _pdf_escape(chapter.title or f"Глава {index}")
+        flow.append(Paragraph(f'<a name="{chapter_id(index)}"/>{title}', styles["Heading1"]))
+        for markup in _pdf_html_blocks(chapter.html):
+            flow.append(Paragraph(markup, styles['Body']))
     document.build(flow, onFirstPage=_draw_pdf_page_number, onLaterPages=_draw_pdf_page_number)
     return buffer.getvalue()
 
@@ -282,6 +300,62 @@ def _add_pdf_blocks(flow: list[Any], blocks: list[str], styles: dict[str, Paragr
         flow.append(Paragraph(_pdf_escape(block), styles["Body"]))
 
 
+def _pdf_html_blocks(html: str) -> list[str]:
+    soup = BeautifulSoup(html, 'lxml')
+
+    def blocks(container: Tag) -> list[str]:
+        result: list[str] = []
+        current: list[str] = []
+
+        def flush() -> None:
+            value = ''.join(current).strip()
+            if value:
+                result.append(value)
+            current.clear()
+
+        for node in container.children:
+            if isinstance(node, Tag) and node.name in SKIP_TAGS:
+                continue
+            if isinstance(node, Tag) and node.name in CONTAINER_TAGS | {'p', 'blockquote', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}:
+                flush()
+                content = blocks(node)
+                anchor = _pdf_anchor(node)
+                if content:
+                    content[0] = anchor + content[0]
+                    result.extend(content)
+                elif anchor:
+                    current.append(anchor)
+            else:
+                current.append(_pdf_inline(node))
+        flush()
+        return result
+
+    return blocks(soup.body or soup)
+
+
+def _pdf_anchor(node: Tag) -> str:
+    value = str(node.get('id') or '')
+    return f'<a name="{escape(value, quote=True)}"/>' if value else ''
+
+
+def _pdf_inline(node: Tag | NavigableString) -> str:
+    if isinstance(node, NavigableString):
+        return escape(_normalize_inline_text(str(node)))
+    if node.name in SKIP_TAGS:
+        return ''
+    anchor = _pdf_anchor(node)
+    if node.name == 'br':
+        return anchor + '<br/>'
+    content = ''.join(_pdf_inline(child) for child in node.children)
+    mapped = {'b': 'b', 'strong': 'b', 'i': 'i', 'em': 'i', 'sup': 'super', 'sub': 'sub'}.get(node.name)
+    if mapped:
+        content = f'<{mapped}>{content}</{mapped}>'
+    href = str(node.get('href') or '')
+    if node.name == 'a' and content and href.startswith(('#', 'http://', 'https://')):
+        content = f'<link href="{escape(href, quote=True)}" color="blue">{content}</link>'
+    return anchor + content
+
+
 def _draw_pdf_page_number(canvas: Any, document: Any) -> None:
     canvas.saveState()
     canvas.setFont("FicbookSerif" if "FicbookSerif" in pdfmetrics.getRegisteredFontNames() else "Times-Roman", 9)
@@ -333,11 +407,40 @@ def _pairing_text(story: Story) -> str:
 
 def _add_docx_toc(document: Document, story: Story) -> None:
     document.add_heading("Оглавление", level=1)
-    if story.annotation_html or story.description:
-        document.add_paragraph("Аннотация", style="List Bullet")
+    if _html_to_blocks(story.annotation_html or story.description):
+        paragraph = document.add_paragraph(style='List Bullet')
+        _add_run(paragraph, 'Аннотация', bold=False, italic=False,
+                 container=_docx_hyperlink(paragraph, '#annotation'))
     for index, chapter in enumerate(story.chapters, 1):
         title = chapter.title or f"Глава {index}"
-        document.add_paragraph(title, style="List Number")
+        paragraph = document.add_paragraph(style="List Number")
+        _add_run(paragraph, title, bold=False, italic=False,
+                 container=_docx_hyperlink(paragraph, '#' + chapter_id(index)))
+
+
+def _docx_hyperlink(paragraph: Any, href: str, container: Any = None) -> Any:
+    hyperlink = OxmlElement('w:hyperlink')
+    if href.startswith('#'):
+        hyperlink.set(qn('w:anchor'), href[1:].replace('-', '_'))
+    else:
+        hyperlink.set(qn('r:id'), paragraph.part.relate_to(href, RT.HYPERLINK, is_external=True))
+    parent = container if container is not None else paragraph._p
+    parent.append(hyperlink)
+    return hyperlink
+
+
+def _add_docx_bookmark(paragraph: Any, name: str, container: Any = None) -> None:
+    part = paragraph.part
+    number = getattr(part, '_ficbook_next_bookmark_id', 0)
+    part._ficbook_next_bookmark_id = number + 1
+    start = OxmlElement('w:bookmarkStart')
+    start.set(qn('w:id'), str(number))
+    start.set(qn('w:name'), name.replace('-', '_'))
+    end = OxmlElement('w:bookmarkEnd')
+    end.set(qn('w:id'), str(number))
+    parent = container if container is not None else paragraph._p
+    parent.append(start)
+    parent.append(end)
 
 
 def _html_to_text(html: str) -> str:
@@ -364,6 +467,8 @@ def _add_blocks(document: Document, container: Tag, *, quote: bool = False) -> N
             continue
         if child.name in SKIP_TAGS:
             continue
+        if child.get('id') and child.name in CONTAINER_TAGS | {'blockquote', 'ul', 'ol'}:
+            _add_docx_bookmark(document.add_paragraph(), str(child['id']))
         if child.name in CONTAINER_TAGS:
             _add_blocks(document, child, quote=quote)
         elif child.name == "blockquote":
@@ -372,12 +477,15 @@ def _add_blocks(document: Document, container: Tag, *, quote: bool = False) -> N
             _add_list(document, child, ordered=child.name == "ol", quote=quote)
         elif child.name == "p":
             paragraph = _add_paragraph(document, "", quote=quote, note_heading=_is_note_heading(_tag_text(child)))
+            if child.get('id'):
+                _add_docx_bookmark(paragraph, str(child['id']))
             _add_inline_runs(paragraph, child)
         elif child.name == "br":
             document.add_paragraph()
         else:
             paragraph = _add_paragraph(document, "", quote=quote)
-            _add_inline_runs(paragraph, child)
+            fragment = BeautifulSoup(str(child), 'lxml')
+            _add_inline_runs(paragraph, fragment.body or fragment)
 
 
 def _add_list(document: Document, list_node: Tag, *, ordered: bool, quote: bool) -> None:
@@ -386,6 +494,8 @@ def _add_list(document: Document, list_node: Tag, *, ordered: bool, quote: bool)
         if not isinstance(child, Tag) or child.name != "li":
             continue
         paragraph = document.add_paragraph(style=style)
+        if child.get('id'):
+            _add_docx_bookmark(paragraph, str(child['id']))
         if quote:
             paragraph.paragraph_format.left_indent = Inches(0.35)
         _add_inline_runs(paragraph, child, skip_nested_lists=True)
@@ -409,17 +519,29 @@ def _add_inline_runs(
     bold: bool = False,
     italic: bool = False,
     skip_nested_lists: bool = False,
+    container: Any = None,
+    vertical: str = '',
 ) -> None:
     for child in node.children:
         if isinstance(child, NavigableString):
-            _add_run(paragraph, str(child), bold=bold, italic=italic)
+            _add_run(paragraph, str(child), bold=bold, italic=italic, container=container, vertical=vertical)
             continue
         if child.name in SKIP_TAGS:
             continue
         if skip_nested_lists and child.name in {"ul", "ol"}:
             continue
+        if child.get('id'):
+            _add_docx_bookmark(paragraph, str(child['id']), container)
+        href = str(child.get('href') or '')
+        if child.name == 'a' and href.startswith(('#', 'http://', 'https://')):
+            hyperlink = _docx_hyperlink(paragraph, href, container)
+            _add_inline_runs(paragraph, child, bold=bold, italic=italic, container=hyperlink, vertical=vertical)
+            continue
         if child.name == "br":
-            paragraph.add_run().add_break()
+            run = paragraph.add_run()
+            run.add_break()
+            if container is not None:
+                container.append(run._r)
             continue
         _add_inline_runs(
             paragraph,
@@ -427,16 +549,26 @@ def _add_inline_runs(
             bold=bold or child.name in INLINE_BOLD_TAGS,
             italic=italic or child.name in INLINE_ITALIC_TAGS,
             skip_nested_lists=skip_nested_lists,
+            container=container,
+            vertical=child.name if child.name in {'sup', 'sub'} else vertical,
         )
 
 
-def _add_run(paragraph: Any, text: str, *, bold: bool, italic: bool) -> None:
+def _add_run(paragraph: Any, text: str, *, bold: bool, italic: bool, container: Any = None, vertical: str = '') -> None:
     normalized = _normalize_inline_text(text)
     if not normalized:
         return
     run = paragraph.add_run(normalized)
     run.bold = bold
     run.italic = italic
+    if vertical == 'sup':
+        run.font.superscript = True
+    elif vertical == 'sub':
+        run.font.subscript = True
+    if container is not None:
+        container.append(run._r)
+        run.font.color.rgb = RGBColor(0, 0, 255)
+        run.underline = True
 
 
 def _tag_text(node: Tag) -> str:
