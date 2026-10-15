@@ -35,6 +35,42 @@ Telegram-бот на `aiogram`, который принимает ссылки �
 - переносит задание на следующий Ficbook-аккаунт при `429` или ошибке входа
 - готов для запуска в Docker
 
+## Python и зависимости
+
+Docker использует `Python 3.14.8` (`python:3.14.8-slim-bookworm`). Python 3.15 пока
+не поддерживается выбранным стеком: `aiogram 3.31.0` требует Python `<3.15`.
+Тот же aiogram ограничивает Pydantic версией `<2.14`, поэтому используется `2.13.5`.
+Ограничения совместимости не обходятся.
+
+`requirements.txt` фиксирует прямые зависимости, а `requirements.lock` — также
+транзитивные пакеты, платформенные условия и SHA-256 хеши. Docker устанавливает
+только готовые wheel-пакеты из lock-файла и проверяет совместимость через `pip check`.
+Для локальной разработки создайте отдельное окружение на Python 3.14 и установите:
+
+```bash
+python -m pip install --only-binary=:all: --require-hashes -r requirements.lock
+python -m pip check
+python -B -m unittest discover -s tests
+```
+
+Не используйте старое окружение Python 3.11 для проверки обновлённого стека.
+Lock-файл охватывает Linux и Windows; Docker-сборка и полный прогон тестов проверены
+на Linux x86_64. Windows-зависимости имеют отдельные платформенные условия.
+
+После изменения прямых версий пересоздайте lock-файл с `uv 0.13.1`:
+
+```bash
+uv pip compile requirements.txt --python-version 3.14 --universal --generate-hashes --no-build --prerelease disallow --upgrade --output-file requirements.lock --no-config
+```
+
+Обновление lock-файла требует проверки diff, чистой Docker-сборки, тестов с отдельной
+PostgreSQL и аудита зависимостей. Успешный аудит известных уязвимостей не гарантирует
+их полного отсутствия. Для `pip-audit 2.10.1` в отдельном окружении Python 3.14:
+
+```bash
+pip-audit --disable-pip --no-deps --require-hashes --strict -r requirements.lock
+```
+
 ## Запуск
 
 ```bash
