@@ -107,6 +107,8 @@ def build_pdf(story: Story) -> bytes:
     styles = _pdf_styles(regular_font, bold_font)
     document = SimpleDocTemplate(
         buffer,
+        title=story.title,
+        author=story.author,
         pagesize=A4,
         rightMargin=2 * cm,
         leftMargin=2 * cm,

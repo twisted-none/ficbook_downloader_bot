@@ -74,7 +74,7 @@ from src.core.download_queue import (
     QueueFullError,
 )
 from src.core.limits import (ResourceLimitError, ResourceLimits, bounded_async_operation,
-                             check_deadline, current_limits, run_worker, validate_story)
+                             check_deadline, close_download_workers, current_limits, run_worker, validate_story)
 from src.exporters.epub import build_epub
 from src.exporters.fb2 import build_fb2
 from src.sources.ficbook import (
@@ -250,8 +250,8 @@ class ProgressMessage:
                         return True
             await asyncio.sleep(max(0.05, delay))
 
-    def from_thread(self, text: str) -> Future[None]:
-        return asyncio.run_coroutine_threadsafe(self.set(text), self._loop)
+    def from_thread(self, text: str, *, force: bool = False) -> Future[None]:
+        return asyncio.run_coroutine_threadsafe(self.set(text, force=force), self._loop)
 
     async def close(self) -> None:
         async with self._lock:
@@ -320,6 +320,16 @@ class RegisterUserMiddleware(BaseMiddleware):
         event: Message,
         data: dict[str, Any],
     ) -> Any:
+        user_id = event.from_user.id if event.from_user else None
+        waiting = any(user_id in state for state in (
+            _support_waiting, _broadcast_waiting, _reply_waiting, _chapter_waiting,
+        ))
+        text = getattr(event, 'text', None) or ''
+        if not waiting and not text.lstrip().startswith('/') and extract_download_url(text):
+            status = await _acknowledge_link(event)
+            if status is None:
+                return None
+            data['initial_status'] = status
         user_store: UserStore | None = data.get("user_store")
         if user_store and event.from_user:
             try:
@@ -777,6 +787,7 @@ async def on_link(
     analytics_store: AnalyticsStore,
     download_queues: DownloadQueuePool,
     premium_queue_user_ids: frozenset[int],
+    initial_status: Message | None = None,
 ) -> None:
     url = extract_download_url(message.text or "")
     if not url:
@@ -785,11 +796,15 @@ async def on_link(
             reply_markup=_main_keyboard_for_message(message, admin_chat_id),
         )
         return
+    if initial_status is None:
+        initial_status = await _acknowledge_link(message)
+        if initial_status is None:
+            return
     if is_google_share_url(url):
         try:
             url = await resolve_share_url(url)
         except ShareLinkError as exc:
-            await message.answer(escape(str(exc)), reply_markup=_main_keyboard_for_message(message, admin_chat_id))
+            await _replace_status_with_notice(message, initial_status, admin_chat_id, escape(str(exc)))
             return
     settings = (
         await _get_user_download_settings(analytics_store, message.from_user.id)
@@ -804,6 +819,7 @@ async def on_link(
             message, ficbook_client, admin_chat_id, alert_bot, analytics_store,
             download_queues, url=url, formats=formats,
             premium_queue_user_ids=premium_queue_user_ids, cover_enabled=cover_enabled,
+            initial_status=initial_status,
         )
         return
     if chapter_selection_enabled and message.from_user:
@@ -816,6 +832,7 @@ async def on_link(
             formats,
             cover_enabled,
             download_queues,
+            initial_status=initial_status,
         )
         return
     await _process_download(
@@ -829,6 +846,7 @@ async def on_link(
         formats,
         premium_queue_user_ids,
         cover_enabled=cover_enabled,
+        initial_status=initial_status,
     )
 
 
@@ -847,7 +865,15 @@ async def _ask_chapter_selection(
     formats: tuple[str, ...],
     cover_enabled: bool,
     download_queues: DownloadQueuePool | None = None,
+    *,
+    initial_status: Message | None = None,
 ) -> None:
+    if initial_status is not None:
+        try:
+            await initial_status.delete()
+        except (TelegramBadRequest, TelegramNetworkError, TelegramServerError,
+                TelegramForbiddenError, TelegramRetryAfter):
+            logger.debug('Could not delete link acknowledgement')
     try:
         status = await _answer_status_with_retry(message,
             _chapter_selection_input_text("Подготавливаю список глав..."),
@@ -924,22 +950,38 @@ async def _process_collection(
     premium_queue_user_ids: frozenset[int],
     *,
     cover_enabled: bool = True,
+    initial_status: Message | None = None,
 ) -> None:
     user_id = message.from_user.id if message.from_user else message.chat.id
     if user_id in _collection_users:
-        await _answer_notice_safely(message, 'У тебя уже скачивается сборник. Дождись его завершения.')
+        await _replace_status_with_notice(
+            message, initial_status, admin_chat_id, 'У тебя уже скачивается сборник. Дождись его завершения.',
+        )
         return
     if len(_collection_users) >= current_limits().max_collection_batches:
-        await _answer_notice_safely(message, 'Сейчас очередь сборников заполнена. Попробуй позже.')
+        await _replace_status_with_notice(
+            message, initial_status, admin_chat_id, 'Сейчас очередь сборников заполнена. Попробуй позже.',
+        )
         return
     _collection_users.add(user_id)
-    status = None
+    status = initial_status
     progress = None
     try:
-        status = await _answer_status_with_retry(message, 'Получаю список фанфиков из сборника...')
+        if status is None:
+            status = await _answer_status_with_retry(message, 'Получаю список фанфиков из сборника...')
         progress = ProgressMessage(status, min_interval=5.0)
+
+        def report_discovery(text: str) -> None:
+            # Do not let a quick next page overwrite an unread milestone.
+            future = progress.from_thread(text, force=True)
+            try:
+                future.result(timeout=10)
+            except Exception:
+                future.cancel()
+                logger.warning('Could not deliver collection discovery progress')
+
         collection = await download_queues.run_preview(
-            lambda: run_worker(ficbook_client.collection, url, progress.from_thread), user_id=user_id,
+            lambda: run_worker(ficbook_client.collection, url, report_discovery), user_id=user_id,
         )
         total = len(collection.urls)
         if not total:
@@ -948,14 +990,17 @@ async def _process_collection(
             return
         sent = 0
         title = escape(collection.title)
+        await progress.set(f'Сборник: {title}\nОбработано 0 из {total}.\nОтправлено: 0.', force=True)
         for index, work_url in enumerate(collection.urls, 1):
-            await progress.set(f'Сборник: {title}\nОбработано {index - 1} из {total}.\nОтправлено: {sent}.')
             success = await _process_download(
                 message, ficbook_client, admin_chat_id, alert_bot, analytics_store,
                 download_queues, work_url, formats, premium_queue_user_ids,
                 cover_enabled=cover_enabled, raise_forbidden=True,
             )
             sent += bool(success)
+            await progress.set(
+                f'Сборник: {title}\nОбработано {index} из {total}.\nОтправлено: {sent}.', force=True,
+            )
         await progress.close()
         await _replace_status_with_notice(
             message, status, admin_chat_id,
@@ -991,11 +1036,12 @@ async def _process_download(
     cover_enabled: bool = True,
     chapter_numbers: set[int] | None = None,
     raise_forbidden: bool = False,
+    initial_status: Message | None = None,
 ) -> bool:
     priority = _is_priority_download_user(message, premium_queue_user_ids)
     assignment = download_queues.assign(url)
-    status: Message | None = None
-    progress: ProgressMessage | None = None
+    status: Message | None = initial_status
+    progress = ProgressMessage(status, min_interval=5.0) if status is not None else None
     progress_state = DownloadProgressState()
     download_id = await _start_download(analytics_store, message, url)
     try:
@@ -1205,6 +1251,14 @@ async def _answer_status_with_retry(message: Message, text: str, **kwargs: Any) 
             logger.warning('Telegram status send failed; retrying (%s/%s)', attempt + 2, TELEGRAM_SEND_ATTEMPTS)
             await asyncio.sleep(delay)
     raise RuntimeError('Unreachable Telegram retry state')
+
+
+async def _acknowledge_link(message: Message) -> Message | None:
+    try:
+        return await _answer_status_with_retry(message, 'Ссылка получена. Подготавливаю загрузку...')
+    except (FicbookError, TelegramForbiddenError):
+        logger.warning('Could not acknowledge download link; processing not started')
+        return None
 
 
 async def _active_progress_updater(
@@ -1446,6 +1500,8 @@ async def run_bot(settings: Settings) -> None:
         retention_task.cancel()
         sessions_task.cancel()
         await asyncio.gather(metrics_task, retention_task, sessions_task, return_exceptions=True)
+        await asyncio.to_thread(close_download_workers)
+        await asyncio.to_thread(analytics_store.close)
         if alert_bot:
             await alert_bot.session.close()
 
@@ -1675,7 +1731,11 @@ async def _notify_admin(
     error_kind = "Handled Ficbook error" if expected else "Unhandled bot error"
     technical = getattr(error, "technical", "")
     if technical:
-        logger.warning("Handled user error details: %s", technical)
+        cause = error.__cause__
+        status_code = getattr(cause, 'status_code', None)
+        if isinstance(status_code, int):
+            technical = f'{type(cause).__name__}: HTTP {status_code}'
+        logger.warning("Handled user error details: %s", technical[:500])
     text = (
         f"<b>{error_kind}</b>\n"
         f"<b>User:</b> {escape(user_name)}\n"

@@ -2,6 +2,8 @@ from io import BytesIO
 import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
+from types import SimpleNamespace
+from xml.etree import ElementTree
 
 from bs4 import BeautifulSoup
 from docx import Document
@@ -16,6 +18,90 @@ from tests.test_ficbook_metadata import FakeStory
 
 
 class FicbookCreditsTests(unittest.TestCase):
+    def test_current_creator_markup_recovers_author_and_ignores_avatar_beta_and_comments(self):
+        soup = BeautifulSoup('''<section class="chapter-info"><header><section class="fanfic-hat">
+          <div><a href="/authors/1"><img alt="Writer"/></a>
+            <div><span><a class="word-break" itemprop="author" href="/authors/1">Writer</a></span>
+              <span class="ds-badge ds-badge-regular">автор</span></div></div>
+          <div><div><span><a class="word-break" href="/authors/2">Coauthor</a></span>
+              <span class="ds-badge ds-badge-regular">соавтор</span></div></div>
+          <div><div><span><a class="word-break" href="/authors/3">Beta</a></span>
+              <span class="ds-badge ds-badge-regular">бета</span></div></div>
+        </section></header></section>
+        <div id="comments"><a href="/authors/4">Commenter</a></div>''', 'lxml')
+        metadata = FakeStory()
+        FicbookClient()._fill_ficbook_author_metadata(metadata, soup)
+        self.assertEqual(metadata.getMetadata('author'), 'Writer, Coauthor')
+        self.assertEqual(metadata.getMetadata('translator'), '')
+
+    def test_current_translation_keeps_original_author_and_translator_separate(self):
+        soup = BeautifulSoup('''<section class="chapter-info"><header><section class="fanfic-hat">
+          <div><div><span><a class="word-break" itemprop="author" href="/authors/786035">negative_one</a></span>
+            <span class="ds-badge ds-badge-regular">переводчик</span></div></div>
+          <div><div><span><a class="word-break" href="/authors/488214">N_a_t_a_l_y</a></span>
+            <span class="ds-badge ds-badge-regular">бета</span></div></div>
+        </section><div><strong>Автор оригинала:</strong><div>
+          <a href="/translations/by_author?author=Rezzekmood">Rezzekmood</a>
+        </div></div></header></section>''', 'lxml')
+        metadata = FakeStory()
+        FicbookClient()._fill_ficbook_author_metadata(metadata, soup)
+        self.assertEqual(metadata.getMetadata('author'), 'Rezzekmood')
+        self.assertEqual(metadata.getMetadata('translator'), 'negative_one')
+        self.assertEqual(metadata.getMetadata('authorUrl'), 'https://ficbook.net/translations/by_author?author=Rezzekmood')
+
+    def test_legacy_avatar_is_skipped_before_text_author_link(self):
+        soup = BeautifulSoup('<div id="comments"><a href="/authors/2">Commenter</a></div>'
+                             '<a href="/authors/1"><img alt="Writer"/></a><a href="/authors/1">Writer</a>', 'lxml')
+        metadata = FakeStory()
+        FicbookClient()._fill_ficbook_author_metadata(metadata, soup)
+        self.assertEqual(metadata.getMetadata('author'), 'Writer')
+
+    def test_legacy_credits_below_title_header_remain_supported(self):
+        soup = BeautifulSoup('''<section class="chapter-info"><header><h1>Title</h1></header>
+          <div class="hat-creator-container"><a class="creator-username" href="/authors/1">Writer</a>
+            <span class="small-text text-muted">Автор</span></div></section>
+          <div id="comments"><a href="/authors/2">Commenter</a></div>''', 'lxml')
+        metadata = FakeStory()
+        FicbookClient()._fill_ficbook_author_metadata(metadata, soup)
+        self.assertEqual(metadata.getMetadata('author'), 'Writer')
+
+    def test_current_badges_are_read_from_work_not_recommendations(self):
+        soup = BeautifulSoup('''<aside><div class="ds-label ds-label-rating-NC21">NC-21</div>
+          <div class="direction">Гет</div><div class="badge-status-in-progress">В процессе</div></aside>
+          <section class="chapter-info"><header><section class="fanfic-badges">
+            <div class="direction direction-gen"><span class="hidden-xs">Джен</span></div>
+            <div class="ds-label ds-label-rating-R">R</div>
+            <div class="ds-label ds-label-status-finished">Завершён</div>
+          </section></header></section>''', 'lxml')
+        metadata = FakeStory()
+        FicbookClient()._fill_optional_ficbook_metadata(SimpleNamespace(story=metadata), soup, get_cover=False)
+        self.assertEqual(metadata.getMetadata('classification'), 'Джен')
+        self.assertEqual(metadata.getMetadata('rating'), 'R')
+        self.assertEqual(metadata.getMetadata('status'), 'Completed')
+
+    def test_annotation_keeps_each_label_with_its_value(self):
+        metadata = FakeStory({'title': 'Title', 'author': 'Writer', 'status': 'Completed',
+                              'dateStart': '24.05.2019', 'dateFinish': '01.06.2019'})
+        html = FicbookClient()._build_annotation_html(metadata, BeautifulSoup('', 'lxml'), 'https://ficbook.net/readfic/1')
+        paragraphs = [p.get_text(' ', strip=True) for p in BeautifulSoup(html, 'lxml').find_all('p')]
+        for value in ('Автор: Writer', 'Статус: завершён', 'Дата начала: 24.05.2019', 'Дата завершения: 01.06.2019'):
+            self.assertIn(value, paragraphs)
+        self.assertFalse(any(p.endswith(':') for p in paragraphs))
+
+    def test_author_is_set_in_epub_fb2_docx_and_pdf_metadata(self):
+        story = Story('Title', 'MetadataWriter', 'https://ficbook.net/readfic/1', translator='MetadataTranslator')
+        with ZipFile(BytesIO(build_epub(story))) as archive:
+            root = ElementTree.fromstring(archive.read('OEBPS/content.opf'))
+        dc = '{http://purl.org/dc/elements/1.1/}'
+        self.assertEqual(root.find('.//' + dc + 'creator').text, story.author)
+        self.assertEqual(root.find('.//' + dc + 'contributor').text, story.translator)
+        root = ElementTree.fromstring(build_fb2(story))
+        ns = '{http://www.gribuser.ru/xml/fictionbook/2.0}'
+        self.assertEqual(root.find(f'.//{ns}title-info/{ns}author/{ns}nickname').text, story.author)
+        self.assertEqual(root.find(f'.//{ns}title-info/{ns}translator/{ns}nickname').text, story.translator)
+        self.assertEqual(Document(BytesIO(build_docx(story))).core_properties.author, story.author)
+        self.assertTrue(b'/Author (MetadataWriter)' in build_pdf(story), 'PDF author metadata is missing')
+
     def test_download_passes_credits_and_complete_annotation_to_exporters(self):
         from fanficfare import adapters
         from src.sources.ficbook import FicbookAccount

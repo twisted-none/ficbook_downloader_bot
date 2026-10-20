@@ -15,6 +15,26 @@ from src.core.limits import ResourceLimitError, ResponseLimitError
 logger = logging.getLogger(__name__)
 
 
+class AO3WorkUnavailableError(Exception):
+    pass
+
+
+def require_available_work(html: bytes) -> None:
+    marker = 'This work is part of an ongoing challenge and will be revealed soon!'
+    if marker.encode() not in html:
+        return
+    soup = BeautifulSoup(html, 'lxml')
+    for notice in soup.select('#main .notice'):
+        if (notice.find_parent(id=re.compile(r'^(?:workskin|chapters)$')) is not None
+                or notice.find_parent(class_='userstuff') is not None):
+            continue
+        if marker in notice.get_text(' ', strip=True):
+            raise AO3WorkUnavailableError(
+                'Эта работа AO3 скрыта в нераскрытой коллекции (Mystery Work). '
+                'Сайт не предоставляет её текст. Скачать можно после раскрытия работы.'
+            )
+
+
 def _download_link(page: str, work_url: str) -> str | None:
     work = re.search(r'/works/(\d+)', work_url)
     if not work:

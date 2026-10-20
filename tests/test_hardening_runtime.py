@@ -12,6 +12,7 @@ from src.core.download_queue import DownloadQueue
 from src.core.limits import ResourceLimitError, ResourceLimits, read_bounded, resource_scope, run_worker
 from src.core.models import Chapter, Story
 from src.sources.fanficfare_http import SafeFanficFareFetcher
+from src.sources.ao3_http import AO3RequestsFetcher
 from src.sources.ficbook import FicbookAccount, FicbookClient
 from src.sources.safe_http import DeadlineHTTPResponse
 
@@ -48,7 +49,8 @@ class HTTPDeadlineTests(unittest.TestCase):
             with self.subTest(url=url):
                 config = client._build_config(url, FicbookAccount())
                 fetcher = config.get_fetcher()
-                expected = RequestsFetcher if 'ficbook.net' in url else SafeFanficFareFetcher
+                expected = (RequestsFetcher if 'ficbook.net' in url else
+                            AO3RequestsFetcher if 'archiveofourown.org' in url else SafeFanficFareFetcher)
                 self.assertIs(type(fetcher), expected)
                 jar = fetcher.get_cookiejar()
                 refreshed = config.get_fetcher(make_new=True)

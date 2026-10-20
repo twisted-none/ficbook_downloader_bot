@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import wraps
+from functools import partial, wraps
 import asyncio
 from io import BytesIO
 import os
@@ -64,6 +65,7 @@ class _Budget:
 
 
 _budget: ContextVar[_Budget | None] = ContextVar('download_budget', default=None)
+_download_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix='downloads')
 
 
 @contextmanager
@@ -99,7 +101,9 @@ def bounded_async_operation(function):
 
 @bounded_async_operation
 async def run_worker(function, *args, **kwargs):
-    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    task = asyncio.get_running_loop().run_in_executor(
+        _download_executor, copy_context().run, partial(function, *args, **kwargs),
+    )
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -118,6 +122,10 @@ async def run_worker(function, *args, **kwargs):
         if not task.cancelled():
             task.exception()
         raise
+
+
+def close_download_workers() -> None:
+    _download_executor.shutdown(wait=True, cancel_futures=True)
 
 
 class LimitedBytesIO(BytesIO):

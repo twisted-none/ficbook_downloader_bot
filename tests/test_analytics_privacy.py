@@ -133,6 +133,7 @@ class RetentionDatabaseTests(unittest.TestCase):
         self.addCleanup(self.drop_schema)
         self.database_url = make_conninfo(TEST_DATABASE_URL, options="-c search_path=" + self.schema)
         self.store = AnalyticsStore(self.database_url, history_retention_days=30)
+        self.addCleanup(self.store.close)
         self.store.record_user(User(id=101, is_bot=False, first_name="First"), started=True)
         self.store.record_user(User(id=102, is_bot=False, first_name="Second"), started=True)
 
@@ -190,7 +191,7 @@ class RetentionDatabaseTests(unittest.TestCase):
         self.expire(old)
         with self.store._connect() as db:
             db.execute("UPDATE downloads SET privacy_expires_at = NULL WHERE id = %s", (old,))
-        AnalyticsStore(self.database_url, history_retention_days=30)
+        AnalyticsStore(self.database_url, history_retention_days=30).close()
         self.assertEqual(self.store.cleanup_expired_history(), 0)
         self.assertEqual(self.row(old)["user_id"], 101)
         self.assertEqual(self.store.enroll_legacy_history(), 1)
@@ -253,6 +254,7 @@ class RetentionDatabaseTests(unittest.TestCase):
     def test_batched_and_concurrent_cleanup_never_double_counts(self):
         from concurrent.futures import ThreadPoolExecutor
         other = AnalyticsStore(self.database_url)
+        self.addCleanup(other.close)
         for _ in range(7):
             self.expire(self.download())
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -277,6 +279,7 @@ class RetentionDatabaseTests(unittest.TestCase):
                        "LEFT JOIN downloads d ON d.user_id = u.user_id AND d.status = 'success' "
                        "GROUP BY u.user_id")
         migrated = AnalyticsStore(self.database_url)
+        self.addCleanup(migrated.close)
         self.assertEqual(migrated.snapshot().successful_downloads, 1)
         self.assertEqual(migrated.cleanup_expired_history(), 0)
         migrated.enroll_legacy_history()

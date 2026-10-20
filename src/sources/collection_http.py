@@ -20,10 +20,11 @@ _HOSTS = frozenset({'ficbook.net', 'www.ficbook.net'})
 
 
 class BrowserCollectionClient:
-    """One anonymous, memory-only browser session for a public collection."""
+    """One anonymous, memory-only browser session for allowlisted public pages."""
 
-    def __init__(self, validate_url: Callable[[str], object]) -> None:
+    def __init__(self, validate_url: Callable[[str], object], *, allowed_hosts: frozenset[str] = _HOSTS) -> None:
         self._validate_url = validate_url
+        self._allowed_hosts = allowed_hosts
         self._session: Session | None = None
         self._closed = False
 
@@ -33,7 +34,7 @@ class BrowserCollectionClient:
         visited: set[str] = set()
         for hop in range(6):
             check_deadline()
-            parts = require_https_url(url, _HOSTS)
+            parts = require_https_url(url, self._allowed_hosts)
             self._validate_url(url)
             if url in visited:
                 raise URLError('Collection redirect loop')

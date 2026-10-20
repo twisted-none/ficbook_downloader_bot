@@ -16,7 +16,7 @@ import ssl
 from threading import Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 import fanficfare
@@ -25,7 +25,7 @@ from fanficfare import adapters, exceptions
 from fanficfare.configurable import Configuration
 from fanficfare.exceptions import HTTPErrorFFF
 
-from src.sources.ao3 import download_html_chapters
+from src.sources.ao3 import AO3WorkUnavailableError, download_html_chapters
 from src.sources.collections import FicbookCollection, load_collection
 from src.sources.litnet import (
     LitnetClient,
@@ -1012,12 +1012,23 @@ class FicbookClient:
 
     def _fill_ficbook_author_metadata(self, story: Any, soup: BeautifulSoup) -> None:
         credits: dict[str, list[tuple[str, str]]] = {"author": [], "translator": []}
-        links = soup.select(".hat-creator-container .creator-username, .creator-info .creator-username")
+        root = soup.select_one('section.chapter-info') or soup
+        links = soup.select('.hat-creator-container .creator-username, .creator-info .creator-username')
+        links.extend(root.select(
+            '.fanfic-hat a.word-break[href^="/authors/"], .fanfic-hat a[itemprop="author"][href]'
+        ))
         if not links:
             links = soup.select("a.creator-username")
         for link in links:
             container = link.find_parent(class_=re.compile(r"^(hat-creator-container|creator-info)$"))
             role_node = container.select_one(".small-text.text-muted") if container else None
+            if role_node is None:
+                for parent in link.parents:
+                    if not isinstance(parent, Tag) or parent.name in {'section', 'header', 'body', 'html'}:
+                        break
+                    role_node = parent.find(class_='ds-badge', recursive=False)
+                    if role_node is not None:
+                        break
             role = self._tag_text(role_node).lower() if role_node else ""
             key = "translator" if "переводчик" in role else "author"
             if role and not any(word in role for word in ("автор", "переводчик")):
@@ -1037,14 +1048,18 @@ class FicbookClient:
             if not name:
                 continue
             link = value if value.name == "a" else value.find("a", href=True)
-            credits["author"] = [(name, self._safe_text(link.get("href")) if link else "")]
+            href = self._safe_text(link.get('href')) if link else ''
+            credits["author"] = [(name, urljoin('https://ficbook.net', href) if href else '')]
             break
         # Legacy pages may have a bare author link, but role-labelled pages must
         # never substitute a translator or beta for a missing original author.
         if not links and not credits["author"]:
-            link = soup.find("a", href=re.compile(r"^/authors/"))
-            if isinstance(link, Tag) and self._tag_text(link):
-                credits["author"].append((self._tag_text(link), f"https://ficbook.net{link['href']}"))
+            for link in soup.find_all("a", href=re.compile(r"^/authors/")):
+                if link.find_parent(id=re.compile(r'^(?:comments?|reviews?)(?:$|[-_\d])')):
+                    continue
+                if self._tag_text(link):
+                    credits["author"].append((self._tag_text(link), f"https://ficbook.net{link['href']}"))
+                    break
         for key, people in credits.items():
             if people:
                 story.setMetadata(key, ", ".join(name for name, _ in people))
@@ -1077,11 +1092,13 @@ class FicbookClient:
 
     def _fill_optional_ficbook_metadata(self, adapter: Any, soup: BeautifulSoup, *, get_cover: bool = True) -> None:
         story = adapter.story
-        rating = soup.select_one('header div[class*="badge-rating-"] span')
+        rating = (soup.select_one('section.chapter-info header .fanfic-badges [class*="ds-label-rating-"]')
+                  or soup.select_one('header div[class*="badge-rating-"] span'))
         if rating:
             story.setMetadata("rating", self._tag_text(rating))
         if not story.getMetadata("classification"):
-            direction = soup.select_one('div[class^="badge-with-icon direction"] span.badge-text')
+            direction = (soup.select_one('section.chapter-info header .fanfic-badges .direction')
+                         or soup.select_one('div[class^="badge-with-icon direction"] span.badge-text'))
             if direction:
                 story.setMetadata("classification", self._tag_text(direction))
         status = self._status_from_soup(soup)
@@ -1165,7 +1182,10 @@ class FicbookClient:
             story.setMetadata("dateFinish", finish_date)
 
     def _status_from_soup(self, soup: BeautifulSoup) -> str:
-        for node in soup.select('[class*="badge-status"]'):
+        nodes = soup.select('section.chapter-info header .fanfic-badges [class*="ds-label-status-"]')
+        if not nodes:
+            nodes = soup.select('[class*="badge-status"]')
+        for node in nodes:
             class_text = " ".join(str(item) for item in node.get("class", []))
             text = self._tag_text(node)
             normalized = f"{class_text} {text}".lower().replace("_", "-")
@@ -1291,17 +1311,11 @@ class FicbookClient:
         row("Слов", self._safe_text(story.getMetadata("numWords")).replace(",", " "))
         row("Кол-во частей", story.getMetadata("numChapters"))
         status = self._status_text(story.getMetadata("status"))
-        if status:
-            parts.append("<p>Статус:</p>")
-            parts.append(f"<p>{escape(status)}</p>")
+        row("Статус", status)
         start_date = self._safe_text(story.getMetadata("dateStart") or story.getMetadata("datePublished"))
-        if start_date:
-            parts.append("<p>Дата начала:</p>")
-            parts.append(f"<p>{escape(start_date)}</p>")
+        row("Дата начала", start_date)
         finish_date = self._safe_text(story.getMetadata("dateFinish"))
-        if finish_date:
-            parts.append("<p>Дата завершения:</p>")
-            parts.append(f"<p>{escape(finish_date)}</p>")
+        row("Дата завершения", finish_date)
         row("Метки", ", ".join(story.getList("genre")))
         description = story.getMetadata("description")
         if description:
@@ -1550,6 +1564,8 @@ def _friendly_download_error(url: str, error: Exception) -> FicbookError:
     if isinstance(error, ResourceLimitError):
         raise error
     site_name = _site_display_name(url)
+    if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3WorkUnavailableError):
+        return FicbookError(str(error))
     if _is_ao3_shields_error(url, error):
         return FicbookError(
             "AO3 включил браузерную проверку защиты. Бот не может пройти ее как обычный браузер, "
@@ -1580,6 +1596,8 @@ def _ficbook_site_unavailable_error(error: Exception) -> FicbookSiteUnavailableE
 
 def _friendly_preview_error(url: str, error: Exception) -> FicbookError:
     site_name = _site_display_name(url)
+    if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3WorkUnavailableError):
+        return FicbookError(str(error))
     if _is_ao3_shields_error(url, error):
         return FicbookError(
             "AO3 включил браузерную проверку защиты, поэтому список глав сейчас получить не удалось. "

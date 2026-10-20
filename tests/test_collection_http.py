@@ -57,6 +57,21 @@ class BrowserCollectionClientTests(unittest.TestCase):
         self.assertEqual(self.session.curl_options[CurlOpt.PROXY], b'')
         self.assertLessEqual(options['timeout'], ResourceLimits().max_response_seconds)
 
+    def test_ao3_allowlist_is_per_client_and_keeps_collection_hosts_unchanged(self):
+        url = 'https://archiveofourown.org/works/14454174'
+        client = BrowserCollectionClient(lambda target: None, allowed_hosts=frozenset({'archiveofourown.org'}))
+        self.addCleanup(client.close)
+        self.assertEqual(client.fetch(url)[1], url)
+        self.assertEqual(self.session.curl_options[CurlOpt.RESOLVE], [b'archiveofourown.org:443:93.184.216.34'])
+        self.session.get.reset_mock()
+        with self.assertRaises(URLError):
+            self.client.fetch(url)
+        self.session.get.assert_not_called()
+        self.status, self.headers = 302, {'Location': 'https://ficbook.net/collections/123'}
+        with self.assertRaises(URLError):
+            client.fetch(url)
+        self.session.get.assert_called_once()
+
     def test_private_or_mixed_dns_is_rejected_before_the_client_is_created(self):
         for ip in ('127.0.0.1', '169.254.169.254', '10.0.0.1', '100.64.0.1'):
             with self.subTest(ip=ip), patch('src.sources.safe_http.socket.getaddrinfo', return_value=[address(), address(ip)]):

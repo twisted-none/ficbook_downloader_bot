@@ -24,6 +24,9 @@ WORKS = tuple(f'https://ficbook.net/readfic/{i}' for i in (1, 2, 3))
 
 class CollectionFlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        gate = patch.object(app, '_telegram_edit_gate', app.TelegramEditGate(min_interval=0))
+        gate.start()
+        self.addCleanup(gate.stop)
         self.message = IncomingMessage()
         self.message.text = URL
         self.client = SimpleNamespace(collection=Mock(return_value=FicbookCollection('Books <&>', URL, WORKS)))
@@ -104,6 +107,41 @@ class CollectionFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Не удалось: 1', self.message.statuses[-1].text)
         self.assertIn('Books &lt;&amp;&gt;', self.message.statuses[-1].text)
         self.assertTrue(self.message.statuses[0].deleted)
+
+    async def test_summary_updates_after_every_completed_work_including_failures(self):
+        edits = []
+
+        async def edit(message, text):
+            edits.append(text)
+
+        with patch.object(app, '_process_download', AsyncMock(side_effect=[True, False, True])), \
+                patch.object(app._telegram_edit_gate, 'edit', side_effect=edit):
+            await self.run_collection()
+        for count, sent in ((1, 1), (2, 1), (3, 2)):
+            self.assertTrue(any(f'Обработано {count} из 3.' in text and f'Отправлено: {sent}.' in text
+                                for text in edits), edits)
+
+    async def test_discovery_milestones_are_delivered_before_starting_downloads(self):
+        edits = []
+
+        def collection(url, progress):
+            progress('Получаю сборник: страница 1, найдено работ: 5')
+            progress('Получаю сборник: страница 2, найдено работ: 7')
+            return FicbookCollection('Books', URL, WORKS)
+
+        async def edit(message, text):
+            edits.append(text)
+
+        async def download(*args, **kwargs):
+            return True
+
+        self.client.collection.side_effect = collection
+        with patch.object(app, '_process_download', side_effect=download) as process, \
+                patch.object(app._telegram_edit_gate, 'edit', side_effect=edit):
+            await self.run_collection()
+        self.assertEqual(process.await_count, 3)
+        self.assertIn('Получаю сборник: страница 1, найдено работ: 5', edits)
+        self.assertIn('Получаю сборник: страница 2, найдено работ: 7', edits)
 
     async def test_collection_failure_or_empty_list_does_not_start_downloads(self):
         for value in (CollectionError('closed'), FicbookCollection('Empty', URL, ())):

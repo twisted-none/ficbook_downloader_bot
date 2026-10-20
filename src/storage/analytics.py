@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
 import logging
 from threading import Lock
+from time import monotonic
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from aiogram.types import User
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from src.exporters.formats import DEFAULT_FORMATS, normalize_formats
 from src.sources.registry import is_supported_story_url, normalize_url
@@ -62,11 +65,25 @@ class AnalyticsStore:
         self.database_url = database_url
         self.history_retention_days = history_retention_days
         self.lock = Lock()
+        self._pool_lock = Lock()
+        self._closed = False
+        self._pool = ConnectionPool(
+            database_url, min_size=1, max_size=4, open=False, timeout=5, max_waiting=32,
+            kwargs={'autocommit': True, 'row_factory': dict_row, 'connect_timeout': 5},
+        )
+        self._settings_lock = Lock()
+        self._settings_write_locks = tuple(Lock() for _ in range(64))
+        self._settings_cache: OrderedDict[int, tuple[float, UserDownloadSettings]] = OrderedDict()
+        self._settings_generation = 0
         if initialize:
-            self._initialize()
+            try:
+                self._initialize()
+            except Exception:
+                self.close()
+                raise
 
     def record_user(self, user: User, *, started: bool = False) -> None:
-        with self.lock, self._connect() as db:
+        with self._connect() as db:
             db.execute(
                 """
                 INSERT INTO bot_users
@@ -87,7 +104,7 @@ class AnalyticsStore:
             )
 
     def start_download(self, user_id: int, url: str) -> int:
-        with self.lock, self._connect() as db:
+        with self._connect() as db:
             row = db.execute(
                 """
                 INSERT INTO downloads (user_id, url, status, attempted_at, privacy_expires_at)
@@ -100,7 +117,7 @@ class AnalyticsStore:
 
     def finish_download(self, download_id: int, *, success: bool, url: str, title: str = "", error: str = "") -> None:
         status = "success" if success else "error"
-        with self.lock, self._connect() as db:
+        with self._connect() as db:
             db.execute(
                 """
                 UPDATE downloads
@@ -111,7 +128,7 @@ class AnalyticsStore:
             )
 
     def discard_download(self, download_id: int) -> None:
-        with self.lock, self._connect() as db:
+        with self._connect() as db:
             db.execute("DELETE FROM downloads WHERE id = %s AND user_id IS NOT NULL", (download_id,))
 
     def enroll_legacy_history(self) -> int:
@@ -236,7 +253,13 @@ class AnalyticsStore:
         )
 
     def get_user_download_settings(self, user_id: int) -> UserDownloadSettings:
-        with self.lock, self._connect() as db:
+        with self._settings_lock:
+            generation = self._settings_generation
+            cached = self._settings_cache.get(user_id)
+            if cached is not None and cached[0] > monotonic():
+                self._settings_cache.move_to_end(user_id)
+                return cached[1]
+        with self._connect() as db:
             row = db.execute(
                 """
                 SELECT formats, chapter_selection_enabled, cover_enabled
@@ -245,17 +268,27 @@ class AnalyticsStore:
                 """,
                 (user_id,),
             ).fetchone()
-        if not row:
-            return UserDownloadSettings()
-        return UserDownloadSettings(
+        settings = UserDownloadSettings() if not row else UserDownloadSettings(
             formats=normalize_formats(list(row["formats"] or [])),
             chapter_selection_enabled=bool(row["chapter_selection_enabled"]),
             cover_enabled=bool(row["cover_enabled"]),
         )
+        with self._settings_lock:
+            if generation == self._settings_generation:
+                self._cache_settings(user_id, settings)
+            else:
+                cached = self._settings_cache.get(user_id)
+                if cached is not None and cached[0] > monotonic():
+                    return cached[1]
+        return settings
 
     def save_user_download_settings(self, user_id: int, settings: UserDownloadSettings) -> None:
+        with self._settings_write_locks[user_id % len(self._settings_write_locks)]:
+            self._save_settings(user_id, settings)
+
+    def _save_settings(self, user_id: int, settings: UserDownloadSettings) -> None:
         normalized = normalize_formats(settings.formats)
-        with self.lock, self._connect() as db:
+        with self._connect() as db:
             db.execute(
                 """
                 INSERT INTO user_format_settings
@@ -275,8 +308,20 @@ class AnalyticsStore:
                 ),
             )
 
+        with self._settings_lock:
+            self._settings_generation += 1
+            self._cache_settings(user_id, UserDownloadSettings(
+                normalized, settings.chapter_selection_enabled, settings.cover_enabled,
+            ))
+
+    def _cache_settings(self, user_id: int, settings: UserDownloadSettings) -> None:
+        self._settings_cache[user_id] = (monotonic() + 60, settings)
+        self._settings_cache.move_to_end(user_id)
+        while len(self._settings_cache) > 2048:
+            self._settings_cache.popitem(last=False)
+
     def snapshot(self, *, include_users: bool = True) -> AnalyticsSnapshot:
-        with self.lock, self._connect() as db, db.transaction():
+        with self._connect() as db, db.transaction():
             db.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             db.execute("SET LOCAL statement_timeout = '15s'")
             started = _scalar(db, "SELECT COUNT(*) FROM bot_users WHERE started_at IS NOT NULL")
@@ -475,8 +520,19 @@ class AnalyticsStore:
                 """
             )
 
-    def _connect(self) -> psycopg.Connection:
-        return psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row, connect_timeout=5)
+    def _connect(self):
+        with self._pool_lock:
+            if self._closed:
+                raise RuntimeError('Analytics store is closed')
+            if self._pool.closed:
+                self._pool.open()
+        return self._pool.connection()
+
+    def close(self) -> None:
+        with self._pool_lock:
+            if not self._closed:
+                self._closed = True
+                self._pool.close()
 
 
 def render_prometheus(snapshot: AnalyticsSnapshot) -> str:

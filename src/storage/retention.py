@@ -42,6 +42,7 @@ def main() -> None:
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
         parser.error("DATABASE_URL is required")
+    store = None
     try:
         store = AnalyticsStore(database_url, history_retention_days=history_retention_days(), initialize=False)
         preview = store.retention_preview(include_legacy=args.enroll_existing)
@@ -61,6 +62,9 @@ def main() -> None:
         print(f"Personal associations removed: {total}. Download totals are preserved.")
     except (psycopg.Error, ValueError):
         parser.exit(1, "Retention maintenance failed. Check database access and retention settings.\n")
+    finally:
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":

@@ -210,10 +210,15 @@ def _collect_pages(
             title = page_title
         for position, work in enumerate(page_works):
             order = (number, position)
+            new_work = work not in works
             if work not in works or order < works[work]:
                 works[work] = order
             if len(works) > limits.max_collection_works:
                 raise ResourceLimitError(f'В сборнике больше {limits.max_collection_works} работ. Он превышает лимит пакетной загрузки.')
+            if progress and new_work and len(works) % 5 == 0:
+                progress(f'Получаю сборник: страница {number}, найдено работ: {len(works)}')
+        if progress:
+            progress(f'Получаю сборник: страница {number}, найдено работ: {len(works)}')
         for next_number, next_url in next_pages:
             if next_number not in discovered:
                 if len(discovered) >= limits.max_collection_pages:

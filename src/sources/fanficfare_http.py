@@ -29,7 +29,11 @@ class SafeSourceConfiguration(Configuration):
     def get_fetcher(self, make_new=False):
         if self.fetcher is None or make_new:
             jar = self.fetcher.get_cookiejar() if self.fetcher is not None else None
-            self.fetcher = SafeFanficFareFetcher(self.getConfig, self.getConfigList, self.site)
+            if self.site == 'archiveofourown.org':
+                from src.sources.ao3_http import AO3RequestsFetcher
+                self.fetcher = AO3RequestsFetcher(self.getConfig, self.getConfigList)
+            else:
+                self.fetcher = SafeFanficFareFetcher(self.getConfig, self.getConfigList, self.site)
             if jar is not None:
                 self.fetcher.set_cookiejar(jar)
             self.sleeper = SleepDecorator()

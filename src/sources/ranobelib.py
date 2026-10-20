@@ -66,6 +66,21 @@ class RanobelibLoginError(RanobelibError):
         super().__init__(message, user_message="Авторизация через RanobeLIB не сработала.")
 
 
+def _auth_request_error(stage: str, error: Exception) -> RanobelibLoginError:
+    if isinstance(error, UnsafeRequestError):
+        reason = 'blocked by security policy'
+    elif isinstance(error, HTTPError):
+        reason = f'HTTP {error.code}'
+        error.close()
+    elif isinstance(error, TimeoutError) or isinstance(getattr(error, 'reason', None), TimeoutError):
+        reason = 'timeout'
+    elif isinstance(error, json.JSONDecodeError):
+        reason = 'invalid JSON response'
+    else:
+        reason = 'network error'
+    return RanobelibLoginError(f'RanobeLIB {stage} failed: {reason}.')
+
+
 class _OAuthCallback(Exception):
     def __init__(self, url: str) -> None:
         super().__init__("OAuth callback received")
@@ -231,26 +246,31 @@ class RanobelibClient:
             require_https_url(url, API_HOSTS)
         except UnsafeRequestError:
             raise RanobelibError("RanobeLIB: request blocked by security policy.") from None
-        self._ensure_authenticated()
         auth_retried = False
-        total_attempts = self._retry_attempts + int(bool(self.login))
+        has_credentials = bool(self.login and self.password)
+        total_attempts = self._retry_attempts + int(has_credentials)
         for attempt in range(1, total_attempts + 1):
             self._wait_for_request_slot()
             try:
-                with self._api_opener.open(self._api_request(url), timeout=30) as response:
+                request = self._api_request(url)
+                rejected_token = (request.get_header('Authorization') or '').removeprefix('Bearer ')
+                with self._api_opener.open(request, timeout=30) as response:
                     payload = json.loads(read_bounded(response))
                 break
             except HTTPError as exc:
-                if exc.code == 401 and self.login and not auth_retried:
-                    self._renew_authentication()
-                    auth_retried = True
-                    continue
-                if exc.code == 401 and self.login:
-                    raise RanobelibLoginError("RanobeLIB rejected the refreshed access token.") from exc
-                if exc.code in {429, 500, 502, 503, 504} and attempt < self._retry_attempts:
-                    sleep(self._retry_delay(exc, attempt))
-                    continue
-                self._raise_http_error(exc)
+                try:
+                    if exc.code == 401 and has_credentials and not auth_retried:
+                        self._renew_authentication(rejected_token=rejected_token)
+                        auth_retried = True
+                        continue
+                    if exc.code == 401 and has_credentials:
+                        raise RanobelibLoginError("RanobeLIB rejected the refreshed access token.") from None
+                    if exc.code in {429, 500, 502, 503, 504} and attempt < self._retry_attempts:
+                        sleep(self._retry_delay(exc, attempt))
+                        continue
+                    self._raise_http_error(exc)
+                finally:
+                    exc.close()
             except UnsafeRequestError:
                 raise RanobelibError(
                     "RanobeLIB request blocked by security policy.",
@@ -281,15 +301,10 @@ class RanobelibClient:
             headers["Authorization"] = f"Bearer {self._access_token}"
         return Request(url, headers=headers)
 
-    def _ensure_authenticated(self) -> None:
-        if not (self.login and self.password) or self._access_token:
-            return
+    def _renew_authentication(self, *, rejected_token: str) -> None:
         with self._auth_lock:
-            if not self._access_token:
-                self._login_locked()
-
-    def _renew_authentication(self) -> None:
-        with self._auth_lock:
+            if self._access_token and self._access_token != rejected_token:
+                return
             if self._refresh_token and self._refresh_locked():
                 return
             self._access_token = ""
@@ -353,8 +368,8 @@ class RanobelibClient:
                 return response.geturl(), read_bounded(response)
         except _OAuthCallback as exc:
             return exc.url, b""
-        except (HTTPError, URLError, TimeoutError):
-            raise RanobelibLoginError("RanobeLIB authorization page failed or was blocked by security policy.") from None
+        except (HTTPError, URLError, TimeoutError) as exc:
+            raise _auth_request_error('authorization page', exc) from None
 
     def _auth_submit(
         self,
@@ -379,8 +394,8 @@ class RanobelibClient:
                 return callback, result_url, read_bounded(response)
         except _OAuthCallback as exc:
             return exc.url, exc.url, b""
-        except (HTTPError, URLError, TimeoutError):
-            raise RanobelibLoginError("RanobeLIB login request failed or was blocked by security policy.") from None
+        except (HTTPError, URLError, TimeoutError) as exc:
+            raise _auth_request_error('login request', exc) from None
 
     def _submit_consent_if_present(self, body: bytes, referer: str) -> str:
         self._require_auth_host(referer)
@@ -459,8 +474,8 @@ class RanobelibClient:
         try:
             with self._auth_opener.open(request, timeout=30) as response:
                 payload = json.loads(read_bounded(response))
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-            raise RanobelibLoginError("RanobeLIB authentication challenge failed or was blocked by security policy.") from None
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise _auth_request_error('authentication challenge', exc) from None
         if not isinstance(payload, dict):
             raise RanobelibLoginError("RanobeLIB returned an invalid authentication challenge.")
         return payload
@@ -482,8 +497,8 @@ class RanobelibClient:
         try:
             with self._api_opener.open(request, timeout=30) as response:
                 token = json.loads(read_bounded(response))
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-            raise RanobelibLoginError("RanobeLIB token request failed or was blocked by security policy.") from None
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise _auth_request_error('token request', exc) from None
         if not isinstance(token, dict):
             raise RanobelibLoginError("RanobeLIB returned an invalid OAuth token.")
         return token

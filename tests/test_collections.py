@@ -47,6 +47,19 @@ class CollectionLinkTests(unittest.TestCase):
 
 
 class CollectionLoaderTests(unittest.TestCase):
+    def test_discovery_reports_each_page_and_each_five_unique_works(self):
+        events = []
+        result, _ = self.load({
+            URL: page(*range(1, 8), pages=('?p=2',)),
+            URL + '?p=2': page(*range(6, 13)),
+        }, progress=events.append)
+        self.assertEqual(len(result.urls), 12)
+        self.assertIn('Получаю сборник: страница 1, найдено работ: 0', events)
+        self.assertIn('Получаю сборник: страница 1, найдено работ: 5', events)
+        self.assertIn('Получаю сборник: страница 2, найдено работ: 7', events)
+        self.assertIn('Получаю сборник: страница 2, найдено работ: 10', events)
+        self.assertEqual(events[-1], 'Получаю сборник: страница 2, найдено работ: 12')
+
     def load(self, pages, url=URL, **kwargs):
         opener = Mock()
         def fetch(request, **options):
