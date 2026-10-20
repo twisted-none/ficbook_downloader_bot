@@ -144,6 +144,95 @@ class CollectionLoaderTests(unittest.TestCase):
         self.assertEqual(opener.open.call_count, 2)
         sleep.assert_called_once_with(8.0)
 
+    def test_browser_fallback_is_used_only_for_a_confirmed_challenge(self):
+        for code in (401, 403, 404):
+            opener = Mock()
+            opener.open.side_effect = HTTPError(URL, code, 'Denied', {}, BytesIO())
+            with self.subTest(code=code), patch('src.sources.collections.build_safe_opener', return_value=opener), patch(
+                'src.sources.collections.BrowserCollectionClient',
+            ) as browser:
+                with self.assertRaises(CollectionError):
+                    load_collection(URL)
+                browser.assert_not_called()
+
+    def test_challenge_switches_all_remaining_pages_to_one_anonymous_client(self):
+        opener = Mock()
+        opener.open.side_effect = HTTPError(URL, 403, 'Challenge', {'CF-Mitigated': 'challenge'}, BytesIO())
+        browser = Mock()
+        browser.fetch.side_effect = [(page(1, pages=('?p=2',)).encode(), URL),
+                                     (page(2).encode(), URL + '?p=2')]
+        with patch('src.sources.collections.build_safe_opener', return_value=opener), patch(
+            'src.sources.collections.BrowserCollectionClient', return_value=browser,
+        ) as factory:
+            result = load_collection(URL)
+        self.assertEqual(result.urls, ('https://ficbook.net/readfic/1', 'https://ficbook.net/readfic/2'))
+        factory.assert_called_once()
+        validate = factory.call_args.args[0]
+        with self.assertRaises(ValueError):
+            validate('https://ficbook.net/readfic/1')
+        opener.open.assert_called_once()
+        self.assertEqual([call.args[0] for call in browser.fetch.call_args_list], [URL, URL + '?p=2'])
+        browser.close.assert_called_once()
+
+    def test_successful_primary_response_does_not_create_browser_client(self):
+        with patch('src.sources.collections.BrowserCollectionClient') as browser:
+            self.load({URL: page(1)})
+        browser.assert_not_called()
+
+    def test_challenge_header_is_recognized_even_with_http_200(self):
+        challenged = response('<html><title>Challenge</title></html>')
+        challenged.headers['CF-Mitigated'] = 'challenge'
+        opener, browser = Mock(), Mock()
+        opener.open.return_value = challenged
+        browser.fetch.return_value = (page(1).encode(), URL)
+        with patch('src.sources.collections.build_safe_opener', return_value=opener), patch(
+            'src.sources.collections.BrowserCollectionClient', return_value=browser,
+        ):
+            self.assertEqual(len(load_collection(URL).urls), 1)
+        self.assertTrue(challenged.closed)
+        browser.close.assert_called_once()
+
+    def test_each_collection_has_its_own_browser_session(self):
+        opener = Mock()
+        def challenge(*args, **kwargs):
+            raise HTTPError(URL, 403, 'Challenge', {'CF-Mitigated': 'challenge'}, BytesIO())
+        opener.open.side_effect = challenge
+        first, second = Mock(), Mock()
+        for browser in (first, second):
+            browser.fetch.return_value = (page(1).encode(), URL)
+        with patch('src.sources.collections.build_safe_opener', return_value=opener), patch(
+            'src.sources.collections.BrowserCollectionClient', side_effect=[first, second],
+        ) as factory:
+            load_collection(URL)
+            load_collection(URL)
+        self.assertEqual(factory.call_count, 2)
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+
+    def test_repeated_challenge_is_reported_without_retrying_or_claiming_private(self):
+        opener, browser = Mock(), Mock()
+        opener.open.side_effect = HTTPError(URL, 403, 'Challenge', {'cf-mitigated': 'challenge'}, BytesIO())
+        browser.fetch.side_effect = HTTPError(URL, 403, 'Challenge', {'cf-mitigated': 'challenge'}, BytesIO())
+        with patch('src.sources.collections.build_safe_opener', return_value=opener), patch(
+            'src.sources.collections.BrowserCollectionClient', return_value=browser,
+        ) as factory:
+            with self.assertRaisesRegex(CollectionError, 'Cloudflare'):
+                load_collection(URL)
+        factory.assert_called_once()
+        browser.fetch.assert_called_once()
+        browser.close.assert_called_once()
+
+    def test_browser_client_is_closed_when_a_later_page_exceeds_limits(self):
+        opener, browser = Mock(), Mock()
+        opener.open.side_effect = HTTPError(URL, 403, 'Challenge', {'cf-mitigated': 'challenge'}, BytesIO())
+        browser.fetch.return_value = (page(1, 2).encode(), URL)
+        with patch('src.sources.collections.build_safe_opener', return_value=opener), patch(
+            'src.sources.collections.BrowserCollectionClient', return_value=browser,
+        ), resource_scope(replace(ResourceLimits(), max_collection_works=1)):
+            with self.assertRaises(ResourceLimitError):
+                load_collection(URL)
+        browser.close.assert_called_once()
+
     def test_redirect_cannot_leave_the_collection_or_enter_authentication(self):
         handler = _CollectionRedirectHandler(URL)
         for target in ('https://ficbook.net/login', 'https://ficbook.net/collections/999',

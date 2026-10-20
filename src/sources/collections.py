@@ -1,6 +1,8 @@
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 import heapq
+import logging
 import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
@@ -11,6 +13,7 @@ from bs4 import BeautifulSoup
 from src.core.limits import (ResourceLimitError, bounded_operation, bounded_sleep,
                              check_deadline, current_limits, read_bounded, request_timeout)
 from src.sources.registry import FICBOOK_ID_PATTERN, normalize_collection_url
+from src.sources.collection_http import BrowserCollectionClient, is_cloudflare_challenge
 from src.sources.safe_http import SafeRedirectHandler, build_safe_opener, require_https_url
 
 
@@ -26,6 +29,7 @@ class FicbookCollection:
 
 
 _HOSTS = frozenset({'ficbook.net', 'www.ficbook.net'})
+logger = logging.getLogger(__name__)
 _PAGE_KEYS = {'p', 'page', 'page_num', 'page_number', 'offset'}
 _WORK_PATH = re.compile(rf'/readfic/({FICBOOK_ID_PATTERN})(?:/[0-9]+)?/?', re.I)
 _PAGINATION = ('.pagination a[href], .page-pagination a[href], .paginator a[href], '
@@ -66,6 +70,38 @@ class _CollectionRedirectHandler(SafeRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         _page_url(newurl, self.base)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+@contextmanager
+def _collection_reader(base: str):
+    opener = build_safe_opener(_HOSTS, redirect_handler=_CollectionRedirectHandler(base))
+    browser: BrowserCollectionClient | None = None
+
+    def fetch(url: str) -> tuple[bytes, str]:
+        nonlocal browser
+        if browser is not None:
+            return browser.fetch(url)
+        request = Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (compatible; FicbookDownloaderBot/1.0)',
+            'Accept-Language': 'ru-RU,ru;q=0.9',
+        })
+        try:
+            with opener.open(request, timeout=request_timeout()) as response:
+                if not is_cloudflare_challenge(response.headers):
+                    return read_bounded(response), response.geturl()
+        except HTTPError as exc:
+            if not is_cloudflare_challenge(exc.headers):
+                raise
+            exc.close()
+        logger.info('Cloudflare challenged a public collection; switching to anonymous browser transport')
+        browser = BrowserCollectionClient(lambda target: _page_url(target, base))
+        return browser.fetch(url)
+
+    try:
+        yield fetch
+    finally:
+        if browser is not None:
+            browser.close()
 
 
 def _parse_page(html: str, url: str, base: str) -> tuple[str, list[str], list[tuple[int, str]]]:
@@ -120,9 +156,16 @@ def load_collection(
         base = normalize_collection_url(url)
     except ValueError as exc:
         raise CollectionError('Нужна ссылка на публичный сборник Ficbook.') from exc
+    # Neither transport receives source accounts or authenticated cookies.
+    with _collection_reader(base) as fetch:
+        return _collect_pages(base, fetch, progress, request_delay, retry_attempts, retry_base_delay)
+
+
+def _collect_pages(
+    base: str, fetch: Callable[[str], tuple[bytes, str]], progress: Callable[[str], None] | None,
+    request_delay: float, retry_attempts: int, retry_base_delay: float,
+) -> FicbookCollection:
     limits = current_limits()
-    # No cookie jar or source account: a shared bot login must not expose private lists.
-    opener = build_safe_opener(_HOSTS, redirect_handler=_CollectionRedirectHandler(base))
     pending = [(1, base)]
     discovered = {1}
     works: dict[str, tuple[int, int]] = {}
@@ -136,20 +179,22 @@ def load_collection(
             try:
                 if request_delay:
                     bounded_sleep(request_delay)
-                request = Request(page_url, headers={
-                    'User-Agent': 'Mozilla/5.0 (compatible; FicbookDownloaderBot/1.0)',
-                    'Accept-Language': 'ru-RU,ru;q=0.9',
-                })
-                with opener.open(request, timeout=request_timeout()) as response:
-                    final_number, _ = _page_url(response.geturl(), base)
-                    if final_number != number:
-                        raise CollectionError('Ficbook перенаправил на другую страницу сборника. Попробуй позже.')
-                    html = read_bounded(response).decode('utf-8', 'replace')
+                payload, final_url = fetch(page_url)
+                final_number, _ = _page_url(final_url, base)
+                if final_number != number:
+                    raise CollectionError('Ficbook перенаправил на другую страницу сборника. Попробуй позже.')
+                html = payload.decode('utf-8', 'replace')
                 break
             except HTTPError as exc:
                 exc.close()
-                if exc.code in {401, 403, 404}:
-                    raise CollectionError('Сборник не найден или недоступен. Нужна ссылка на публичный сборник Ficbook.') from None
+                if is_cloudflare_challenge(exc.headers):
+                    raise CollectionError('Cloudflare не пропустил запрос к сборнику даже через резервный клиент. Попробуй позже.') from None
+                if exc.code == 404:
+                    raise CollectionError('Сборник не найден. Проверь ссылку на сборник Ficbook.') from None
+                if exc.code == 401:
+                    raise CollectionError('Для доступа к сборнику требуется вход. Бот скачивает только публичные сборники.') from None
+                if exc.code == 403:
+                    raise CollectionError('Ficbook запретил запрос к сборнику. Это может быть ограничение доступа или временная блокировка.') from None
                 if exc.code not in {429, 500, 502, 503, 504} or attempt + 1 >= retry_attempts:
                     raise CollectionError('Ficbook не отдал все страницы сборника. Попробуй позже.') from None
             except (URLError, TimeoutError, OSError) as exc:
