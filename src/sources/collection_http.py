@@ -1,4 +1,4 @@
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from email.message import Message
 from io import BytesIO
 import socket
@@ -13,15 +13,10 @@ from curl_cffi.requests.exceptions import RequestException
 
 from src.core.limits import (ResourceLimitError, ResponseLimitError, check_deadline,
                              current_limits, request_timeout)
-from src.sources.safe_http import require_https_url, resolve_addresses
+from src.sources.safe_http import is_cloudflare_challenge, require_https_url, resolve_addresses
 
 
 _HOSTS = frozenset({'ficbook.net', 'www.ficbook.net'})
-
-
-def is_cloudflare_challenge(headers: Message | Mapping[str, str]) -> bool:
-    return any(name.lower() == 'cf-mitigated' and str(value).strip().lower() == 'challenge'
-               for name, value in headers.items())
 
 
 class BrowserCollectionClient:

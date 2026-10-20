@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import unittest
+from email.message import Message
+from io import BytesIO
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError, URLError
 
 from bs4 import BeautifulSoup
 
 from src.core.models import Story
+from src.core.limits import ResourceLimitError
 from src.sources.ficbook import (
     FicbookAccount,
     FicbookChapterDownloadError,
@@ -132,6 +136,105 @@ class FicbookMetadataTests(unittest.TestCase):
             str(raised.exception),
             "Не удалось скачать фанфик с Ficbook. Возможно, сайт изменил страницу или временно отдает неполный ответ.",
         )
+
+    def test_unknown_homepage_does_not_turn_download_or_preview_errors_into_outage(self):
+        for operation in (self.client._download_once, self.client._preview_once):
+            with self.subTest(operation=operation.__name__), \
+                    patch.object(self.client, '_build_config', return_value=object()), \
+                    patch.object(self.client, 'ficbook_site_status', return_value=FicbookSiteStatus.UNKNOWN), \
+                    patch('src.sources.ficbook.adapters.getAdapter', side_effect=ValueError('parser drift')):
+                args = ('https://ficbook.net/readfic/1', FicbookAccount())
+                if operation.__name__ == '_download_once':
+                    args += (None, None)
+                with self.assertRaises(FicbookError) as raised:
+                    operation(*args)
+                self.assertNotIsInstance(raised.exception, FicbookSiteUnavailableError)
+                self.assertIn('parser drift', raised.exception.technical)
+
+    def test_network_failure_stays_network_error_when_homepage_status_is_unknown(self):
+        with patch.object(self.client, '_build_config', return_value=object()), \
+                patch.object(self.client, 'ficbook_site_status', return_value=FicbookSiteStatus.UNKNOWN), \
+                patch('src.sources.ficbook.adapters.getAdapter', side_effect=URLError('connection timeout')):
+            with self.assertRaises(FicbookError) as raised:
+                self.client._download_once('https://ficbook.net/readfic/1', FicbookAccount(), None, None)
+        self.assertNotIsInstance(raised.exception, FicbookSiteUnavailableError)
+        self.assertIn('соединение', raised.exception.user_message)
+
+    def test_plain_access_error_is_not_a_site_outage_or_cloudflare(self):
+        from fanficfare.exceptions import HTTPErrorFFF
+
+        for code in (401, 403):
+            with self.subTest(code=code), patch.object(self.client, '_build_config', return_value=object()), \
+                    patch.object(self.client, 'ficbook_site_status', return_value=FicbookSiteStatus.UNAVAILABLE) as status, \
+                    patch('src.sources.ficbook.adapters.getAdapter', side_effect=HTTPErrorFFF(
+                        'https://ficbook.net/readfic/1', code, 'Forbidden', b'Access denied',
+                    )):
+                with self.assertRaises(FicbookError) as raised:
+                    self.client._download_once('https://ficbook.net/readfic/1', FicbookAccount(), None, None)
+                self.assertNotIsInstance(raised.exception, FicbookSiteUnavailableError)
+                self.assertIn('доступ', raised.exception.user_message)
+                self.assertNotIn('Cloudflare', raised.exception.user_message)
+                status.assert_not_called()
+
+    def test_source_challenge_is_reported_without_a_homepage_probe(self):
+        from src.sources.fanficfare_http import SourceChallengeError
+
+        for operation in (self.client._download_once, self.client._preview_once):
+            with self.subTest(operation=operation.__name__), \
+                    patch.object(self.client, '_build_config', return_value=object()), \
+                    patch.object(self.client, 'ficbook_site_status') as status, \
+                    patch('src.sources.ficbook.adapters.getAdapter', side_effect=SourceChallengeError(
+                        'https://ficbook.net/readfic/1', 403,
+                    )):
+                args = ('https://ficbook.net/readfic/1', FicbookAccount())
+                if operation.__name__ == '_download_once':
+                    args += (None, None)
+                with self.assertRaises(FicbookError) as raised:
+                    operation(*args)
+                self.assertNotIsInstance(raised.exception, FicbookSiteUnavailableError)
+                self.assertIn('Cloudflare', raised.exception.user_message)
+                status.assert_not_called()
+
+    def test_homepage_challenge_is_not_an_outage_even_with_http_503_or_maintenance_text(self):
+        for code in (200, 403, 503):
+            with self.subTest(code=code):
+                headers = Message()
+                headers['CF-Mitigated'] = 'challenge'
+                response = BytesIO(b'under maintenance')
+                response.headers = headers
+                response.status = code
+                if code != 200:
+                    response = HTTPError('https://ficbook.net/', code, 'Challenge', headers, response)
+                with patch('src.sources.ficbook.urlopen', **(
+                    {'return_value': response} if code == 200 else {'side_effect': response}
+                )):
+                    result = self.client.ficbook_site_status()
+                self.assertEqual(result.value, 'challenged')
+                self.assertTrue(response.closed)
+
+    def test_homepage_resource_limits_are_not_silenced_as_unknown_status(self):
+        with patch('src.sources.ficbook.urlopen', side_effect=ResourceLimitError('deadline')):
+            with self.assertRaises(ResourceLimitError):
+                self.client.ficbook_site_status()
+
+    def test_homepage_http_errors_close_response_and_keep_unknown_separate_from_outage(self):
+        for code, expected in ((403, FicbookSiteStatus.UNKNOWN), (502, FicbookSiteStatus.UNAVAILABLE)):
+            with self.subTest(code=code):
+                response = HTTPError('https://ficbook.net/', code, 'Error', {}, BytesIO(b'Error'))
+                with patch('src.sources.ficbook.urlopen', side_effect=response):
+                    self.assertIs(self.client.ficbook_site_status(), expected)
+                self.assertTrue(response.closed)
+
+    def test_challenged_homepage_does_not_replace_the_original_parser_error(self):
+        with patch.object(self.client, '_build_config', return_value=object()), \
+                patch.object(self.client, 'ficbook_site_status', return_value=FicbookSiteStatus.CHALLENGED), \
+                patch('src.sources.ficbook.adapters.getAdapter', side_effect=ValueError('parser drift')):
+            with self.assertRaises(FicbookError) as raised:
+                self.client._download_once('https://ficbook.net/readfic/1', FicbookAccount(), None, None)
+        self.assertNotIsInstance(raised.exception, FicbookSiteUnavailableError)
+        self.assertNotIn('Cloudflare', raised.exception.user_message)
+        self.assertIn('parser drift', raised.exception.technical)
+        self.assertIn('challenged', raised.exception.technical)
 
     def test_ficbook_metadata_recovers_from_missing_text_element(self) -> None:
         adapter = FakeFicbookAdapter(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from email.message import Message
 from http.client import HTTPConnection, HTTPSConnection, HTTPResponse
 from http.cookiejar import CookieJar
 from functools import lru_cache
@@ -25,6 +27,11 @@ _TRANSITION_NETWORKS = tuple(ip_network(value) for value in (
 class UnsafeRequestError(URLError):
     def __init__(self, reason: str = "External request blocked by security policy") -> None:
         super().__init__(reason)
+
+
+def is_cloudflare_challenge(headers: Message | Mapping[str, str]) -> bool:
+    return any(name.lower() == 'cf-mitigated' and str(value).strip().lower() == 'challenge'
+               for name, value in headers.items())
 
 
 def is_public_address(value: str) -> bool:

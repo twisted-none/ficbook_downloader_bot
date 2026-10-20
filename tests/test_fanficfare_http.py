@@ -1,7 +1,11 @@
 from io import BytesIO
+from email.message import Message
 import gzip
 import unittest
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
+
+from fanficfare.exceptions import HTTPErrorFFF
 
 from src.sources.fanficfare_http import SafeFanficFareFetcher
 from src.sources.safe_http import UnsafeRequestError
@@ -65,6 +69,43 @@ class FanficFareTransportTests(unittest.TestCase):
         body.headers = {'Content-Encoding': 'gzip'}
         with self.assertRaises(ResourceLimitError):
             read_bounded(body, 200)
+
+    def test_cloudflare_challenge_keeps_its_type_without_saving_headers_or_body(self):
+        url = 'https://ficbook.net/readfic/1'
+        for status in (200, 403, 503):
+            with self.subTest(status=status):
+                headers = Message()
+                headers['cF-MiTiGaTeD'] = 'challenge'
+                headers['Set-Cookie'] = 'private=dummy'
+                response = Response(b'private challenge body')
+                response.headers = headers
+                response.status = status
+                opener = Mock()
+                if status == 200:
+                    opener.open.return_value = response
+                else:
+                    response = HTTPError(url, status, 'Challenge', headers, response)
+                    opener.open.side_effect = response
+                with patch('src.sources.fanficfare_http.build_safe_opener', return_value=opener):
+                    with self.assertRaises(HTTPErrorFFF) as raised:
+                        self.fetcher().request('GET', url)
+                self.assertEqual(type(raised.exception).__name__, 'SourceChallengeError')
+                self.assertEqual(raised.exception.status_code, status)
+                self.assertIsNone(raised.exception.data)
+                self.assertNotIn('private', str(raised.exception))
+                self.assertTrue(response.closed)
+
+    def test_plain_forbidden_does_not_become_a_cloudflare_challenge(self):
+        url = 'https://ficbook.net/readfic/1'
+        response = HTTPError(url, 403, 'Forbidden', {}, Response(b'Access denied'))
+        opener = Mock()
+        opener.open.side_effect = response
+        with patch('src.sources.fanficfare_http.build_safe_opener', return_value=opener):
+            with self.assertRaises(HTTPErrorFFF) as raised:
+                self.fetcher().request('GET', url)
+        self.assertIs(type(raised.exception), HTTPErrorFFF)
+        self.assertEqual(raised.exception.data, b'Access denied')
+        self.assertTrue(response.closed)
 
 
 if __name__ == '__main__':

@@ -1267,9 +1267,21 @@ async def _wait_for_ficbook_recovery(
         await asyncio.sleep(FICBOOK_SITE_RECHECK_SECONDS)
         check_deadline()
         status = await run_worker(client.ficbook_site_status)
-        if status is not FicbookSiteStatus.AVAILABLE:
+        if status is FicbookSiteStatus.UNAVAILABLE:
             continue
         queues.mark_site_available("ficbook.net")
+        if status is FicbookSiteStatus.CHALLENGED:
+            raise FicbookError(
+                "Cloudflare заблокировал проверку доступности Ficbook. "
+                "Не удалось подтвердить восстановление сайта. Попробуй повторить позже.",
+                technical="Ficbook recovery probe received a Cloudflare challenge",
+            )
+        if status is not FicbookSiteStatus.AVAILABLE:
+            raise FicbookError(
+                "Не удалось проверить доступность Ficbook. Это не подтверждает сбой сайта. "
+                "Попробуй повторить скачивание позже.",
+                technical="Ficbook recovery probe returned an unknown status",
+            )
         await progress.set(_active_download_status(formats, 0), force=True)
         return
 

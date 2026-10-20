@@ -3,6 +3,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.error import URLError
 
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.methods import SendMessage
@@ -11,6 +12,8 @@ from src.bot import app
 from src.core.download_queue import DownloadQueuePool
 from src.core.limits import ResourceLimits
 from src.sources.collections import CollectionError, FicbookCollection
+from src.sources.fanficfare_http import SourceChallengeError
+from src.sources.ficbook import FicbookClient, FicbookSiteStatus
 from src.storage.analytics import UserDownloadSettings
 from tests.test_download_status_flow import IncomingMessage, NoopAction
 
@@ -136,3 +139,48 @@ class CollectionFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.message.documents), 2)
         self.assertIn('Отправлено: 2', self.message.statuses[-1].text)
         self.assertIn('Не удалось: 1', self.message.statuses[-1].text)
+
+    async def test_source_errors_do_not_pause_the_collection_or_poison_site_state(self):
+        errors = (
+            SourceChallengeError(WORKS[0], 403),
+            ValueError('parser drift'),
+            URLError('connection timeout'),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                self.message = IncomingMessage()
+                source = FicbookClient(retry_attempts=1)
+                original = source._download_once
+
+                def download_once(url, account, progress, chapter_numbers):
+                    if url == WORKS[0]:
+                        return original(url, account, progress, chapter_numbers)
+                    return app.Story('Book', 'Author', url)
+
+                source.collection = self.client.collection
+                self.dependencies['ficbook_client'] = source
+                queues = DownloadQueuePool()
+                self.dependencies['download_queues'] = queues
+                with patch.object(source, '_download_once', side_effect=download_once), \
+                        patch.object(source, '_build_config', return_value=object()), \
+                        patch.object(source, 'ficbook_site_status', return_value=FicbookSiteStatus.UNKNOWN), \
+                        patch('src.sources.ficbook.adapters.getAdapter', side_effect=error), \
+                        patch.object(app, '_wait_for_ficbook_recovery', AsyncMock(
+                            side_effect=app.FicbookError('Unexpected recovery wait'),
+                        )) as wait, \
+                        patch.object(app, '_start_download', AsyncMock(return_value=None)), \
+                        patch.object(app, '_finish_download', AsyncMock()) as finish, \
+                        patch.object(app, '_notify_admin', AsyncMock()), \
+                        patch.object(app, '_build_selected_files', AsyncMock(return_value=[('txt', b'file')])), \
+                        patch.object(app.ChatActionSender, 'upload_document', return_value=NoopAction()), \
+                        patch.object(app._telegram_edit_gate, 'edit', AsyncMock()):
+                    await self.run_collection()
+                wait.assert_not_awaited()
+                self.assertFalse(queues.is_site_unavailable('ficbook.net'))
+                self.assertEqual(await queues.total_jobs(), 0)
+                self.assertEqual(len(self.message.documents), 2)
+                self.assertEqual([call.kwargs['success'] for call in finish.call_args_list], [False, True, True])
+                self.assertIn('Отправлено: 2', self.message.statuses[-1].text)
+                self.assertIn('Не удалось: 1', self.message.statuses[-1].text)
+                if isinstance(error, SourceChallengeError):
+                    self.assertTrue(any('Cloudflare' in status.text for status in self.message.statuses))

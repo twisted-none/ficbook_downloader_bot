@@ -168,6 +168,7 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
         url: str = "https://archiveofourown.org/works/1",
         *,
         update_interval: float = 0.005,
+        queues: DownloadQueuePool | None = None,
     ) -> None:
         patches = (
             patch("src.bot.app._start_download", AsyncMock(return_value=None)),
@@ -178,7 +179,7 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         with patches[0], patches[1], patches[2], patches[3], patches[4]:
             await _process_download(
-                message, client or FakeClient(), None, None, object(), DownloadQueuePool(),
+                message, client or FakeClient(), None, None, object(), queues or DownloadQueuePool(),
                 url, ("txt",), frozenset(),
             )
 
@@ -251,6 +252,50 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("Ficbook сейчас не работает" in text for text in active.edits))
         self.assertTrue(any("Ваш фанфик скачивается" in text for text in active.edits))
         self.assertIn("document", message.events)
+
+    async def test_unknown_recovery_probe_stops_waiting_instead_of_claiming_outage(self):
+        message = IncomingMessage()
+        client = OutageThenSuccessClient()
+        queues = DownloadQueuePool()
+        client.ficbook_site_status = unittest.mock.Mock(side_effect=[
+            FicbookSiteStatus.UNKNOWN, FicbookSiteStatus.AVAILABLE,
+        ])
+        with patch('src.bot.app.FICBOOK_SITE_RECHECK_SECONDS', 0), \
+                patch('src.bot.app._notify_admin', AsyncMock()):
+            await self._run_download(message, client, 'https://ficbook.net/readfic/1', queues=queues)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(client.ficbook_site_status.call_count, 1)
+        self.assertEqual(message.documents, [])
+        self.assertIn('проверить доступность', message.statuses[-1].text)
+        self.assertFalse(queues.is_site_unavailable('ficbook.net'))
+
+    async def test_challenged_recovery_probe_does_not_keep_the_site_paused(self):
+        message = IncomingMessage()
+        client = OutageThenSuccessClient()
+        queues = DownloadQueuePool()
+        client.ficbook_site_status = unittest.mock.Mock(side_effect=[
+            FicbookSiteStatus.CHALLENGED, FicbookSiteStatus.AVAILABLE,
+        ])
+        with patch('src.bot.app.FICBOOK_SITE_RECHECK_SECONDS', 0), \
+                patch('src.bot.app._notify_admin', AsyncMock()):
+            await self._run_download(message, client, 'https://ficbook.net/readfic/1', queues=queues)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(client.ficbook_site_status.call_count, 1)
+        self.assertEqual(message.documents, [])
+        self.assertIn('Cloudflare', message.statuses[-1].text)
+        self.assertFalse(queues.is_site_unavailable('ficbook.net'))
+
+    async def test_confirmed_outage_keeps_waiting_until_available(self):
+        message = IncomingMessage()
+        client = OutageThenSuccessClient()
+        client.ficbook_site_status = unittest.mock.Mock(side_effect=[
+            FicbookSiteStatus.UNAVAILABLE, FicbookSiteStatus.AVAILABLE,
+        ])
+        with patch('src.bot.app.FICBOOK_SITE_RECHECK_SECONDS', 0):
+            await self._run_download(message, client, 'https://ficbook.net/readfic/1')
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(client.ficbook_site_status.call_count, 2)
+        self.assertEqual(len(message.documents), 1)
 
     async def test_paid_litnet_book_is_a_notice_without_admin_alert(self) -> None:
         message = IncomingMessage()

@@ -46,9 +46,9 @@ from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPre
 from src.core.limits import (ResourceLimitError, bounded_operation, check_chapter_count,
                              bounded_sleep as sleep, check_deadline, read_bounded,
                              request_timeout, validate_preview, validate_story)
-from src.sources.fanficfare_http import SafeSourceConfiguration
+from src.sources.fanficfare_http import SafeSourceConfiguration, SourceChallengeError
 from src.sources.safe_http import (SafeHTTPSHandler, SafeProxyHandler, SafeRedirectHandler,
-                                   build_safe_opener)
+                                   build_safe_opener, is_cloudflare_challenge)
 from src.sources.registry import (
     SUPPORTED_HOST_MARKERS,
     extract_url,
@@ -151,6 +151,7 @@ class FicbookChapterDownloadError(FicbookError):
 class FicbookSiteStatus(Enum):
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
+    CHALLENGED = "challenged"
     UNKNOWN = "unknown"
 
 
@@ -215,18 +216,49 @@ class FicbookClient:
         )
         try:
             with urlopen(request, timeout=30) as response:
+                if is_cloudflare_challenge(response.headers):
+                    return FicbookSiteStatus.CHALLENGED
                 status = int(getattr(response, "status", 200))
                 html = read_bounded(response, FICBOOK_HOME_MAX_BYTES).decode("utf-8", "ignore")
         except HTTPError as exc:
-            try:
-                html = exc.read(FICBOOK_HOME_MAX_BYTES).decode("utf-8", "ignore")
-            except OSError:
-                html = ""
+            with exc:
+                if is_cloudflare_challenge(exc.headers):
+                    return FicbookSiteStatus.CHALLENGED
+                try:
+                    html = read_bounded(exc, FICBOOK_HOME_MAX_BYTES).decode("utf-8", "ignore")
+                except OSError:
+                    html = ""
             return classify_ficbook_homepage(exc.code, html)
+        except ResourceLimitError:
+            raise
         except Exception:
             logger.warning("Could not check Ficbook availability", exc_info=True)
             return FicbookSiteStatus.UNKNOWN
         return classify_ficbook_homepage(status, html)
+
+    def _ficbook_failure(self, error: Exception, *, preview: bool = False) -> FicbookError:
+        if isinstance(error, SourceChallengeError):
+            return FicbookError(
+                "Cloudflare заблокировал запрос к Ficbook проверкой браузера. "
+                "Это не означает, что сайт не работает. Попробуй повторить позже.",
+                technical=repr(error),
+            )
+        if _is_rate_limited(error):
+            return FicbookRateLimitError("Ficbook временно ограничил запросы.", technical=repr(error))
+        code = error.status_code if isinstance(error, HTTPErrorFFF) else getattr(error, 'code', None)
+        if code in {401, 403}:
+            return FicbookError(
+                "Ficbook отказал в доступе к запрошенной странице. "
+                "Это может быть ограничение доступа или блокировка запроса, а не сбой сайта.",
+                technical=repr(error),
+            )
+        status = self.ficbook_site_status()
+        if status is FicbookSiteStatus.UNAVAILABLE:
+            return _ficbook_site_unavailable_error(error)
+        friendly = _friendly_preview_error if preview else _friendly_download_error
+        result = friendly('https://ficbook.net/', error)
+        result.technical = f'{error!r}; Ficbook availability: {status.value}'
+        return result
 
     def collection(self, url: str, progress: Callable[[str], None] | None = None) -> FicbookCollection:
         return load_collection(
@@ -428,11 +460,7 @@ class FicbookClient:
         except (FicbookError, ResourceLimitError):
             raise
         except Exception as exc:
-            if _is_rate_limited(exc):
-                raise FicbookRateLimitError("Ficbook временно ограничил запросы.", technical=repr(exc)) from exc
-            if self.ficbook_site_status() is not FicbookSiteStatus.AVAILABLE:
-                raise _ficbook_site_unavailable_error(exc) from exc
-            raise _friendly_download_error(normalized, exc) from exc
+            raise self._ficbook_failure(exc) from exc
         return Story(
             title=story.getMetadata("title") or "ficbook",
             author=story.getMetadata("author") or "unknown",
@@ -523,11 +551,7 @@ class FicbookClient:
         except (FicbookError, ResourceLimitError):
             raise
         except Exception as exc:
-            if _is_rate_limited(exc):
-                raise FicbookRateLimitError("Ficbook временно ограничил запросы.", technical=repr(exc)) from exc
-            if self.ficbook_site_status() is not FicbookSiteStatus.AVAILABLE:
-                raise _ficbook_site_unavailable_error(exc) from exc
-            raise _friendly_preview_error(normalized, exc) from exc
+            raise self._ficbook_failure(exc, preview=True) from exc
         return StoryPreview(
             title=story.getMetadata("title") or "ficbook",
             author=story.getMetadata("author") or "unknown",
@@ -1547,7 +1571,7 @@ def _friendly_download_error(url: str, error: Exception) -> FicbookError:
 
 def _ficbook_site_unavailable_error(error: Exception) -> FicbookSiteUnavailableError:
     return FicbookSiteUnavailableError(
-        "Ficbook сейчас не работает или не проходит проверку доступности.",
+        "Проверка доступности подтвердила временную недоступность Ficbook.",
         technical=repr(error),
         user_message=(
             "Ficbook сейчас не работает. Фанфик останется в очереди и скачается, "

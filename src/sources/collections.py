@@ -13,8 +13,9 @@ from bs4 import BeautifulSoup
 from src.core.limits import (ResourceLimitError, bounded_operation, bounded_sleep,
                              check_deadline, current_limits, read_bounded, request_timeout)
 from src.sources.registry import FICBOOK_ID_PATTERN, normalize_collection_url
-from src.sources.collection_http import BrowserCollectionClient, is_cloudflare_challenge
-from src.sources.safe_http import SafeRedirectHandler, build_safe_opener, require_https_url
+from src.sources.collection_http import BrowserCollectionClient
+from src.sources.safe_http import (SafeRedirectHandler, build_safe_opener,
+                                   is_cloudflare_challenge, require_https_url)
 
 
 class CollectionError(Exception):
