@@ -7,13 +7,13 @@ from urllib.error import URLError
 
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.methods import SendMessage
+from fanficfare.exceptions import HTTPErrorFFF
 
 from src.bot import app
 from src.core.download_queue import DownloadQueuePool
 from src.core.limits import ResourceLimits
 from src.sources.collections import CollectionError, FicbookCollection
-from src.sources.fanficfare_http import SourceChallengeError
-from src.sources.ficbook import FicbookClient, FicbookSiteStatus
+from src.sources.ficbook import FicbookAccount, FicbookClient, FicbookSiteStatus
 from src.storage.analytics import UserDownloadSettings
 from tests.test_download_status_flow import IncomingMessage, NoopAction
 
@@ -47,6 +47,51 @@ class CollectionFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(collection.call_args.kwargs['cover_enabled'])
         chapters.assert_not_awaited()
         download.assert_not_awaited()
+
+    async def test_standalone_link_goes_directly_to_standard_downloader(self):
+        self.message.text = WORKS[0]
+        settings = UserDownloadSettings(formats=('fb2',), cover_enabled=False, chapter_selection_enabled=False)
+        with patch.object(app, '_get_user_download_settings', AsyncMock(return_value=settings)), \
+                patch.object(app, '_process_collection', AsyncMock()) as collection, \
+                patch.object(app, '_process_download', AsyncMock()) as download, \
+                patch('src.sources.collections.BrowserCollectionClient') as browser:
+            await app.on_link(self.message, **self.dependencies)
+        collection.assert_not_awaited()
+        browser.assert_not_called()
+        download.assert_awaited_once()
+        self.assertEqual(download.call_args.args[6], WORKS[0])
+        self.assertEqual(download.call_args.args[7], ('fb2',))
+        self.assertFalse(download.call_args.kwargs['cover_enabled'])
+
+    async def test_standalone_and_collection_works_use_same_downloader_and_account(self):
+        account = FicbookAccount('test-user', 'dummy-password')
+        source = FicbookClient(accounts=(account,))
+        source.collection = self.client.collection
+        self.dependencies['ficbook_client'] = source
+        self.dependencies['download_queues'] = DownloadQueuePool(ficbook_accounts=(account,))
+        settings = UserDownloadSettings(formats=('txt',), cover_enabled=False, chapter_selection_enabled=False)
+        self.message.text = WORKS[0]
+        with patch.object(source, '_download_once', side_effect=lambda url, *args: app.Story(
+            'Book', 'Author', url,
+        )) as download, \
+                patch.object(app, '_get_user_download_settings', AsyncMock(return_value=settings)), \
+                patch.object(app, '_start_download', AsyncMock(return_value=None)), \
+                patch.object(app, '_finish_download', AsyncMock()), \
+                patch.object(app, '_build_selected_files', AsyncMock(return_value=[('txt', b'file')])) as build_files, \
+                patch.object(app.ChatActionSender, 'upload_document', return_value=NoopAction()), \
+                patch.object(app._telegram_edit_gate, 'edit', AsyncMock()), \
+                patch('src.sources.collections.BrowserCollectionClient') as browser:
+            await app.on_link(self.message, **self.dependencies)
+            source.collection.assert_not_called()
+            self.message.text = URL
+            await app.on_link(self.message, **self.dependencies)
+        self.assertEqual([call.args[0] for call in download.call_args_list], [WORKS[0], *WORKS])
+        self.assertTrue(all(call.args[1] is account for call in download.call_args_list))
+        self.assertEqual(len(self.message.documents), 4)
+        self.assertEqual([doc['caption'] for doc in self.message.documents], ['Book (TXT)'] * 4)
+        self.assertEqual([call.args[1] for call in build_files.call_args_list], [('txt',)] * 4)
+        source.collection.assert_called_once()
+        browser.assert_not_called()
 
     async def test_works_are_sequential_and_failure_does_not_stop_the_rest(self):
         with patch.object(app, '_process_download', AsyncMock(side_effect=[True, False, True])) as download:
@@ -142,7 +187,7 @@ class CollectionFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_source_errors_do_not_pause_the_collection_or_poison_site_state(self):
         errors = (
-            SourceChallengeError(WORKS[0], 403),
+            HTTPErrorFFF(WORKS[0], 403, 'Source returned an HTTP error'),
             ValueError('parser drift'),
             URLError('connection timeout'),
         )
@@ -182,5 +227,5 @@ class CollectionFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([call.kwargs['success'] for call in finish.call_args_list], [False, True, True])
                 self.assertIn('Отправлено: 2', self.message.statuses[-1].text)
                 self.assertIn('Не удалось: 1', self.message.statuses[-1].text)
-                if isinstance(error, SourceChallengeError):
-                    self.assertTrue(any('Cloudflare' in status.text for status in self.message.statuses))
+                if isinstance(error, HTTPErrorFFF):
+                    self.assertTrue(any('доступ' in status.text for status in self.message.statuses))

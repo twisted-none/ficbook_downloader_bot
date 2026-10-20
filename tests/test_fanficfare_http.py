@@ -70,30 +70,39 @@ class FanficFareTransportTests(unittest.TestCase):
         with self.assertRaises(ResourceLimitError):
             read_bounded(body, 200)
 
-    def test_cloudflare_challenge_keeps_its_type_without_saving_headers_or_body(self):
+    def test_successful_response_is_passed_to_fanficfare_without_challenge_interception(self):
+        response = Response(b'<html>source page</html>')
+        response.headers = {'CF-Mitigated': 'challenge'}
+        opener = Mock()
+        opener.open.return_value = response
+        with patch('src.sources.fanficfare_http.build_safe_opener', return_value=opener), \
+                patch('src.sources.collections.BrowserCollectionClient') as browser:
+            result = self.fetcher().request('GET', 'https://ficbook.net/readfic/1')
+        self.assertEqual(result.content, b'<html>source page</html>')
+        self.assertEqual(result.redirecturl, 'https://ficbook.net/readfic/1')
+        self.assertTrue(response.closed)
+        browser.assert_not_called()
+
+    def test_http_errors_keep_standard_fanficfare_handling_even_with_challenge_header(self):
         url = 'https://ficbook.net/readfic/1'
-        for status in (200, 403, 503):
+        for status in (403, 503):
             with self.subTest(status=status):
                 headers = Message()
                 headers['cF-MiTiGaTeD'] = 'challenge'
                 headers['Set-Cookie'] = 'private=dummy'
-                response = Response(b'private challenge body')
-                response.headers = headers
-                response.status = status
+                response = HTTPError(url, status, 'Error', headers, Response(b'source error page'))
                 opener = Mock()
-                if status == 200:
-                    opener.open.return_value = response
-                else:
-                    response = HTTPError(url, status, 'Challenge', headers, response)
-                    opener.open.side_effect = response
-                with patch('src.sources.fanficfare_http.build_safe_opener', return_value=opener):
+                opener.open.side_effect = response
+                with patch('src.sources.fanficfare_http.build_safe_opener', return_value=opener), \
+                        patch('src.sources.collections.BrowserCollectionClient') as browser:
                     with self.assertRaises(HTTPErrorFFF) as raised:
                         self.fetcher().request('GET', url)
-                self.assertEqual(type(raised.exception).__name__, 'SourceChallengeError')
+                self.assertIs(type(raised.exception), HTTPErrorFFF)
                 self.assertEqual(raised.exception.status_code, status)
-                self.assertIsNone(raised.exception.data)
+                self.assertEqual(raised.exception.data, b'source error page')
                 self.assertNotIn('private', str(raised.exception))
                 self.assertTrue(response.closed)
+                browser.assert_not_called()
 
     def test_plain_forbidden_does_not_become_a_cloudflare_challenge(self):
         url = 'https://ficbook.net/readfic/1'

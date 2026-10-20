@@ -11,8 +11,7 @@ from fanficfare.fetchers import SleepDecorator
 from fanficfare.fetchers.base_fetcher import Fetcher, FetcherResponse
 
 from src.core.limits import ResourceLimitError, image_is_safe, read_bounded, request_timeout
-from src.sources.safe_http import (UnsafeRequestError, build_safe_opener,
-                                   is_cloudflare_challenge, require_https_url)
+from src.sources.safe_http import UnsafeRequestError, build_safe_opener, require_https_url
 
 SOURCE_HOSTS = {
     'ficbook.net': frozenset({'ficbook.net', 'www.ficbook.net'}),
@@ -20,13 +19,6 @@ SOURCE_HOSTS = {
                                     'download.archiveofourown.org'}),
     'wattpad.com': frozenset({'wattpad.com', 'www.wattpad.com', 'api.wattpad.com'}),
 }
-
-
-class SourceChallengeError(HTTPErrorFFF):
-    """A confirmed challenge, without retaining response cookies or body."""
-
-    def __init__(self, url: str, status_code: int) -> None:
-        super().__init__(url, status_code, 'Cloudflare browser challenge')
 
 
 class SafeSourceConfiguration(Configuration):
@@ -83,8 +75,6 @@ class SafeFanficFareFetcher(Fetcher):
         request = Request(url, data=data, headers=headers, method=method)
         try:
             with opener.open(request, timeout=request_timeout()) as response:
-                if is_cloudflare_challenge(response.headers):
-                    raise SourceChallengeError(url, int(getattr(response, 'status', 200)))
                 content = read_bounded(response, 8 * 1024 * 1024 if image else None)
                 if image and not image_is_safe(content):
                     raise ResourceLimitError('Обложка имеет небезопасный размер или формат.')
@@ -92,8 +82,6 @@ class SafeFanficFareFetcher(Fetcher):
                 require_https_url(result_url, None if image else self.allowed_hosts)
         except HTTPError as exc:
             with exc:
-                if is_cloudflare_challenge(exc.headers):
-                    raise SourceChallengeError(url, exc.code) from None
                 body = read_bounded(exc)
             raise HTTPErrorFFF(url, exc.code, 'Source returned an HTTP error', body) from None
         return FetcherResponse(content, result_url, False,

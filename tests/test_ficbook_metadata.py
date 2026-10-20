@@ -176,15 +176,15 @@ class FicbookMetadataTests(unittest.TestCase):
                 self.assertNotIn('Cloudflare', raised.exception.user_message)
                 status.assert_not_called()
 
-    def test_source_challenge_is_reported_without_a_homepage_probe(self):
-        from src.sources.fanficfare_http import SourceChallengeError
+    def test_http_403_uses_standard_error_in_download_and_preview(self):
+        from fanficfare.exceptions import HTTPErrorFFF
 
         for operation in (self.client._download_once, self.client._preview_once):
             with self.subTest(operation=operation.__name__), \
                     patch.object(self.client, '_build_config', return_value=object()), \
                     patch.object(self.client, 'ficbook_site_status') as status, \
-                    patch('src.sources.ficbook.adapters.getAdapter', side_effect=SourceChallengeError(
-                        'https://ficbook.net/readfic/1', 403,
+                    patch('src.sources.ficbook.adapters.getAdapter', side_effect=HTTPErrorFFF(
+                        'https://ficbook.net/readfic/1', 403, 'Source returned an HTTP error',
                     )):
                 args = ('https://ficbook.net/readfic/1', FicbookAccount())
                 if operation.__name__ == '_download_once':
@@ -192,7 +192,8 @@ class FicbookMetadataTests(unittest.TestCase):
                 with self.assertRaises(FicbookError) as raised:
                     operation(*args)
                 self.assertNotIsInstance(raised.exception, FicbookSiteUnavailableError)
-                self.assertIn('Cloudflare', raised.exception.user_message)
+                self.assertIn('доступ', raised.exception.user_message)
+                self.assertNotIn('Cloudflare', raised.exception.user_message)
                 status.assert_not_called()
 
     def test_homepage_challenge_is_not_an_outage_even_with_http_503_or_maintenance_text(self):

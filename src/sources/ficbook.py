@@ -46,7 +46,7 @@ from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPre
 from src.core.limits import (ResourceLimitError, bounded_operation, check_chapter_count,
                              bounded_sleep as sleep, check_deadline, read_bounded,
                              request_timeout, validate_preview, validate_story)
-from src.sources.fanficfare_http import SafeSourceConfiguration, SourceChallengeError
+from src.sources.fanficfare_http import SafeSourceConfiguration
 from src.sources.safe_http import (SafeHTTPSHandler, SafeProxyHandler, SafeRedirectHandler,
                                    build_safe_opener, is_cloudflare_challenge)
 from src.sources.registry import (
@@ -237,12 +237,6 @@ class FicbookClient:
         return classify_ficbook_homepage(status, html)
 
     def _ficbook_failure(self, error: Exception, *, preview: bool = False) -> FicbookError:
-        if isinstance(error, SourceChallengeError):
-            return FicbookError(
-                "Cloudflare заблокировал запрос к Ficbook проверкой браузера. "
-                "Это не означает, что сайт не работает. Попробуй повторить позже.",
-                technical=repr(error),
-            )
         if _is_rate_limited(error):
             return FicbookRateLimitError("Ficbook временно ограничил запросы.", technical=repr(error))
         code = error.status_code if isinstance(error, HTTPErrorFFF) else getattr(error, 'code', None)
