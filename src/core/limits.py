@@ -39,6 +39,9 @@ class ResourceLimits:
     max_sessions: int = 1000
     max_preview_bytes: int = 256 * 1024
     max_preview_chapters: int = 10000
+    max_collection_works: int = 1000
+    max_collection_pages: int = 100
+    max_collection_batches: int = 10
 
     @classmethod
     def from_environment(cls) -> 'ResourceLimits':

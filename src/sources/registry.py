@@ -13,6 +13,31 @@ SUPPORTED_HOST_MARKERS = (
     "ranobelib.me",
 )
 
+FICBOOK_ID_PATTERN = r'(?:[0-9]+|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})'
+_COLLECTION_PATH = re.compile(rf'/collections/({FICBOOK_ID_PATTERN})(?:/(?:page|p)/[0-9]{{1,9}})?/?', re.I)
+
+
+def normalize_collection_url(url: str) -> str:
+    if (len(url) > 4096 or '\\' in url
+            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)):
+        raise ValueError('Invalid collection URL')
+    parts = urlsplit(url)
+    match = _COLLECTION_PATH.fullmatch(parts.path)
+    if (parts.scheme not in {'http', 'https'}
+            or parts.hostname not in {'ficbook.net', 'www.ficbook.net', 'ficbook.com', 'www.ficbook.com'}
+            or parts.username is not None or parts.password is not None
+            or parts.port not in {None, 443 if parts.scheme == 'https' else 80} or match is None):
+        raise ValueError('Invalid collection URL')
+    return f'https://ficbook.net/collections/{match.group(1).lower()}'
+
+
+def is_ficbook_collection_url(url: str) -> bool:
+    try:
+        normalize_collection_url(url)
+        return True
+    except ValueError:
+        return False
+
 
 def extract_url(text: str) -> str | None:
     for chunk in text.split():

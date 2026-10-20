@@ -26,6 +26,7 @@ from fanficfare.configurable import Configuration
 from fanficfare.exceptions import HTTPErrorFFF
 
 from src.sources.ao3 import download_html_chapters
+from src.sources.collections import FicbookCollection, load_collection
 from src.sources.litnet import (
     LitnetClient,
     LitnetError,
@@ -226,6 +227,12 @@ class FicbookClient:
             logger.warning("Could not check Ficbook availability", exc_info=True)
             return FicbookSiteStatus.UNKNOWN
         return classify_ficbook_homepage(status, html)
+
+    def collection(self, url: str, progress: Callable[[str], None] | None = None) -> FicbookCollection:
+        return load_collection(
+            url, progress, request_delay=self.request_delay,
+            retry_attempts=self.retry_attempts, retry_base_delay=self.retry_base_delay,
+        )
 
     @bounded_operation
     def download(

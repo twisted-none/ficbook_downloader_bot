@@ -36,6 +36,13 @@ class ShareLinkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await resolve_share_url("https://share.google/Ab123"), "https://ficbook.net/readfic/123")
             self.assertEqual(fetch.await_count, 2)
 
+    async def test_google_share_can_resolve_to_a_public_collection_url(self):
+        target = 'https://ficbook.net/collections/123'
+        with patch('src.sources.share_links._fetch_redirect', AsyncMock(return_value=target)), patch(
+            'src.sources.share_links.ThreadedResolver.resolve', AsyncMock(return_value=[public_address()]),
+        ):
+            self.assertEqual(await resolve_share_url('https://share.google/Ab123'), target)
+
     async def test_redirect_targets_are_validated_before_fetching(self):
         targets = ["http://127.0.0.1/admin", "http://169.254.169.254/latest/meta-data",
                    "https://[::1]/", "file:///etc/passwd", "https://evil.test/",

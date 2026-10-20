@@ -66,7 +66,7 @@ class SupportConfirmationTests(unittest.IsolatedAsyncioTestCase):
         await app.on_support_text(self.message, 100)
 
     async def test_supported_links_require_confirmation_without_sending(self):
-        urls = ["https://share.google/Ab123", "https://ficbook.net/readfic/1", "https://archiveofourown.org/works/1",
+        urls = ["https://share.google/Ab123", "https://ficbook.net/readfic/1", "https://ficbook.net/collections/123", "https://archiveofourown.org/works/1",
                 "https://www.wattpad.com/story/123", "http://hogwartsnet.ru/mfanf/ffshowfic.php?fid=1",
                 "https://litnet.com/ru/book/title-b123", "https://ranobelib.me/ru/123--title"]
         with patch.object(app, "_send_support_message", new_callable=AsyncMock) as send:

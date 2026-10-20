@@ -90,6 +90,8 @@ from src.sources.ficbook import (
 )
 from src.exporters.formats import ALLOWED_FORMATS, build_docx, build_pdf, build_txt, normalize_formats
 from src.sources.share_links import ShareLinkError, extract_download_url, is_google_share_url, resolve_share_url
+from src.sources.collections import CollectionError
+from src.sources.registry import is_ficbook_collection_url
 from src.monitoring.metrics import run_metrics_server
 from src.storage.retention import run_history_retention
 from src.core.models import Story, StoryPreview
@@ -104,6 +106,7 @@ _support_pending: ExpiringDict[int, PendingSupportMessage] = ExpiringDict()
 _reply_waiting: ExpiringDict[int, int] = ExpiringDict()
 _settings_drafts: ExpiringDict[int, SettingsSession] = ExpiringDict()
 _chapter_waiting: ExpiringDict[int, PendingChapterSelection] = ExpiringDict()
+_collection_users: set[int] = set()
 _session_stores = (_broadcast_waiting, _support_waiting, _support_pending,
                    _reply_waiting, _settings_drafts, _chapter_waiting)
 FICBOOK_SITE_RECHECK_SECONDS = 60.0
@@ -796,6 +799,13 @@ async def on_link(
     formats = settings.formats
     cover_enabled = settings.cover_enabled
     chapter_selection_enabled = settings.chapter_selection_enabled
+    if is_ficbook_collection_url(url):
+        await _process_collection(
+            message, ficbook_client, admin_chat_id, alert_bot, analytics_store,
+            download_queues, url=url, formats=formats,
+            premium_queue_user_ids=premium_queue_user_ids, cover_enabled=cover_enabled,
+        )
+        return
     if chapter_selection_enabled and message.from_user:
         await _ask_chapter_selection(
             message,
@@ -902,6 +912,71 @@ async def _ask_chapter_selection(
     await status.edit_text(_chapter_selection_prompt(preview))
 
 
+async def _process_collection(
+    message: Message,
+    ficbook_client: FicbookClient,
+    admin_chat_id: int | None,
+    alert_bot: Bot | None,
+    analytics_store: AnalyticsStore,
+    download_queues: DownloadQueuePool,
+    url: str,
+    formats: tuple[str, ...],
+    premium_queue_user_ids: frozenset[int],
+    *,
+    cover_enabled: bool = True,
+) -> None:
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if user_id in _collection_users:
+        await _answer_notice_safely(message, 'У тебя уже скачивается сборник. Дождись его завершения.')
+        return
+    if len(_collection_users) >= current_limits().max_collection_batches:
+        await _answer_notice_safely(message, 'Сейчас очередь сборников заполнена. Попробуй позже.')
+        return
+    _collection_users.add(user_id)
+    status = None
+    progress = None
+    try:
+        status = await _answer_status_with_retry(message, 'Получаю список фанфиков из сборника...')
+        progress = ProgressMessage(status, min_interval=5.0)
+        collection = await download_queues.run_preview(
+            lambda: run_worker(ficbook_client.collection, url, progress.from_thread), user_id=user_id,
+        )
+        total = len(collection.urls)
+        if not total:
+            await progress.close()
+            await _replace_status_with_notice(message, status, admin_chat_id, 'Этот сборник пуст.')
+            return
+        sent = 0
+        title = escape(collection.title)
+        for index, work_url in enumerate(collection.urls, 1):
+            await progress.set(f'Сборник: {title}\nОбработано {index - 1} из {total}.\nОтправлено: {sent}.')
+            success = await _process_download(
+                message, ficbook_client, admin_chat_id, alert_bot, analytics_store,
+                download_queues, work_url, formats, premium_queue_user_ids,
+                cover_enabled=cover_enabled, raise_forbidden=True,
+            )
+            sent += bool(success)
+        await progress.close()
+        await _replace_status_with_notice(
+            message, status, admin_chat_id,
+            f'Сборник: {title}\nОбработано {total} из {total}.\nОтправлено: {sent}.\nНе удалось: {total - sent}.',
+        )
+    except TelegramForbiddenError:
+        logger.info('Collection download stopped because Telegram access was revoked')
+    except (CollectionError, ResourceLimitError, QueueFullError, FicbookError) as exc:
+        if progress is not None:
+            await progress.close()
+        await _replace_status_with_notice(message, status, admin_chat_id, _resource_error_text(exc))
+    except Exception as exc:
+        logger.exception('Unexpected error while processing Ficbook collection')
+        await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False)
+        await _replace_status_with_error(message, status, admin_chat_id, _developer_error_text())
+    finally:
+        if progress is not None:
+            await progress.close()
+        _collection_users.discard(user_id)
+
+
 async def _process_download(
     message: Message,
     ficbook_client: FicbookClient,
@@ -915,7 +990,8 @@ async def _process_download(
     *,
     cover_enabled: bool = True,
     chapter_numbers: set[int] | None = None,
-) -> None:
+    raise_forbidden: bool = False,
+) -> bool:
     priority = _is_priority_download_user(message, premium_queue_user_ids)
     assignment = download_queues.assign(url)
     status: Message | None = None
@@ -1068,7 +1144,12 @@ async def _process_download(
                     ) from exc
                 assignment = next_assignment
                 failover = True
+        return True
 
+    except TelegramForbiddenError:
+        await _finish_download(analytics_store, download_id, success=False, url=url, error='Telegram access revoked')
+        if raise_forbidden:
+            raise
     except (ResourceLimitError, QueueFullError) as exc:
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
         await _replace_status_with_notice(message, status, admin_chat_id, _resource_error_text(exc))
@@ -1102,6 +1183,7 @@ async def _process_download(
     finally:
         if progress is not None:
             await progress.close()
+    return False
 
 
 def _resource_error_text(error: Exception) -> str:

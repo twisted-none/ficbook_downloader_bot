@@ -9,7 +9,7 @@ import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import ThreadedResolver
 
-from src.sources.registry import SUPPORTED_HOST_MARKERS, is_supported_story_url
+from src.sources.registry import SUPPORTED_HOST_MARKERS, is_ficbook_collection_url, is_supported_story_url
 from src.sources.safe_http import is_public_address
 
 MAX_RESPONSE_BYTES = 64 * 1024
@@ -53,7 +53,8 @@ def extract_download_url(text: str) -> str | None:
     for chunk in text.split():
         candidate = chunk.strip("()[]<>,.!?\"'")
         try:
-            if is_google_share_url(candidate) or is_supported_story_url(candidate):
+            if (is_google_share_url(candidate) or is_ficbook_collection_url(candidate)
+                    or is_supported_story_url(candidate)):
                 return candidate
         except ValueError:
             continue
@@ -70,7 +71,7 @@ def _kind(url: str) -> str:
             return "google"
     host = parts.hostname or ""
     host = host.removeprefix("www.")
-    if host in SUPPORTED_HOST_MARKERS and is_supported_story_url(url):
+    if host in SUPPORTED_HOST_MARKERS and (is_supported_story_url(url) or is_ficbook_collection_url(url)):
         if parts.scheme == "https" or host == "hogwartsnet.ru":
             return "story"
     raise ShareLinkError()
