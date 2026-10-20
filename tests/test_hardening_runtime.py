@@ -5,6 +5,8 @@ from threading import Event
 import unittest
 from unittest.mock import Mock, patch
 
+from fanficfare.fetchers import RequestsFetcher
+
 from src.bot.app import DownloadProgressState, _build_selected_files
 from src.core.download_queue import DownloadQueue
 from src.core.limits import ResourceLimitError, ResourceLimits, read_bounded, resource_scope, run_worker
@@ -38,7 +40,7 @@ class HTTPDeadlineTests(unittest.TestCase):
             response.close()
         sock.shutdown.assert_called_once()
 
-    def test_all_fanficfare_configurations_keep_safe_transport_after_refresh(self):
+    def test_source_configurations_keep_selected_transport_after_refresh(self):
         client = FicbookClient()
         urls = ('https://ficbook.net/readfic/1', 'https://archiveofourown.org/works/1',
                 'https://www.wattpad.com/story/1')
@@ -46,10 +48,11 @@ class HTTPDeadlineTests(unittest.TestCase):
             with self.subTest(url=url):
                 config = client._build_config(url, FicbookAccount())
                 fetcher = config.get_fetcher()
-                self.assertIsInstance(fetcher, SafeFanficFareFetcher)
+                expected = RequestsFetcher if 'ficbook.net' in url else SafeFanficFareFetcher
+                self.assertIs(type(fetcher), expected)
                 jar = fetcher.get_cookiejar()
                 refreshed = config.get_fetcher(make_new=True)
-                self.assertIsInstance(refreshed, SafeFanficFareFetcher)
+                self.assertIs(type(refreshed), expected)
                 self.assertIs(refreshed.get_cookiejar(), jar)
 
 

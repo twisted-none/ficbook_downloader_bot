@@ -904,7 +904,11 @@ class FicbookClient:
         return "Для 18+ фанфиков Hogwartsnet укажи HOGWARTSNET_LOGIN и HOGWARTSNET_PASSWORD в .env."
 
     def _build_config(self, url: str, account: FicbookAccount) -> Configuration:
-        config = SafeSourceConfiguration(adapters.getConfigSectionsFor(url), "epub", site=_site_key(url))
+        sections = adapters.getConfigSectionsFor(url)
+        if _site_key(url) == "ficbook.net":
+            config = Configuration(sections, "epub")
+        else:
+            config = SafeSourceConfiguration(sections, "epub", site=_site_key(url))
         config.read([str(self.defaults_ini)])
         if urlsplit(url).hostname == "ficbook.net":
             config.set("ficbook.net", "add_to_extra_valid_entries", ",translator,translatorUrl")
