@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from html import escape, unescape
-from io import BytesIO
+from src.core.limits import LimitedBytesIO as BytesIO
 from typing import Any
 
 from bs4 import BeautifulSoup, NavigableString, Tag

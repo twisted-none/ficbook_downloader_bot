@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from src.core.limits import account_chapter
+
 
 @dataclass(slots=True)
 class Chapter:
     title: str
     html: str
     source_url: str = ""
+
+    @classmethod
+    def from_download(cls, title: str, html: str, source_url: str = '') -> 'Chapter':
+        account_chapter(html)
+        return cls(title, html, source_url)
 
 
 @dataclass(slots=True)

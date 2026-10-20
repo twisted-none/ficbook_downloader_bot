@@ -14,7 +14,4 @@ services:
     ports:
       - "${METRICS_HOST_PORT:-18000}:${METRICS_PORT:-8000}"
     volumes:
-      - ficbook-bot-data:/app/data
-
-volumes:
-  ficbook-bot-data:
+      - /srv/projects/data/ficbook_downloader_bot/app-data:/app/data

@@ -12,7 +12,7 @@ import mimetypes
 import re
 import secrets
 from threading import Lock
-from time import monotonic, sleep
+from time import monotonic
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
@@ -21,6 +21,7 @@ from urllib.request import Request
 from bs4 import BeautifulSoup
 
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.core.limits import bounded_operation, bounded_sleep as sleep, check_chapter_count, read_bounded
 from src.sources.safe_http import SafeRedirectHandler, UnsafeRequestError, build_safe_opener, require_https_url
 
 API_ROOT = "https://api.cdnlibs.org/api/manga"
@@ -121,6 +122,7 @@ class RanobelibClient:
         self._api_opener = build_safe_opener(API_HOSTS)
         self._cover_opener = build_safe_opener()
 
+    @bounded_operation
     def download(
         self,
         url: str,
@@ -130,6 +132,7 @@ class RanobelibClient:
         slug = self._slug(url)
         info = self._info(slug)
         selected = self._select_chapters(self._chapters(slug), chapter_numbers)
+        check_chapter_count(len(selected))
         chapters: list[Chapter] = []
         for position, chapter in enumerate(selected, 1):
             if progress:
@@ -141,9 +144,10 @@ class RanobelibClient:
                     f"RanobeLIB вернул пустую главу {chapter.index}.",
                     user_message=f"Глава {chapter.index} сейчас недоступна на RanobeLIB.",
                 )
-            chapters.append(Chapter(chapter.title, html, f"https://ranobelib.me/{slug}/v{chapter.volume}/c{chapter.number}"))
+            chapters.append(Chapter.from_download(chapter.title, html, f"https://ranobelib.me/{slug}/v{chapter.volume}/c{chapter.number}"))
         return self._story(url, info, chapters)
 
+    @bounded_operation
     def preview(self, url: str) -> StoryPreview:
         slug = self._slug(url)
         info = self._info(slug)
@@ -234,7 +238,7 @@ class RanobelibClient:
             self._wait_for_request_slot()
             try:
                 with self._api_opener.open(self._api_request(url), timeout=30) as response:
-                    payload = json.load(response)
+                    payload = json.loads(read_bounded(response))
                 break
             except HTTPError as exc:
                 if exc.code == 401 and self.login and not auth_retried:
@@ -346,7 +350,7 @@ class RanobelibClient:
         request = Request(url, headers=self._browser_headers(AUTH_LOGIN_URL))
         try:
             with self._auth_opener.open(request, timeout=30) as response:
-                return response.geturl(), response.read()
+                return response.geturl(), read_bounded(response)
         except _OAuthCallback as exc:
             return exc.url, b""
         except (HTTPError, URLError, TimeoutError):
@@ -372,7 +376,7 @@ class RanobelibClient:
             with self._auth_opener.open(request, timeout=30) as response:
                 result_url = response.geturl()
                 callback = result_url if _is_oauth_callback(result_url) else ""
-                return callback, result_url, response.read()
+                return callback, result_url, read_bounded(response)
         except _OAuthCallback as exc:
             return exc.url, exc.url, b""
         except (HTTPError, URLError, TimeoutError):
@@ -454,7 +458,7 @@ class RanobelibClient:
         request = Request(url, headers={**self._browser_headers(referer), "Accept": "application/json"})
         try:
             with self._auth_opener.open(request, timeout=30) as response:
-                payload = json.load(response)
+                payload = json.loads(read_bounded(response))
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             raise RanobelibLoginError("RanobeLIB authentication challenge failed or was blocked by security policy.") from None
         if not isinstance(payload, dict):
@@ -477,7 +481,7 @@ class RanobelibClient:
         )
         try:
             with self._api_opener.open(request, timeout=30) as response:
-                token = json.load(response)
+                token = json.loads(read_bounded(response))
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             raise RanobelibLoginError("RanobeLIB token request failed or was blocked by security policy.") from None
         if not isinstance(token, dict):

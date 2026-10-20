@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from html import escape
-from io import BytesIO
+from src.core.limits import LimitedBytesIO as BytesIO
 import re
 from uuid import NAMESPACE_URL, uuid5
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile

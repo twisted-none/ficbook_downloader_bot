@@ -94,7 +94,8 @@ class SupportConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 await app.on_link(self.message, **self.dependencies)
                 resolve.assert_awaited_once_with(self.message.text)
                 if select_chapters:
-                    select.assert_awaited_once_with(self.message, self.dependencies["ficbook_client"], 100, None, target, ("txt",), False)
+                    select.assert_awaited_once_with(self.message, self.dependencies["ficbook_client"], 100, None,
+                                                   target, ("txt",), False, self.dependencies['download_queues'])
                     download.assert_not_awaited()
                 else:
                     self.assertEqual(download.call_args.args[6:8], (target, ("txt",)))
@@ -203,7 +204,8 @@ class SupportConfirmationTests(unittest.IsolatedAsyncioTestCase):
         ) as select, patch.object(app, "_process_download", new_callable=AsyncMock) as download:
             await app.on_support_decision(self.callback("download"), **self.dependencies)
             select.assert_awaited_once_with(self.message, self.dependencies["ficbook_client"], 100, None,
-                                          "https://ficbook.net/readfic/123", ("epub",), False)
+                                          "https://ficbook.net/readfic/123", ("epub",), False,
+                                          self.dependencies['download_queues'])
             download.assert_not_awaited()
 
     async def test_foreign_user_and_old_buttons_cannot_consume_new_request(self):

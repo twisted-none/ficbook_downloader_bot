@@ -9,6 +9,7 @@ from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup, Tag
 
 from src.core.models import Chapter
+from src.core.limits import ResourceLimitError, ResponseLimitError
 
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ def parse_download(
             if heading:
                 heading.decompose()
             parts.append(str(node))
-        chapters.append(Chapter(str(link.get('title') or f'Глава {index}'), ''.join(parts), str(link['url'])))
+        chapters.append(Chapter.from_download(str(link.get('title') or f'Глава {index}'), ''.join(parts), str(link['url'])))
 
     if chapters:
         notes = soup.select('#preface > .meta > blockquote.userstuff')
@@ -103,6 +104,8 @@ def download_html_chapters(
 ) -> list[Chapter] | None:
     try:
         page = adapter.get_request(adapter.url + adapter.addurl)
+    except ResourceLimitError:
+        raise
     except Exception as exc:
         logger.info('AO3 download menu unavailable (%s); using chapter loader', type(exc).__name__)
         return None
@@ -115,6 +118,11 @@ def download_html_chapters(
     pause()
     try:
         html = adapter.get_request(link, usecache=False)
+    except ResponseLimitError:
+        logger.info('AO3 HTML export exceeds response limit; using chapter loader')
+        return None
+    except ResourceLimitError:
+        raise
     except Exception as exc:
         logger.info('AO3 HTML download unavailable (%s); using chapter loader', type(exc).__name__)
         return None

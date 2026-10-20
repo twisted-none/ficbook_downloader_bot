@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from http.client import HTTPConnection, HTTPSConnection
+from http.client import HTTPConnection, HTTPSConnection, HTTPResponse
 from http.cookiejar import CookieJar
 from functools import lru_cache
 from ipaddress import ip_address, ip_network
 import socket
 import ssl
+from threading import Timer
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import SplitResult, urljoin, urlsplit
@@ -13,6 +14,8 @@ from urllib.request import (
     HTTPCookieProcessor, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request,
     build_opener, proxy_bypass,
 )
+
+from src.core.limits import check_deadline, current_limits, request_timeout
 
 _TRANSITION_NETWORKS = tuple(ip_network(value) for value in (
     "64:ff9b::/96", "64:ff9b:1::/48", "2001::/32", "2002::/16", "192.0.0.0/24",
@@ -24,7 +27,7 @@ class UnsafeRequestError(URLError):
         super().__init__(reason)
 
 
-def _public_ip(value: str) -> bool:
+def is_public_address(value: str) -> bool:
     try:
         ip = ip_address(value)
     except ValueError:
@@ -50,7 +53,7 @@ def require_https_url(url: str, allowed_hosts: frozenset[str] | None = None) -> 
         except ValueError:
             pass
         else:
-            if not _public_ip(host):
+            if not is_public_address(host):
                 raise UnsafeRequestError()
         return parts
     except ValueError:
@@ -66,13 +69,38 @@ def resolve_addresses(host: str, port: int, *, public_only: bool = True) -> list
         raise UnsafeRequestError("External host has no usable addresses")
     for family, kind, _, _, address in addresses:
         if (family not in {socket.AF_INET, socket.AF_INET6} or kind != socket.SOCK_STREAM
-                or address[1] != port or (public_only and not _public_ip(address[0]))
+                or address[1] != port or (public_only and not is_public_address(address[0]))
                 or (public_only and family == socket.AF_INET6 and address[3] != 0)):
             raise UnsafeRequestError()
     return addresses
 
 
+class DeadlineHTTPResponse(HTTPResponse):
+    def __init__(self, sock, *args, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        self._response_socket = sock
+        self._deadline_expired = False
+        self._deadline_timer = Timer(request_timeout(current_limits().max_response_seconds), self._expire)
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
+
+    def _expire(self):
+        self._deadline_expired = True
+        try:
+            self._response_socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _close_conn(self):
+        timer = getattr(self, '_deadline_timer', None)
+        if timer is not None:
+            timer.cancel()
+        super()._close_conn()
+
+
 class PublicHTTPSConnection(HTTPSConnection):
+    response_class = DeadlineHTTPResponse
+
     def __init__(self, host: str, *, via_proxy: bool = False, **kwargs: Any) -> None:
         super().__init__(host, **kwargs)
         if not self._context.check_hostname or self._context.verify_mode != ssl.CERT_REQUIRED:
@@ -85,10 +113,11 @@ class PublicHTTPSConnection(HTTPSConnection):
         # Only the explicitly configured proxy may have a private address; the target is always public.
         addresses = resolve_addresses(*address, public_only=not self._via_proxy)
         for family, kind, protocol, _, numeric_address in addresses:
+            check_deadline()
             sock = socket.socket(family, kind, protocol)
             try:
                 if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
-                    sock.settimeout(timeout)
+                    sock.settimeout(request_timeout(timeout))
                 if source_address is not None:
                     sock.bind(source_address)
                 sock.connect(numeric_address)
@@ -202,7 +231,7 @@ class SafeOpener:
 
     def open(self, url: str | Request, data: bytes | None = None, timeout: float = 30) -> Any:
         require_https_url(url.full_url if isinstance(url, Request) else url, self.allowed_hosts)
-        return self.backend.open(url, data=data, timeout=timeout)
+        return self.backend.open(url, data=data, timeout=request_timeout(timeout))
 
 
 @lru_cache(maxsize=1)

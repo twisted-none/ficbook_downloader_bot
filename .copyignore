@@ -1,0 +1,86 @@
+# Development tools and repository metadata
+.git/
+.github/
+.agents/
+.codex/
+.idea/
+.vscode/
+.gitignore
+.gitattributes
+.graphifyignore
+AGENTS.md
+CLAUDE.md
+
+# Tests, reports and project graph
+tests/
+tasks/
+docs/
+graphify-out/
+README.md
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local environments, dependencies and build artifacts
+.venv*/
+venv/
+env/
+node_modules/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+build/
+dist/
+*.egg-info/
+
+# Local bot data must not overwrite server data
+data/
+downloads/
+output/
+logs/
+backups/
+*.log
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.dump
+backup*.sql
+dump*.sql
+
+# Keep .env available for deployment; exclude only the example
+.env.example
+**/.env.example
+
+# Local authentication state and private keys
+.auth/
+playwright/.auth/
+auth-state*.json
+storage-state*.json
+cookies*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editor and operating-system leftovers
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

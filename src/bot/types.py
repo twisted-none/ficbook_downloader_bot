@@ -19,6 +19,8 @@ class SettingsSession:
     saved: SettingsDraft
     draft: SettingsDraft
     view: str = "menu"
+    message_id: int | None = None
+    chat_id: int | None = None
 
 
 @dataclass(slots=True)

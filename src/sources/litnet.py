@@ -15,6 +15,7 @@ from urllib.request import Request
 from bs4 import BeautifulSoup, Tag
 
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.core.limits import bounded_operation, check_chapter_count, read_bounded
 from src.sources.safe_http import UnsafeRequestError, build_safe_opener, require_https_url
 
 MAX_COVER_BYTES = 8 * 1024 * 1024
@@ -71,6 +72,7 @@ class LitnetClient:
         self._authenticated = False
         self._lock = Lock()
 
+    @bounded_operation
     def download(
         self,
         url: str,
@@ -89,6 +91,7 @@ class LitnetClient:
                 book = self._soup(url.replace("/reader/", "/book/"))
                 chapters = self._chapters(reader)
             selected = self._select_chapters(chapters, chapter_numbers)
+            check_chapter_count(len(selected))
             bodies: list[Chapter] = []
             for position, chapter in enumerate(selected, 1):
                 if progress:
@@ -102,9 +105,10 @@ class LitnetClient:
                     except LitnetLoginError as exc:
                         raise self._protected_chapter_login_error(chapter.index, exc) from exc
                     html = self._chapter_html(self._soup(f"{url}?c={chapter.chapter_id}"))
-                bodies.append(Chapter(chapter.title, html, f"{url}?c={chapter.chapter_id}"))
+                bodies.append(Chapter.from_download(chapter.title, html, f"{url}?c={chapter.chapter_id}"))
             return self._story(url, reader, book, bodies)
 
+    @bounded_operation
     def preview(self, url: str) -> StoryPreview:
         with self._lock:
             reader = self._soup(url)
@@ -314,7 +318,7 @@ class LitnetClient:
         )
         try:
             with self._opener.open(request, timeout=30) as response:
-                return response.read(), response.headers.get_content_type()
+                return read_bounded(response), response.headers.get_content_type()
         except UnsafeRequestError:
             raise LitnetError("Не удалось безопасно подключиться к Litnet. Проверь настройки сети и прокси.") from None
         except HTTPError as exc:

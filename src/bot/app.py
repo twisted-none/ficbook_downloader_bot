@@ -33,6 +33,7 @@ from aiogram.utils.chat_action import ChatActionSender
 
 from src.storage.analytics import AnalyticsStore, UserDownloadSettings
 from src.bot.types import PendingChapterSelection, PendingSupportMessage, SettingsDraft, SettingsSession
+from src.bot.sessions import ExpiringDict, ExpiringSet
 from src.bot.ui import (
     active_download_status as _active_download_status,
     cancel_keyboard as _cancel_keyboard,
@@ -70,7 +71,10 @@ from src.core.download_queue import (
     PREMIUM_PRIORITY,
     DownloadQueuePool,
     QueueAssignment,
+    QueueFullError,
 )
+from src.core.limits import (ResourceLimitError, ResourceLimits, bounded_async_operation,
+                             check_deadline, current_limits, run_worker, validate_story)
 from src.exporters.epub import build_epub
 from src.exporters.fb2 import build_fb2
 from src.sources.ficbook import (
@@ -89,17 +93,19 @@ from src.sources.share_links import ShareLinkError, extract_download_url, is_goo
 from src.monitoring.metrics import run_metrics_server
 from src.storage.retention import run_history_retention
 from src.core.models import Story, StoryPreview
-from src.storage.users import UserStore
+from src.storage.users import UserStore, UserStoreError
 
 router = Router()
 URL_RE = re.compile(r"https?://[^\s]+")
 logger = logging.getLogger(__name__)
-_broadcast_waiting: set[int] = set()
-_support_waiting: set[int] = set()
-_support_pending: dict[int, PendingSupportMessage] = {}
-_reply_waiting: dict[int, int] = {}
-_settings_drafts: dict[int, "SettingsSession"] = {}
-_chapter_waiting: dict[int, "PendingChapterSelection"] = {}
+_broadcast_waiting: ExpiringSet[int] = ExpiringSet()
+_support_waiting: ExpiringSet[int] = ExpiringSet()
+_support_pending: ExpiringDict[int, PendingSupportMessage] = ExpiringDict()
+_reply_waiting: ExpiringDict[int, int] = ExpiringDict()
+_settings_drafts: ExpiringDict[int, SettingsSession] = ExpiringDict()
+_chapter_waiting: ExpiringDict[int, PendingChapterSelection] = ExpiringDict()
+_session_stores = (_broadcast_waiting, _support_waiting, _support_pending,
+                   _reply_waiting, _settings_drafts, _chapter_waiting)
 FICBOOK_SITE_RECHECK_SECONDS = 60.0
 ACTIVE_PROGRESS_UPDATE_SECONDS = 5.0
 TELEGRAM_SEND_ATTEMPTS = 3
@@ -313,7 +319,10 @@ class RegisterUserMiddleware(BaseMiddleware):
     ) -> Any:
         user_store: UserStore | None = data.get("user_store")
         if user_store and event.from_user:
-            user_store.add(event.from_user.id)
+            try:
+                await asyncio.to_thread(user_store.add, event.from_user.id)
+            except (UserStoreError, OSError):
+                logger.error('User registry could not be updated; existing data left intact')
         analytics_store: AnalyticsStore | None = data.get("analytics_store")
         if analytics_store and event.from_user:
             await _record_user(analytics_store, event.from_user)
@@ -340,6 +349,13 @@ def create_dispatcher(
     router.message.middleware(RegisterUserMiddleware())
     dispatcher.include_router(router)
     return dispatcher
+
+
+async def _expire_sessions() -> None:
+    while True:
+        await asyncio.sleep(60)
+        for store in _session_stores:
+            store.expire()
 
 
 @router.message(CommandStart())
@@ -370,8 +386,10 @@ async def on_settings(message: Message, analytics_store: AnalyticsStore, admin_c
         return
     settings = await _get_user_download_settings(analytics_store, message.from_user.id)
     draft = SettingsDraft(settings.formats, settings.chapter_selection_enabled, settings.cover_enabled)
-    _settings_drafts[message.from_user.id] = SettingsSession(saved=draft, draft=draft)
-    await message.answer(_settings_menu_text(draft), reply_markup=_settings_menu_keyboard(draft))
+    sent = await message.answer(_settings_menu_text(draft), reply_markup=_settings_menu_keyboard(draft))
+    _settings_drafts[message.from_user.id] = SettingsSession(
+        saved=draft, draft=draft, message_id=sent.message_id, chat_id=sent.chat.id,
+    )
 
 
 @router.message(Command("broadcast"))
@@ -691,7 +709,13 @@ async def on_broadcast_text(message: Message, admin_chat_id: int | None, user_st
     if not text:
         await message.answer("Нужен текст для рассылки.", reply_markup=_main_keyboard_for_message(message, admin_chat_id))
         return
-    sent, failed = await _broadcast(message.bot, user_store, text)
+    try:
+        sent, failed = await _broadcast(message.bot, user_store, text)
+    except (UserStoreError, OSError):
+        logger.error('Broadcast registry is unreadable; existing data left intact')
+        await message.answer('Список получателей недоступен. Рассылка остановлена, файл пользователей не сброшен.',
+                             reply_markup=_main_keyboard_for_message(message, admin_chat_id))
+        return
     await message.answer(
         f"Рассылка завершена. Отправлено: {sent}. Ошибок: {failed}.",
         reply_markup=_main_keyboard_for_message(message, admin_chat_id),
@@ -781,6 +805,7 @@ async def on_link(
             url,
             formats,
             cover_enabled,
+            download_queues,
         )
         return
     await _process_download(
@@ -797,6 +822,12 @@ async def on_link(
     )
 
 
+@router.message(F.text)
+async def on_unmatched_text(message: Message, admin_chat_id: int | None) -> None:
+    await message.answer('Пришли ссылку на произведение. Для обращения в поддержку открой /help.',
+                         reply_markup=_main_keyboard_for_message(message, admin_chat_id))
+
+
 async def _ask_chapter_selection(
     message: Message,
     ficbook_client: FicbookClient,
@@ -805,16 +836,27 @@ async def _ask_chapter_selection(
     url: str,
     formats: tuple[str, ...],
     cover_enabled: bool,
+    download_queues: DownloadQueuePool | None = None,
 ) -> None:
-    status = await message.answer(
-        _chapter_selection_input_text("Подготавливаю список глав..."),
-        reply_markup=_cancel_keyboard(),
-    )
+    try:
+        status = await _answer_status_with_retry(message,
+            _chapter_selection_input_text("Подготавливаю список глав..."),
+            reply_markup=_cancel_keyboard(),
+        )
+    except (FicbookError, TelegramForbiddenError):
+        logger.warning('Telegram preview status could not be created; preview not started')
+        return
     progress = ProgressMessage(status)
     try:
-        preview = await asyncio.to_thread(ficbook_client.preview, url, progress.from_thread)
+        queues = download_queues or DownloadQueuePool()
+        preview = await queues.run_preview(
+            lambda: run_worker(ficbook_client.preview, url, progress.from_thread),
+            user_id=message.from_user.id if message.from_user else None,
+        )
+    except (ResourceLimitError, QueueFullError) as exc:
+        await _replace_status_with_notice(message, status, admin_chat_id, _resource_error_text(exc))
+        return
     except FicbookSiteUnavailableError:
-        await progress.close()
         await _replace_status_with_error(
             message,
             status,
@@ -851,6 +893,8 @@ async def _ask_chapter_selection(
         await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False)
         await _replace_status_with_error(message, status, admin_chat_id, _developer_error_text())
         return
+    finally:
+        await progress.close()
     if not preview.chapters:
         await _replace_status_with_error(message, status, admin_chat_id, "Не удалось получить список глав.")
         return
@@ -898,7 +942,7 @@ async def _process_download(
                     ),
                 )
                 if status is None or progress is None:
-                    status = await message.answer(text)
+                    status = await _answer_status_with_retry(message, text)
                     progress = ProgressMessage(status, min_interval=5.0, initial_text=text)
                     return
                 await progress.set(text, force=True)
@@ -911,12 +955,14 @@ async def _process_download(
                 if status is not None:
                     try:
                         await status.delete()
-                    except TelegramBadRequest:
+                    except (TelegramBadRequest, TelegramNetworkError, TelegramServerError,
+                            TelegramForbiddenError, TelegramRetryAfter):
                         logger.debug("Failed to delete queued status message", exc_info=True)
                 active_text = _active_download_status(formats, progress_state.percent())
-                status = await message.answer(active_text)
+                status = await _answer_status_with_retry(message, active_text)
                 progress = ProgressMessage(status, min_interval=5.0, initial_text=active_text)
 
+            @bounded_async_operation
             async def download_job() -> tuple[Story, list[tuple[str, bytes]]]:
                 if progress is None:
                     raise RuntimeError("Active download status was not created")
@@ -935,7 +981,7 @@ async def _process_download(
                     )
                     try:
                         async with ChatActionSender.upload_document(bot=message.bot, chat_id=message.chat.id):
-                            story = await asyncio.to_thread(
+                            story = await run_worker(
                                 ficbook_client.download,
                                 url,
                                 observe_progress,
@@ -966,6 +1012,29 @@ async def _process_download(
                 files = await _build_selected_files(story, formats, progress_state)
                 return story, files
 
+            async def send_completed(result: tuple[Story, list[tuple[str, bytes]]]) -> None:
+                story, files = result
+                await _finish_download(analytics_store, download_id, success=True,
+                                       url=story.source_url, title=story.title)
+                file_stem = _safe_name(story.title)
+                if progress is None or status is None:
+                    raise RuntimeError('Download status message is missing')
+                if not await progress.set_required(_sending_status(formats)):
+                    logger.warning('Sending completed download after Telegram did not update final status')
+                for index, (fmt, payload) in enumerate(files, 1):
+                    await _answer_document_with_retry(
+                        message, payload, filename=f'{file_stem}.{fmt}',
+                        caption=f'{escape(story.title)} ({fmt.upper()})',
+                        reply_markup=(_main_keyboard_for_message(message, admin_chat_id)
+                                      if index == len(files) else None),
+                    )
+                try:
+                    await status.delete()
+                except (TelegramNetworkError, TelegramServerError, TelegramRetryAfter, TelegramForbiddenError):
+                    logger.warning('Telegram transient error while deleting completed progress message')
+                except TelegramBadRequest:
+                    logger.debug('Failed to delete completed progress message')
+
             level = PREMIUM_PRIORITY if priority else FAILOVER_PRIORITY if failover else 0
             try:
                 story, files = await current.queue.run(
@@ -974,6 +1043,9 @@ async def _process_download(
                     on_started=on_started,
                     queue_update_interval=60.0,
                     priority_level=level,
+                    user_id=message.from_user.id if message.from_user else None,
+                    continuation=failover,
+                    on_completed=send_completed,
                 )
                 break
             except (FicbookRateLimitError, FicbookLoginError) as exc:
@@ -997,35 +1069,9 @@ async def _process_download(
                 assignment = next_assignment
                 failover = True
 
-        await _finish_download(analytics_store, download_id, success=True, url=story.source_url, title=story.title)
-        file_stem = _safe_name(story.title)
-        final_text = _sending_status(formats)
-        if progress is None or status is None:
-            raise RuntimeError("Download status message is missing")
-        final_status_updated = await progress.set_required(final_text)
-        if not final_status_updated:
-            logger.warning(
-                "Sending completed download after Telegram did not update final status: chat_id=%s",
-                message.chat.id,
-            )
-        for index, (fmt, payload) in enumerate(files, 1):
-            await _answer_document_with_retry(
-                message,
-                payload,
-                filename=f"{file_stem}.{fmt}",
-                caption=f"{escape(story.title)} ({fmt.upper()})",
-                reply_markup=(
-                    _main_keyboard_for_message(message, admin_chat_id)
-                    if index == len(files)
-                    else None
-                ),
-            )
-        try:
-            await status.delete()
-        except (TelegramNetworkError, TelegramServerError):
-            logger.warning("Telegram transient error while deleting completed progress message", exc_info=True)
-        except TelegramBadRequest:
-            logger.debug("Failed to delete completed progress message", exc_info=True)
+    except (ResourceLimitError, QueueFullError) as exc:
+        await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
+        await _replace_status_with_notice(message, status, admin_chat_id, _resource_error_text(exc))
     except FicbookPaidContentError as exc:
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
         await _replace_status_with_notice(message, status, admin_chat_id, _user_error_message(exc))
@@ -1053,6 +1099,30 @@ async def _process_download(
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
         await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False)
         await _replace_status_with_error(message, status, admin_chat_id, _developer_error_text())
+    finally:
+        if progress is not None:
+            await progress.close()
+
+
+def _resource_error_text(error: Exception) -> str:
+    return ('Сейчас очередь заполнена. Попробуй отправить ссылку немного позже.'
+            if isinstance(error, QueueFullError) else escape(str(error)))
+
+
+async def _answer_status_with_retry(message: Message, text: str, **kwargs: Any) -> Message:
+    for attempt in range(TELEGRAM_SEND_ATTEMPTS):
+        try:
+            return await message.answer(text, **kwargs)
+        except (TelegramNetworkError, TelegramServerError, TelegramRetryAfter) as exc:
+            delay = exc.retry_after + 1 if isinstance(exc, TelegramRetryAfter) else TELEGRAM_SEND_RETRY_DELAY_SECONDS
+            if attempt + 1 == TELEGRAM_SEND_ATTEMPTS or delay > 30:
+                raise FicbookError(
+                    'Не удалось создать сообщение о загрузке из-за сбоя Telegram. Попробуй позже.',
+                    technical='Telegram status send attempts exhausted',
+                ) from None
+            logger.warning('Telegram status send failed; retrying (%s/%s)', attempt + 2, TELEGRAM_SEND_ATTEMPTS)
+            await asyncio.sleep(delay)
+    raise RuntimeError('Unreachable Telegram retry state')
 
 
 async def _active_progress_updater(
@@ -1113,7 +1183,8 @@ async def _wait_for_ficbook_recovery(
     )
     while True:
         await asyncio.sleep(FICBOOK_SITE_RECHECK_SECONDS)
-        status = await asyncio.to_thread(client.ficbook_site_status)
+        check_deadline()
+        status = await run_worker(client.ficbook_site_status)
         if status is not FicbookSiteStatus.AVAILABLE:
             continue
         queues.mark_site_available("ficbook.net")
@@ -1133,7 +1204,7 @@ async def _replace_status_with_error(
     if status is not None:
         try:
             await status.delete()
-        except (TelegramNetworkError, TelegramServerError):
+        except (TelegramNetworkError, TelegramServerError, TelegramRetryAfter, TelegramForbiddenError):
             logger.warning(
                 "Telegram transient error while deleting progress message before error response",
                 exc_info=True,
@@ -1141,10 +1212,8 @@ async def _replace_status_with_error(
         except TelegramBadRequest:
             logger.debug("Failed to delete progress message before error response", exc_info=True)
     reply_markup = _support_keyboard() if support else _main_keyboard_for_message(message, admin_chat_id)
-    await message.answer(
-        _download_error_text(error, admin_notified=admin_notified),
-        reply_markup=reply_markup,
-    )
+    await _answer_notice_safely(message, _download_error_text(error, admin_notified=admin_notified),
+                                reply_markup=reply_markup)
 
 
 async def _replace_status_with_notice(
@@ -1156,17 +1225,21 @@ async def _replace_status_with_notice(
     if status is not None:
         try:
             await status.delete()
-        except (TelegramNetworkError, TelegramServerError):
+        except (TelegramNetworkError, TelegramServerError, TelegramRetryAfter, TelegramForbiddenError):
             logger.warning(
                 "Telegram transient error while deleting progress message before notice",
                 exc_info=True,
             )
         except TelegramBadRequest:
             logger.debug("Failed to delete progress message before notice", exc_info=True)
-    await message.answer(
-        text,
-        reply_markup=_main_keyboard_for_message(message, admin_chat_id),
-    )
+    await _answer_notice_safely(message, text, reply_markup=_main_keyboard_for_message(message, admin_chat_id))
+
+
+async def _answer_notice_safely(message: Message, text: str, **kwargs: Any) -> None:
+    try:
+        await _answer_status_with_retry(message, text, **kwargs)
+    except (FicbookError, TelegramForbiddenError, TelegramBadRequest):
+        logger.warning('Telegram error notice could not be delivered')
 
 
 def _user_error_message(error: Exception) -> str:
@@ -1223,6 +1296,11 @@ def _site_accounts(settings: Settings) -> dict[str, tuple[FicbookAccount, ...]]:
 
 
 async def run_bot(settings: Settings) -> None:
+    limits = ResourceLimits.from_environment()
+    for store in _session_stores:
+        values = store._values if isinstance(store, ExpiringSet) else store
+        values.ttl_seconds = limits.session_ttl_seconds
+        values.max_entries = limits.max_sessions
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     alert_bot = (
         Bot(settings.alert_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -1256,6 +1334,8 @@ async def run_bot(settings: Settings) -> None:
             ficbook_accounts=ficbook_accounts,
             min_start_interval=settings.ficbook_download_interval_seconds,
             account_cooldown_seconds=settings.ficbook_retry_max_delay_seconds or 60.0,
+            max_jobs=limits.max_queue_jobs,
+            max_active=limits.max_active_jobs,
         ),
         settings.premium_queue_user_ids,
     )
@@ -1263,13 +1343,15 @@ async def run_bot(settings: Settings) -> None:
         run_metrics_server(analytics_store, settings.metrics_host, settings.metrics_port)
     )
     retention_task = asyncio.create_task(run_history_retention(analytics_store))
+    sessions_task = asyncio.create_task(_expire_sessions())
     try:
         await _set_bot_commands(bot, settings.admin_chat_id)
-        await dispatcher.start_polling(bot)
+        await dispatcher.start_polling(bot, tasks_concurrency_limit=limits.max_queue_jobs + 64)
     finally:
         metrics_task.cancel()
         retention_task.cancel()
-        await asyncio.gather(metrics_task, retention_task, return_exceptions=True)
+        sessions_task.cancel()
+        await asyncio.gather(metrics_task, retention_task, sessions_task, return_exceptions=True)
         if alert_bot:
             await alert_bot.session.close()
 
@@ -1342,13 +1424,12 @@ async def _settings_session(callback: CallbackQuery, analytics_store: AnalyticsS
     if not callback.from_user:
         return None
     session = _settings_drafts.get(callback.from_user.id)
-    if session:
+    if session and (session.message_id is None or (callback.message is not None
+            and callback.message.message_id == session.message_id
+            and callback.message.chat.id == session.chat_id)):
         return session
-    settings = await _get_user_download_settings(analytics_store, callback.from_user.id)
-    draft = SettingsDraft(settings.formats, settings.chapter_selection_enabled, settings.cover_enabled)
-    session = SettingsSession(saved=draft, draft=draft)
-    _settings_drafts[callback.from_user.id] = session
-    return session
+    await callback.answer('Эти настройки устарели. Открой /settings заново.', show_alert=True)
+    return None
 
 
 async def _save_settings_session(user_id: int, session: SettingsSession, analytics_store: AnalyticsStore) -> bool:
@@ -1383,6 +1464,7 @@ def _chapter_selection_prompt(preview: StoryPreview) -> str:
     return "\n".join(lines)
 
 
+@bounded_async_operation
 async def _build_selected_files(
     story: Story,
     formats: tuple[str, ...],
@@ -1396,10 +1478,19 @@ async def _build_selected_files(
         "pdf": build_pdf,
     }
     files: list[tuple[str, bytes]] = []
+    validate_story(story)
+    limits = current_limits()
+    output_size = 0
     total = max(1, len(formats))
     for index, fmt in enumerate(formats, 1):
         progress.set_actual(80 + round(index / total * 15))
-        files.append((fmt, await asyncio.to_thread(builders[fmt], story)))
+        check_deadline()
+        payload = await run_worker(builders[fmt], story)
+        check_deadline()
+        output_size += len(payload)
+        if len(payload) > limits.max_file_bytes or output_size > limits.max_output_bytes:
+            raise ResourceLimitError('Готовые файлы слишком большие. Выбери меньше глав или форматов.')
+        files.append((fmt, payload))
     return files
 
 
@@ -1407,12 +1498,15 @@ async def _broadcast(bot: Bot, user_store: UserStore, text: str) -> tuple[int, i
     sent = 0
     failed = 0
     payload = escape(text)
-    for user_id in user_store.list_user_ids():
+    for user_id in await asyncio.to_thread(user_store.list_user_ids):
         try:
             await bot.send_message(user_id, payload)
             sent += 1
         except (TelegramForbiddenError, TelegramBadRequest):
-            user_store.remove(user_id)
+            try:
+                await asyncio.to_thread(user_store.remove, user_id)
+            except (UserStoreError, OSError):
+                logger.error('Could not update broadcast registry; existing data left intact')
             failed += 1
         except Exception:
             logger.exception("Failed to send broadcast to user %s", user_id)

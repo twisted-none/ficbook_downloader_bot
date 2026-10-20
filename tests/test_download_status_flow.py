@@ -6,7 +6,7 @@ from time import sleep
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import EditMessageText
 from aiogram.types import ReplyKeyboardMarkup
 
@@ -127,6 +127,40 @@ class NoopAction:
 
 
 class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_persistent_telegram_outage_does_not_start_or_repeat_download(self) -> None:
+        message = IncomingMessage()
+        message.answer = AsyncMock(side_effect=TelegramNetworkError(
+            method=EditMessageText(chat_id=1, message_id=1, text='status'), message='timeout',
+        ))
+        client = FastClient()
+        client.download = unittest.mock.Mock(wraps=client.download)
+        with patch('src.bot.app.TELEGRAM_SEND_RETRY_DELAY_SECONDS', 0):
+            await self._run_download(message, client)
+        client.download.assert_not_called()
+        self.assertEqual(message.answer.await_count, 6)  # Three status attempts and three error-notice attempts.
+        self.assertEqual(message.documents, [])
+
+    async def test_initial_status_timeout_is_retried_without_repeating_download(self) -> None:
+        message = IncomingMessage()
+        original = message.answer
+        client = FastClient()
+        client.download = unittest.mock.Mock(wraps=client.download)
+        calls = 0
+
+        async def flaky_answer(text, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TelegramNetworkError(method=EditMessageText(chat_id=1, message_id=1, text=text),
+                                           message='Request timeout error')
+            return await original(text, **kwargs)
+
+        message.answer = flaky_answer
+        with patch('src.bot.app.TELEGRAM_SEND_RETRY_DELAY_SECONDS', 0):
+            await self._run_download(message, client)
+        client.download.assert_called_once()
+        self.assertEqual(len(message.documents), 1)
+
     async def _run_download(
         self,
         message: IncomingMessage,

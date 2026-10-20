@@ -14,11 +14,10 @@ from pathlib import Path
 import re
 import ssl
 from threading import Lock
-from time import sleep
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
-from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, HTTPSHandler, Request, build_opener, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 import fanficfare
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -43,6 +42,12 @@ from src.sources.ranobelib import (
     RanobelibRateLimitError,
 )
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.core.limits import (ResourceLimitError, bounded_operation, check_chapter_count,
+                             bounded_sleep as sleep, check_deadline, read_bounded,
+                             request_timeout, validate_preview, validate_story)
+from src.sources.fanficfare_http import SafeSourceConfiguration
+from src.sources.safe_http import (SafeHTTPSHandler, SafeProxyHandler, SafeRedirectHandler,
+                                   build_safe_opener)
 from src.sources.registry import (
     SUPPORTED_HOST_MARKERS,
     extract_url,
@@ -119,7 +124,10 @@ def _require_hogwartsnet_https(url: str) -> None:
         )
 
 
-class _HogwartsnetHTTPSRedirectHandler(HTTPRedirectHandler):
+class _HogwartsnetHTTPSRedirectHandler(SafeRedirectHandler):
+    def __init__(self) -> None:
+        super().__init__(frozenset({'hogwartsnet.ru', 'www.hogwartsnet.ru'}))
+
     def redirect_request(
         self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str,
     ) -> Any:
@@ -162,6 +170,12 @@ FICBOOK_HOME_MAX_BYTES = 512 * 1024
 DATE_VALUE_PATTERN = r"(?:[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{2,4}|[0-9]{1,2}\s+[А-Яа-яЁё]+\s+[0-9]{4})"
 
 
+def urlopen(request: Request, timeout: float = 30) -> Any:
+    return build_safe_opener(frozenset({'ficbook.net', 'www.ficbook.net'})).open(
+        request, timeout=request_timeout(timeout),
+    )
+
+
 class FicbookClient:
     def __init__(
         self,
@@ -201,7 +215,7 @@ class FicbookClient:
         try:
             with urlopen(request, timeout=30) as response:
                 status = int(getattr(response, "status", 200))
-                html = response.read(FICBOOK_HOME_MAX_BYTES).decode("utf-8", "ignore")
+                html = read_bounded(response, FICBOOK_HOME_MAX_BYTES).decode("utf-8", "ignore")
         except HTTPError as exc:
             try:
                 html = exc.read(FICBOOK_HOME_MAX_BYTES).decode("utf-8", "ignore")
@@ -213,6 +227,7 @@ class FicbookClient:
             return FicbookSiteStatus.UNKNOWN
         return classify_ficbook_homepage(status, html)
 
+    @bounded_operation
     def download(
         self,
         url: str,
@@ -233,7 +248,9 @@ class FicbookClient:
             for attempt in range(1, self.retry_attempts + 1):
                 try:
                     _report(progress, f"Скачиваю описание фанфика: аккаунт {index}/{len(accounts)}")
-                    return self._download_once(normalized, account, progress, chapter_numbers)
+                    result = self._download_once(normalized, account, progress, chapter_numbers)
+                    validate_story(result)
+                    return result
                 except FicbookRateLimitError as exc:
                     last_rate_limit = exc
                     last_transient_error = None
@@ -279,6 +296,7 @@ class FicbookClient:
             raise last_transient_error
         raise FicbookError("Не удалось загрузить фанфик.")
 
+    @bounded_operation
     def preview(self, url: str, progress: Callable[[str], None] | None = None) -> StoryPreview:
         normalized = normalize_url(url)
         site_name = _site_display_name(normalized)
@@ -294,7 +312,9 @@ class FicbookClient:
                         "Формат: 1,2,5-10,17.\n"
                         f"Аккаунт: {index}/{len(accounts)}",
                     )
-                    return self._preview_once(normalized, account)
+                    result = self._preview_once(normalized, account)
+                    validate_preview(result)
+                    return result
                 except FicbookRateLimitError as exc:
                     last_rate_limit = exc
                     last_transient_error = None
@@ -385,7 +405,7 @@ class FicbookClient:
             for position, (chapter_index, chapter) in enumerate(selected_chapters, 1):
                 _report(progress, f"Скачиваю главы: {position}/{len(selected_chapters)}")
                 self._pause_between_requests()
-                chapters.append(Chapter(title=chapter["title"], html=self._load_chapter_html(adapter, chapter["url"]), source_url=chapter["url"]))
+                chapters.append(Chapter.from_download(title=chapter["title"], html=self._load_chapter_html(adapter, chapter["url"]), source_url=chapter["url"]))
         except exceptions.AdultCheckRequired as exc:
             raise FicbookError(
                 self._adult_message(account),
@@ -398,7 +418,7 @@ class FicbookClient:
             ) from exc
         except (exceptions.UnknownSite, exceptions.StoryDoesNotExist) as exc:
             raise FicbookNotFoundError("Не удалось найти фанфик по этой ссылке.") from exc
-        except FicbookError:
+        except (FicbookError, ResourceLimitError):
             raise
         except Exception as exc:
             if _is_rate_limited(exc):
@@ -493,7 +513,7 @@ class FicbookClient:
             ) from exc
         except (exceptions.UnknownSite, exceptions.StoryDoesNotExist) as exc:
             raise FicbookNotFoundError("Не удалось найти фанфик по этой ссылке.") from exc
-        except FicbookError:
+        except (FicbookError, ResourceLimitError):
             raise
         except Exception as exc:
             if _is_rate_limited(exc):
@@ -545,7 +565,7 @@ class FicbookClient:
                 _report(progress, f"Скачиваю главы: {position}/{len(selected_chapters)}")
                 self._pause_between_requests()
                 chapters.append(
-                    Chapter(
+                    Chapter.from_download(
                         title=chapter.get("title") or f"Глава {chapter_index}",
                         source_url=chapter["url"],
                         html=self._fanficfare_chapter_html(
@@ -554,7 +574,7 @@ class FicbookClient:
                         ),
                     )
                 )
-        except FicbookChapterDownloadError:
+        except (FicbookChapterDownloadError, ResourceLimitError):
             raise
         except exceptions.AdultCheckRequired as exc:
             raise FicbookError(
@@ -663,6 +683,7 @@ class FicbookClient:
         return min(delay, self.retry_max_delay) if self.retry_max_delay else delay
 
     def _pause_between_requests(self) -> None:
+        check_deadline()
         if self.request_delay:
             sleep(self.request_delay)
 
@@ -697,7 +718,7 @@ class FicbookClient:
                     user_message=self._adult_user_message(normalized),
                 )
             title, html = self._hogwartsnet_chapter(chapter_soup, chapter.get("title") or f"Глава {chapter_index}")
-            chapters.append(Chapter(title=title, html=html, source_url=chapter["url"]))
+            chapters.append(Chapter.from_download(title=title, html=html, source_url=chapter["url"]))
         return Story(
             title=metadata["title"],
             author=metadata["author"],
@@ -734,7 +755,8 @@ class FicbookClient:
         _require_hogwartsnet_https(url)
         opener = build_opener(
             HTTPCookieProcessor(CookieJar()),
-            HTTPSHandler(context=ssl.create_default_context()),
+            SafeHTTPSHandler(context=ssl.create_default_context()),
+            SafeProxyHandler(),
             _HogwartsnetHTTPSRedirectHandler(),
         )
         if account.login and account.password:
@@ -756,8 +778,8 @@ class FicbookClient:
             },
         )
         try:
-            with opener.open(request, timeout=30) as response:
-                return response.read().decode("cp1251", "replace")
+            with opener.open(request, timeout=request_timeout()) as response:
+                return read_bounded(response).decode("cp1251", "replace")
         except (HTTPError, URLError) as exc:
             if _is_rate_limited(exc):
                 raise FicbookRateLimitError("Hogwartsnet временно ограничил запросы.", technical=repr(exc)) from exc
@@ -826,6 +848,7 @@ class FicbookClient:
                 return chapters
         total = self._metadata_value(soup.get_text(" ", strip=True), "Глав")
         if total.isdigit():
+            check_chapter_count(int(total))
             return [ChapterPreview(index=index, title=f"глава {index}") for index in range(1, int(total) + 1)]
         return [ChapterPreview(index=1, title="глава 1")]
 
@@ -856,7 +879,7 @@ class FicbookClient:
         return "Для 18+ фанфиков Hogwartsnet укажи HOGWARTSNET_LOGIN и HOGWARTSNET_PASSWORD в .env."
 
     def _build_config(self, url: str, account: FicbookAccount) -> Configuration:
-        config = Configuration(adapters.getConfigSectionsFor(url), "epub")
+        config = SafeSourceConfiguration(adapters.getConfigSectionsFor(url), "epub", site=_site_key(url))
         config.read([str(self.defaults_ini)])
         if urlsplit(url).hostname == "ficbook.net":
             config.set("ficbook.net", "add_to_extra_valid_entries", ",translator,translatorUrl")
@@ -1495,6 +1518,8 @@ class FicbookClient:
 
 
 def _friendly_download_error(url: str, error: Exception) -> FicbookError:
+    if isinstance(error, ResourceLimitError):
+        raise error
     site_name = _site_display_name(url)
     if _is_ao3_shields_error(url, error):
         return FicbookError(
@@ -1599,6 +1624,7 @@ def select_chapter_links(
     chapter_links: list[dict[str, Any]],
     chapter_numbers: set[int] | frozenset[int] | None,
 ) -> list[tuple[int, dict[str, Any]]]:
+    check_chapter_count(len(chapter_numbers) if chapter_numbers else len(chapter_links))
     indexed = list(enumerate(chapter_links, 1))
     if chapter_numbers is None:
         return indexed

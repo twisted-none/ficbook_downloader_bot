@@ -10,6 +10,7 @@ from src.exporters.epub import build_epub
 from src.exporters.fb2 import build_fb2
 from src.exporters.formats import build_docx, build_pdf, build_txt
 from src.sources.ficbook import FicbookAccount, FicbookClient
+from src.core.limits import ResponseLimitError
 from tests.test_ficbook_metadata import FakeStory
 
 
@@ -89,6 +90,12 @@ class AO3DownloadTests(unittest.TestCase):
         story = client._download_fanficfare_once(WORK_URL, FicbookAccount(), None, None)
         self.assertEqual(len(story.chapters), 2)
         self.assertEqual(adapter.getChapterTextNum.call_count, 2)
+
+    def test_large_whole_export_can_still_download_selected_chapter_safely(self) -> None:
+        client, adapter = self.setup_client(html=ResponseLimitError('export too large'))
+        story = client._download_fanficfare_once(WORK_URL, FicbookAccount(), None, {2})
+        self.assertEqual(len(story.chapters), 1)
+        adapter.getChapterTextNum.assert_called_once_with(WORK_URL + '/chapters/2', 1)
 
     def test_incomplete_or_non_export_html_is_not_returned_as_a_book(self) -> None:
         for html in (export_html(1), '<html>Shields are up!</html>'):

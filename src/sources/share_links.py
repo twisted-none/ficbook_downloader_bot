@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from ipaddress import ip_address
 import re
 import socket
 from urllib.parse import SplitResult, parse_qs, urljoin, urlsplit
@@ -11,6 +10,7 @@ from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import ThreadedResolver
 
 from src.sources.registry import SUPPORTED_HOST_MARKERS, is_supported_story_url
+from src.sources.safe_http import is_public_address
 
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_HOPS = 4
@@ -88,12 +88,7 @@ class PublicResolver(AbstractResolver):
         if not addresses:
             raise ShareLinkError()
         for address in addresses:
-            ip = ip_address(address["host"])
-            if (not ip.is_global or ip.is_multicast or ip.is_reserved or getattr(ip, "is_site_local", False)
-                    or getattr(ip, "sixtofour", None) or getattr(ip, "teredo", None)):
-                raise ShareLinkError()
-            mapped = getattr(ip, "ipv4_mapped", None)
-            if mapped is not None and not mapped.is_global:
+            if not is_public_address(address['host']):
                 raise ShareLinkError()
         # The connector receives these numeric addresses, not a second DNS lookup.
         return addresses
