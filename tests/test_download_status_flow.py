@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import EditMessageText
-from aiogram.types import ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
 
 from src.bot.app import _process_download
 from src.core.download_queue import DownloadQueuePool
@@ -32,7 +32,7 @@ class SentMessage:
         self.edits: list[str] = []
         self.deleted = False
 
-    async def edit_text(self, text: str) -> None:
+    async def edit_text(self, text: str, **kwargs) -> None:
         if isinstance(self.reply_markup, ReplyKeyboardMarkup):
             raise TelegramBadRequest(
                 method=EditMessageText(chat_id=1, message_id=1, text=text),
@@ -44,6 +44,8 @@ class SentMessage:
                 message="Bad Request: message to edit not found",
             )
         self.edits.append(text)
+        if 'reply_markup' in kwargs:
+            self.reply_markup = kwargs['reply_markup']
         self.events.append(f"edit:{text}")
 
     async def delete(self) -> None:
@@ -65,7 +67,7 @@ class IncomingMessage:
         status = SentMessage(
             text,
             self.events,
-            self.reject_final and bool(self.statuses),
+            self.reject_final,
             reply_markup=kwargs.get("reply_markup"),
         )
         self.statuses.append(status)
@@ -127,7 +129,7 @@ class NoopAction:
 
 
 class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
-    async def test_persistent_telegram_outage_does_not_start_or_repeat_download(self) -> None:
+    async def test_status_outage_does_not_abort_or_repeat_download(self) -> None:
         message = IncomingMessage()
         message.answer = AsyncMock(side_effect=TelegramNetworkError(
             method=EditMessageText(chat_id=1, message_id=1, text='status'), message='timeout',
@@ -136,9 +138,9 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
         client.download = unittest.mock.Mock(wraps=client.download)
         with patch('src.bot.app.TELEGRAM_SEND_RETRY_DELAY_SECONDS', 0):
             await self._run_download(message, client)
-        client.download.assert_not_called()
-        self.assertEqual(message.answer.await_count, 6)  # Three status attempts and three error-notice attempts.
-        self.assertEqual(message.documents, [])
+        client.download.assert_called_once()
+        self.assertLessEqual(message.answer.await_count, 2)
+        self.assertEqual(len(message.documents), 1)
 
     async def test_initial_status_timeout_is_retried_without_repeating_download(self) -> None:
         message = IncomingMessage()
@@ -183,15 +185,16 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
                 url, ("txt",), frozenset(),
             )
 
-    async def test_queue_is_replaced_once_then_active_message_is_only_edited(self) -> None:
+    async def test_queue_and_download_reuse_one_status(self) -> None:
         message = IncomingMessage()
         await self._run_download(message)
 
-        queued, active = message.statuses
+        queued, = message.statuses
+        active = queued
         self.assertIn("Место в очереди: 1.", queued.text)
         self.assertNotIn("Добавля", queued.text)
         self.assertTrue(queued.deleted)
-        self.assertIn("Ваш фанфик скачивается...", active.text)
+        self.assertTrue(any("Ваш фанфик скачивается..." in text for text in active.edits))
         self.assertTrue(any("20%" in text for text in active.edits))
         self.assertIn("Отправляем...", active.edits[-1])
         self.assertLess(message.events.index(f"edit:{active.edits[-1]}"), message.events.index("document"))
@@ -201,7 +204,7 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
 
         await self._run_download(message, FastClient(), update_interval=60.0)
 
-        active = message.statuses[1]
+        active = message.statuses[0]
         progress_edit = next((text for text in active.edits if "20%" in text), None)
         self.assertIsNotNone(progress_edit)
         final_edit = active.edits[-1]
@@ -217,9 +220,11 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
 
         await self._run_download(message)
 
-        queued, active = message.statuses
-        self.assertIsNone(queued.reply_markup)
-        self.assertIsNone(active.reply_markup)
+        queued, = message.statuses
+        active = queued
+        self.assertIsInstance(queued.reply_markup, InlineKeyboardMarkup)
+        self.assertIsInstance(active.reply_markup, InlineKeyboardMarkup)
+        self.assertEqual(queued.reply_markup, active.reply_markup)
         self.assertIsInstance(message.documents[-1]["reply_markup"], ReplyKeyboardMarkup)
 
     async def test_rejected_final_edit_does_not_discard_completed_file(self) -> None:
@@ -247,8 +252,8 @@ class DownloadStatusFlowTests(unittest.IsolatedAsyncioTestCase):
             await self._run_download(message, client, "https://ficbook.net/readfic/1")
 
         self.assertEqual(client.calls, 2)
-        self.assertEqual(len(message.statuses), 2)
-        active = message.statuses[1]
+        self.assertEqual(len(message.statuses), 1)
+        active = message.statuses[0]
         self.assertTrue(any("Ficbook сейчас не работает" in text for text in active.edits))
         self.assertTrue(any("Ваш фанфик скачивается" in text for text in active.edits))
         self.assertIn("document", message.events)

@@ -43,6 +43,7 @@ from src.sources.ranobelib import (
     RanobelibRateLimitError,
 )
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.core.covers import is_ficbook_placeholder
 from src.core.limits import (ResourceLimitError, bounded_operation, check_chapter_count,
                              bounded_sleep as sleep, check_deadline, read_bounded,
                              request_timeout, validate_preview, validate_story)
@@ -270,15 +271,15 @@ class FicbookClient:
     ) -> Story:
         normalized = normalize_url(url)
         site_name = _site_display_name(normalized)
+        attempts = 1 if _site_key(normalized) == 'archiveofourown.org' else self.retry_attempts
         last_rate_limit: FicbookRateLimitError | None = None
-        last_transient_error: FicbookError | None = None
         accounts = (
             (account,)
             if account is not None and _is_ficbook_url(normalized)
             else self._accounts_for_url(normalized, rotate=True)
         )
         for index, account in enumerate(accounts, 1):
-            for attempt in range(1, self.retry_attempts + 1):
+            for attempt in range(1, attempts + 1):
                 try:
                     _report(progress, f"Скачиваю описание фанфика: аккаунт {index}/{len(accounts)}")
                     result = self._download_once(normalized, account, progress, chapter_numbers)
@@ -286,7 +287,6 @@ class FicbookClient:
                     return result
                 except FicbookRateLimitError as exc:
                     last_rate_limit = exc
-                    last_transient_error = None
                     logger.warning(
                         "%s rate limit for account %s/%s, attempt %s/%s",
                         site_name,
@@ -295,7 +295,7 @@ class FicbookClient:
                         attempt,
                         self.retry_attempts,
                     )
-                    if attempt >= self.retry_attempts:
+                    if attempt >= attempts:
                         break
                     delay = self._retry_delay(attempt)
                     _report(
@@ -306,38 +306,23 @@ class FicbookClient:
                         ),
                     )
                     sleep(delay)
-                except FicbookError as exc:
-                    if not _is_ao3_transient_error(normalized, exc):
-                        raise
-                    last_transient_error = exc
-                    last_rate_limit = None
-                    if attempt >= self.retry_attempts:
-                        break
-                    delay = self._retry_delay(attempt)
-                    _report(
-                        progress,
-                        f"AO3 временно отклонил запрос. Повторю попытку через {delay:.0f} сек.",
-                    )
-                    sleep(delay)
         if last_rate_limit:
             raise FicbookRateLimitError(
                 f"{site_name} временно ограничил запросы. Попробуй повторить позже.",
                 technical=getattr(last_rate_limit, "technical", "") or str(last_rate_limit),
                 retry_after=self.retry_max_delay or None,
             ) from last_rate_limit
-        if last_transient_error:
-            raise last_transient_error
         raise FicbookError("Не удалось загрузить фанфик.")
 
     @bounded_operation
     def preview(self, url: str, progress: Callable[[str], None] | None = None) -> StoryPreview:
         normalized = normalize_url(url)
         site_name = _site_display_name(normalized)
+        attempts = 1 if _site_key(normalized) == 'archiveofourown.org' else self.retry_attempts
         last_rate_limit: FicbookRateLimitError | None = None
-        last_transient_error: FicbookError | None = None
         accounts = self._accounts_for_url(normalized)
         for index, account in enumerate(accounts, 1):
-            for attempt in range(1, self.retry_attempts + 1):
+            for attempt in range(1, attempts + 1):
                 try:
                     _report(
                         progress,
@@ -350,29 +335,16 @@ class FicbookClient:
                     return result
                 except FicbookRateLimitError as exc:
                     last_rate_limit = exc
-                    last_transient_error = None
-                    if attempt >= self.retry_attempts:
+                    if attempt >= attempts:
                         break
                     delay = self._retry_delay(attempt)
                     _report(progress, f"{site_name} временно ограничил запросы. Повторю через {delay:.0f} сек.")
-                    sleep(delay)
-                except FicbookError as exc:
-                    if not _is_ao3_transient_error(normalized, exc):
-                        raise
-                    last_transient_error = exc
-                    last_rate_limit = None
-                    if attempt >= self.retry_attempts:
-                        break
-                    delay = self._retry_delay(attempt)
-                    _report(progress, f"AO3 временно отклонил запрос. Повторю через {delay:.0f} сек.")
                     sleep(delay)
         if last_rate_limit:
             raise FicbookError(
                 f"{site_name} временно ограничил запросы. Попробуй повторить скачивание позже.",
                 technical=getattr(last_rate_limit, "technical", "") or str(last_rate_limit),
             ) from last_rate_limit
-        if last_transient_error:
-            raise last_transient_error
         raise FicbookError("Не удалось получить список глав.")
 
     def _download_once(
@@ -475,7 +447,7 @@ class FicbookClient:
             rating=story.getMetadata("rating") or "",
             page_count=self._safe_text(story.getMetadata("pages")),
             word_count=self._safe_text(story.getMetadata("numWords")).replace(",", " "),
-            cover=self._extract_cover_image(story),
+            cover=self._extract_cover_image(story, source_url=normalized),
             chapters=chapters,
         )
 
@@ -1490,7 +1462,7 @@ class FicbookClient:
             return f"{pages} страница, {words} слов"
         return pages or words
 
-    def _extract_cover_image(self, story: Any) -> CoverImage | None:
+    def _extract_cover_image(self, story: Any, *, source_url: str = '') -> CoverImage | None:
         for image in story.getImgUrls():
             newsrc = self._safe_text(image.get("newsrc"))
             if not newsrc.startswith("images/cover."):
@@ -1503,7 +1475,10 @@ class FicbookClient:
                 continue
             extension = self._safe_text(image.get("ext")) or Path(newsrc).suffix.lstrip(".") or "jpg"
             extension = re.sub(r"[^a-zA-Z0-9]", "", extension.lower()) or "jpg"
-            return CoverImage(data=data, mime=mime, extension=extension)
+            cover = CoverImage(data=data, mime=mime, extension=extension)
+            if _is_ficbook_url(source_url) and is_ficbook_placeholder(cover):
+                continue
+            return cover
         return None
 
     def _publication_notice(self, page_soup: BeautifulSoup) -> str:
@@ -1651,10 +1626,6 @@ def _is_ao3_shields_error(url: str, error: Exception) -> bool:
         return False
     text = repr(error).lower()
     return any(marker in text for marker in ("shields are up", "not a robot", "cloudflare", "challenge-platform"))
-
-
-def _is_ao3_transient_error(url: str, error: FicbookError) -> bool:
-    return not isinstance(error, FicbookChapterDownloadError) and _is_ao3_transient_failure(url, error)
 
 
 def _is_ao3_transient_failure(url: str, error: Exception) -> bool:

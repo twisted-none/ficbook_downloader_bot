@@ -2,6 +2,7 @@
 
 import socket
 import re
+from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -37,16 +38,24 @@ def _browser_failure(error: Exception) -> bool:
     ))
 
 
+class AO3HTTPResponse(DeadlineHTTPResponse):
+    max_response_seconds = 20
+
+
 class PublicAO3Connection(HTTPSConnection):
-    response_class = DeadlineHTTPResponse
+    response_class = AO3HTTPResponse
 
     def _new_conn(self):
         addresses = resolve_addresses(self.host, self.port or 443)
+        deadline = monotonic() + request_timeout(min(self.timeout or 8, 8))
         for family, kind, protocol, _, address in addresses:
             check_deadline()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
             sock = socket.socket(family, kind, protocol)
             try:
-                sock.settimeout(request_timeout(self.timeout if isinstance(self.timeout, (int, float)) else 60))
+                sock.settimeout(request_timeout(remaining))
                 for option in self.socket_options or ():
                     sock.setsockopt(*option)
                 if self.source_address:
@@ -127,7 +136,8 @@ class AO3Session(requests.Session):
         if kwargs.get('proxies'):
             raise UnsafeRequestError('Configured proxy cannot be used with pinned AO3 connections')
         timeout = kwargs.get('timeout', 60)
-        kwargs['timeout'] = request_timeout(timeout if isinstance(timeout, (int, float)) else 60)
+        connect, read = timeout if isinstance(timeout, tuple) else (timeout, timeout)
+        kwargs['timeout'] = (request_timeout(min(connect or 8, 8)), request_timeout(min(read or 20, 20)))
         return super().send(request, **kwargs)
 
     def get_redirect_target(self, response):
@@ -160,8 +170,8 @@ class AO3RequestsFetcher(RequestsFetcher):
         return AO3Session()
 
     def do_mounts(self, session):
-        super().do_mounts(session)
-        session.mount('https://', AO3Adapter(max_retries=self.retries))
+        # Recovery belongs to the per-page fallback, not urllib3's retry loop.
+        session.mount('https://', AO3Adapter(max_retries=0))
 
     def use_verify(self):
         return True
@@ -203,7 +213,9 @@ class AO3RequestsFetcher(RequestsFetcher):
                     or not re.match(r'^/(?:works|downloads)/', urlsplit(url).path)):
                 raise
             # This client receives no account, cookies, request headers or POST body.
-            browser = BrowserCollectionClient(lambda target: require_https_url(target, HOSTS), allowed_hosts=HOSTS)
+            browser = BrowserCollectionClient(
+                lambda target: require_https_url(target, HOSTS), allowed_hosts=HOSTS, timeout_seconds=25,
+            )
             try:
                 content, target = browser.fetch(url)
                 return FetcherResponse(content, target)

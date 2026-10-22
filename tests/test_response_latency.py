@@ -11,6 +11,20 @@ from tests.test_download_status_flow import IncomingMessage
 
 
 class ResponseLatencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unavailable_acknowledgement_does_not_drop_link(self):
+        message = IncomingMessage()
+        message.text = 'https://ficbook.net/readfic/12531381'
+        handler = AsyncMock()
+        with patch.object(app, '_acknowledge_link', AsyncMock(return_value=None)) as acknowledge:
+            data = {}
+            await app.RegisterUserMiddleware()(handler, message, data)
+            handler.assert_awaited_once()
+            with patch.object(app, '_get_user_download_settings', AsyncMock(return_value=UserDownloadSettings())), \
+                    patch.object(app, '_process_download', AsyncMock()) as download:
+                await app.on_link(message, object(), None, None, object(), object(), frozenset(), **data)
+            download.assert_awaited_once()
+            acknowledge.assert_awaited_once()
+
     async def test_heavy_download_does_not_occupy_fast_service_executor(self):
         asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
         entered, release = Event(), Event()

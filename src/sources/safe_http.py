@@ -87,7 +87,9 @@ class DeadlineHTTPResponse(HTTPResponse):
         super().__init__(sock, *args, **kwargs)
         self._response_socket = sock
         self._deadline_expired = False
-        self._deadline_timer = Timer(request_timeout(current_limits().max_response_seconds), self._expire)
+        timeout = min(current_limits().max_response_seconds,
+                      getattr(self, 'max_response_seconds', current_limits().max_response_seconds))
+        self._deadline_timer = Timer(request_timeout(timeout), self._expire)
         self._deadline_timer.daemon = True
         self._deadline_timer.start()
 

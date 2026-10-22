@@ -514,7 +514,7 @@ class FicbookMetadataTests(unittest.TestCase):
 
         self.assertEqual(config.get("overrides", "use_view_full_work"), "false")
 
-    def test_ao3_transient_525_is_retried(self) -> None:
+    def test_ao3_transport_failure_does_not_restart_the_whole_work(self) -> None:
         client = FicbookClient(retry_attempts=2, retry_base_delay=0)
         attempts = 0
 
@@ -527,10 +527,9 @@ class FicbookMetadataTests(unittest.TestCase):
 
         client._download_once = fake_download  # type: ignore[method-assign]
 
-        story = client.download("https://archiveofourown.org/works/10057010")
-
-        self.assertEqual(story.title, "Title")
-        self.assertEqual(attempts, 2)
+        with self.assertRaises(FicbookError):
+            client.download("https://archiveofourown.org/works/10057010")
+        self.assertEqual(attempts, 1)
 
     def test_ao3_525_retries_only_current_chapter(self) -> None:
         client = FicbookClient(retry_attempts=2, retry_base_delay=0)

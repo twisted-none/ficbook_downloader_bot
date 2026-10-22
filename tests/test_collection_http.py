@@ -57,6 +57,17 @@ class BrowserCollectionClientTests(unittest.TestCase):
         self.assertEqual(self.session.curl_options[CurlOpt.PROXY], b'')
         self.assertLessEqual(options['timeout'], ResourceLimits().max_response_seconds)
 
+    def test_optional_page_budget_is_shared_across_redirects(self):
+        client = BrowserCollectionClient(lambda target: _page_url(target, URL), timeout_seconds=25)
+        self.addCleanup(client.close)
+        self.session.get.side_effect = [
+            SimpleNamespace(status_code=302, headers={'Location': '?p=2'}, url=URL),
+            SimpleNamespace(status_code=200, headers={}, url=URL + '?p=2'),
+        ]
+        with patch('src.sources.collection_http.monotonic', side_effect=[0, 0, 20]):
+            client.fetch(URL)
+        self.assertEqual([call.kwargs['timeout'] for call in self.session.get.call_args_list], [25, 5])
+
     def test_ao3_allowlist_is_per_client_and_keeps_collection_hosts_unchanged(self):
         url = 'https://archiveofourown.org/works/14454174'
         client = BrowserCollectionClient(lambda target: None, allowed_hosts=frozenset({'archiveofourown.org'}))

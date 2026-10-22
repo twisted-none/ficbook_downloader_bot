@@ -25,8 +25,9 @@ ul, ol { margin: 0.8em 0 0.8em 1.5em; padding: 0; }
 li { margin: 0.25em 0; }
 .meta p, .note-title { text-indent: 0; }
 .note-title { font-weight: bold; margin-top: 1.2em; }
-.cover { margin: 0; text-align: center; }
-.cover img { max-width: 100%; max-height: 95vh; }
+body.cover-page { margin: 0; padding: 0; text-align: center; }
+.cover { margin: 0; padding: 0; }
+.cover img { display: block; width: auto; height: auto; max-width: 100%; max-height: 95vh; margin: 0 auto; }
 """.strip()
 
 
@@ -66,8 +67,12 @@ def _chapter_page(index: int, chapter: Chapter) -> dict[str, str]:
 
 def _cover_page(story: Story) -> dict[str, str]:
     href = escape(_cover_href(story), quote=True)
-    body = f'<section class="cover"><img src="{href}" alt="{escape(story.title, quote=True)}"/></section>'
-    return _page("cover.xhtml", "Обложка", body)
+    title = escape(story.title, quote=True)
+    content = f'''<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="ru">
+<head><title>{title}</title><link rel="stylesheet" href="styles/book.css" type="text/css"/></head>
+<body class="cover-page" epub:type="cover"><section class="cover"><img src="{href}" alt="{title}"/></section></body></html>'''
+    return {'href': 'cover.xhtml', 'title': 'Обложка', 'content': content}
 
 
 def _intro_body(story: Story) -> str:
@@ -195,7 +200,9 @@ def _container_xml() -> str:
 
 def _opf(story: Story, book_id: str, pages: list[dict[str, str]]) -> str:
     items = "".join(f'<item id="p{i}" href="{p["href"]}" media-type="application/xhtml+xml"/>' for i, p in enumerate(pages))
-    spine = '<itemref idref="nav"/>' + "".join(f'<itemref idref="p{i}"/>' for i, _ in enumerate(pages))
+    order = [f'p{i}' for i, _ in enumerate(pages)]
+    order.insert(1 if story.cover else 0, 'nav')
+    spine = ''.join(f'<itemref idref="{item}"/>' for item in order)
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     subjects = "".join(
         f"<dc:subject>{escape(item)}</dc:subject>"
@@ -205,12 +212,14 @@ def _opf(story: Story, book_id: str, pages: list[dict[str, str]]) -> str:
     dates = _date_xml("created", story.published) + _date_xml("modified", story.updated)
     cover_item = ""
     cover_meta = ""
+    guide = ""
     if story.cover:
         cover_item = (
             f'<item id="cover-image" href="{escape(_cover_href(story), quote=True)}" '
             f'media-type="{escape(story.cover.mime, quote=True)}" properties="cover-image"/>'
         )
         cover_meta = '<meta name="cover" content="cover-image"/>'
+        guide = '<guide><reference type="cover" title="Обложка" href="cover.xhtml"/></guide>'
     pages_meta = f'<meta name="ficbook:pages" content="{escape(story.page_count, quote=True)}"/>' if story.page_count else ""
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <package version="3.0" unique-identifier="bookid" xmlns="http://www.idpf.org/2007/opf">
@@ -222,7 +231,7 @@ def _opf(story: Story, book_id: str, pages: list[dict[str, str]]) -> str:
 <manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
 <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
 <item id="css" href="styles/book.css" media-type="text/css"/>{cover_item}{items}</manifest>
-<spine toc="ncx">{spine}</spine></package>"""
+<spine toc="ncx">{spine}</spine>{guide}</package>"""
 
 
 def _ncx(story: Story, book_id: str, pages: list[dict[str, str]]) -> str:
@@ -239,9 +248,14 @@ def _ncx(story: Story, book_id: str, pages: list[dict[str, str]]) -> str:
 
 def _nav(story: Story, pages: list[dict[str, str]]) -> str:
     links = "".join(f'<li><a href="{p["href"]}">{escape(p["title"])}</a></li>' for p in pages)
+    landmarks = (
+        '<nav epub:type="landmarks" hidden="hidden"><h2>Разделы</h2><ol>'
+        '<li><a epub:type="cover" href="cover.xhtml">Обложка</a></li></ol></nav>'
+        if story.cover else ''
+    )
     return f"""<?xml version="1.0" encoding="utf-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml" lang="ru"><head><title>Оглавление</title></head>
-<body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>{escape(story.title)}</h1><ol>{links}</ol></nav></body></html>"""
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="ru"><head><title>Оглавление</title></head>
+<body><nav epub:type="toc"><h1>{escape(story.title)}</h1><ol>{links}</ol></nav>{landmarks}</body></html>"""
 
 
 def _normalize_language(language: str) -> str:

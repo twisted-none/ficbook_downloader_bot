@@ -10,6 +10,7 @@ from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.image.exceptions import UnrecognizedImageError
+from docx.image.image import Image as DocxImage
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -116,7 +117,7 @@ def build_pdf(story: Story) -> bytes:
         bottomMargin=2 * cm,
     )
     flow: list[Any] = []
-    _add_pdf_cover(flow, story)
+    has_cover = _add_pdf_cover(flow, story)
     if not story.annotation_complete:
         flow.extend(
             [
@@ -148,7 +149,11 @@ def build_pdf(story: Story) -> bytes:
         flow.append(Paragraph(f'<a name="{chapter_id(index)}"/>{title}', styles["Heading1"]))
         for markup in _pdf_html_blocks(chapter.html):
             flow.append(Paragraph(markup, styles['Body']))
-    document.build(flow, onFirstPage=_draw_pdf_page_number, onLaterPages=_draw_pdf_page_number)
+    def first_page(canvas, doc):
+        if not has_cover:
+            _draw_pdf_page_number(canvas, doc)
+
+    document.build(flow, onFirstPage=first_page, onLaterPages=_draw_pdf_page_number)
     return buffer.getvalue()
 
 
@@ -178,8 +183,19 @@ def _add_docx_cover(document: Document, story: Story) -> None:
     if not story.cover:
         return
     try:
-        document.add_picture(BytesIO(story.cover.data), width=Inches(5.5))
+        image = DocxImage.from_blob(story.cover.data)
+        section = document.sections[0]
+        width = section.page_width - section.left_margin - section.right_margin
+        # Reserve room for the inline-image baseline and the page-break paragraph.
+        height = section.page_height - section.top_margin - section.bottom_margin - Pt(36)
+        scale = min(width / image.width, height / image.height)
+        document.add_picture(BytesIO(story.cover.data), width=int(image.width * scale), height=int(image.height * scale))
+        paragraph = document.paragraphs[-1]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(0)
         document.add_page_break()
+        section.different_first_page_header_footer = True
     except (UnrecognizedImageError, ValueError):
         return
 
@@ -281,9 +297,9 @@ def _pdf_styles(regular_font: str, bold_font: str) -> dict[str, ParagraphStyle]:
     }
 
 
-def _add_pdf_cover(flow: list[Any], story: Story) -> None:
+def _add_pdf_cover(flow: list[Any], story: Story) -> bool:
     if not story.cover:
-        return
+        return False
     try:
         image = Image(BytesIO(story.cover.data))
         max_width = 12 * cm
@@ -293,8 +309,9 @@ def _add_pdf_cover(flow: list[Any], story: Story) -> None:
         image.drawHeight = image.imageHeight * scale
         image.hAlign = "CENTER"
         flow.extend([image, PageBreak()])
+        return True
     except Exception:
-        return
+        return False
 
 
 def _add_pdf_blocks(flow: list[Any], blocks: list[str], styles: dict[str, ParagraphStyle]) -> None:

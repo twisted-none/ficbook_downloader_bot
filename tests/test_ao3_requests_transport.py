@@ -21,6 +21,21 @@ URL = 'https://archiveofourown.org/works/82620966/navigate?view_adult=true'
 
 
 class AO3RequestsTransportTests(unittest.TestCase):
+    def test_ao3_transport_does_not_retry_underneath_the_fallback(self):
+        fetcher = FicbookClient()._build_config(URL, FicbookAccount()).get_fetcher()
+        session = fetcher.make_sesssion()
+        self.addCleanup(session.close)
+        fetcher.do_mounts(session)
+        self.assertEqual(session.get_adapter(URL).max_retries.total, 0)
+
+    def test_ao3_session_caps_connect_and_read_timeouts(self):
+        from src.sources.ao3_http import AO3Session
+        session = AO3Session()
+        self.addCleanup(session.close)
+        with patch('requests.sessions.Session.send') as send:
+            session.send(requests.Request('GET', URL).prepare(), timeout=60)
+        self.assertEqual(send.call_args.kwargs['timeout'], (8, 20))
+
     def test_session_only_advertises_bounded_supported_decoders(self):
         from src.sources.ao3_http import AO3Session
         session = AO3Session()

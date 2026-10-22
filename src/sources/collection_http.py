@@ -2,6 +2,7 @@ from collections.abc import Callable
 from email.message import Message
 from io import BytesIO
 import socket
+from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import getproxies, proxy_bypass
@@ -22,18 +23,24 @@ _HOSTS = frozenset({'ficbook.net', 'www.ficbook.net'})
 class BrowserCollectionClient:
     """One anonymous, memory-only browser session for allowlisted public pages."""
 
-    def __init__(self, validate_url: Callable[[str], object], *, allowed_hosts: frozenset[str] = _HOSTS) -> None:
+    def __init__(self, validate_url: Callable[[str], object], *, allowed_hosts: frozenset[str] = _HOSTS,
+                 timeout_seconds: float | None = None) -> None:
         self._validate_url = validate_url
         self._allowed_hosts = allowed_hosts
         self._session: Session | None = None
         self._closed = False
+        self._timeout_seconds = timeout_seconds
 
     def fetch(self, url: str) -> tuple[bytes, str]:
         if self._closed:
             raise URLError('Collection session is closed')
         visited: set[str] = set()
+        deadline = monotonic() + self._timeout_seconds if self._timeout_seconds is not None else None
         for hop in range(6):
             check_deadline()
+            remaining = deadline - monotonic() if deadline is not None else current_limits().max_response_seconds
+            if remaining <= 0:
+                raise URLError('Public page request timed out')
             parts = require_https_url(url, self._allowed_hosts)
             self._validate_url(url)
             if url in visited:
@@ -76,7 +83,7 @@ class BrowserCollectionClient:
             try:
                 response = self._session.get(
                     url, verify=True, allow_redirects=False,
-                    timeout=request_timeout(current_limits().max_response_seconds),
+                    timeout=request_timeout(min(current_limits().max_response_seconds, remaining)),
                     accept_encoding='identity', headers={'Accept-Language': 'ru-RU,ru;q=0.9'},
                     content_callback=receive,
                 )
