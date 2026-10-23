@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 SUPPORTED_HOST_MARKERS = (
     "ficbook.net",
     "ficbook.com",
+    "fikbooks.ru",
     "archiveofourown.org",
     "wattpad.com",
     "hogwartsnet.ru",
@@ -15,6 +16,21 @@ SUPPORTED_HOST_MARKERS = (
 
 FICBOOK_ID_PATTERN = r'(?:[0-9]+|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})'
 _COLLECTION_PATH = re.compile(rf'/collections/({FICBOOK_ID_PATTERN})(?:/(?:page|p)/[0-9]{{1,9}})?/?', re.I)
+FIKBOOKS_HOSTS = frozenset({'fikbooks.ru', 'www.fikbooks.ru'})
+FIKBOOKS_PATH = re.compile(r'/readfic/([1-9][0-9]{0,17})(?:/([1-9][0-9]{0,17}))?/?')
+
+
+def normalize_fikbooks_url(url: str) -> str:
+    if (len(url) > 4096 or '\\' in url
+            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)):
+        raise ValueError('Invalid Fikbooks URL')
+    parts = urlsplit(url)
+    match = FIKBOOKS_PATH.fullmatch(parts.path)
+    if (parts.scheme not in {'http', 'https'} or parts.hostname not in FIKBOOKS_HOSTS
+            or parts.username is not None or parts.password is not None or parts.query
+            or parts.port not in {None, 443 if parts.scheme == 'https' else 80} or match is None):
+        raise ValueError('Invalid Fikbooks URL')
+    return 'https://fikbooks.ru/readfic/' + match.group(1)
 
 
 def normalize_collection_url(url: str) -> str:
@@ -49,6 +65,8 @@ def extract_url(text: str) -> str | None:
 
 def normalize_url(url: str) -> str:
     parts = urlsplit(url.strip())
+    if parts.hostname in FIKBOOKS_HOSTS:
+        return normalize_fikbooks_url(url)
     scheme = parts.scheme or "https"
     host = parts.netloc.lower()
     if "ficbook." in host:
@@ -94,6 +112,12 @@ def is_supported_story_url(url: str) -> bool:
     value = url if re.match(r"^https?://", url, re.I) else f"https://{url}"
     parts = urlsplit(value)
     host = parts.netloc.lower().replace("www.", "")
+    if parts.hostname in FIKBOOKS_HOSTS:
+        try:
+            normalize_fikbooks_url(value)
+            return True
+        except ValueError:
+            return False
     path = parts.path.lower()
     if host in {"ficbook.net", "ficbook.com"}:
         return "/readfic/" in path
@@ -147,6 +171,7 @@ def site_display_name(url: str) -> str:
     site = site_key(url)
     labels = {
         "ficbook.net": "Ficbook",
+        "fikbooks.ru": "Fikbooks",
         "archiveofourown.org": "AO3",
         "www.wattpad.com": "Wattpad",
         "hogwartsnet.ru": "Hogwartsnet",

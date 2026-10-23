@@ -844,7 +844,7 @@ async def on_link(
     url = extract_download_url(message.text or "")
     if not url:
         await message.answer(
-            "Нужна ссылка на Ficbook, AO3, Wattpad, Hogwartsnet, RanobeLIB или Litnet.",
+            "Нужна ссылка на Ficbook, Fikbooks, AO3, Wattpad, Hogwartsnet, RanobeLIB или Litnet.",
             reply_markup=_main_keyboard_for_message(message, admin_chat_id),
         )
         return
