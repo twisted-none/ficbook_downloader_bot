@@ -15,6 +15,7 @@ from urllib.request import Request
 from bs4 import BeautifulSoup, Tag
 
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.core.progress import report_title
 from src.core.limits import bounded_operation, check_chapter_count, read_bounded
 from src.sources.safe_http import UnsafeRequestError, build_safe_opener, require_https_url
 
@@ -90,6 +91,7 @@ class LitnetClient:
                 reader = self._soup(url)
                 book = self._soup(url.replace("/reader/", "/book/"))
                 chapters = self._chapters(reader)
+            report_title(progress, self._metadata(reader, 'og:title') or self._heading(reader, 'h1'))
             selected = self._select_chapters(chapters, chapter_numbers)
             check_chapter_count(len(selected))
             bodies: list[Chapter] = []

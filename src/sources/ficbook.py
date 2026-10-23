@@ -44,6 +44,7 @@ from src.sources.ranobelib import (
     RanobelibRateLimitError,
 )
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.core.progress import report_title
 from src.core.covers import is_ficbook_placeholder
 from src.core.limits import (ResourceLimitError, bounded_operation, check_chapter_count,
                              bounded_sleep as sleep, check_deadline, read_bounded,
@@ -404,6 +405,7 @@ class FicbookClient:
             config = self._build_config(normalized, account)
             adapter = adapters.getAdapter(config, normalized)
             story = self._get_story_metadata(adapter, normalized)
+            report_title(progress, story.getMetadata('title'))
             _report(progress, "Скачиваю страницу фанфика")
             self._pause_between_requests()
             page_soup = adapter.make_soup(adapter.get_request(normalized))
@@ -568,6 +570,7 @@ class FicbookClient:
         try:
             adapter = self._adapter_for(normalized, account)
             story = self._get_story_metadata(adapter, normalized)
+            report_title(progress, story.getMetadata('title'))
             chapter_links = adapter.get_chapters()
             selected_chapters = select_chapter_links(chapter_links, chapter_numbers)
             if _site_key(normalized) == 'archiveofourown.org':
@@ -719,6 +722,7 @@ class FicbookClient:
                 user_message=self._adult_user_message(normalized),
             )
         metadata = self._hogwartsnet_metadata(soup, normalized)
+        report_title(progress, metadata['title'])
         previews = self._hogwartsnet_chapter_previews(soup, normalized)
         selected_chapters = select_chapter_links(
             [{"title": chapter.title, "url": self._hogwartsnet_chapter_url(normalized, chapter.index)} for chapter in previews],

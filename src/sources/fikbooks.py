@@ -15,6 +15,7 @@ from src.core.limits import (ResourceLimitError, bounded_operation, bounded_slee
                              check_chapter_count, check_deadline, current_limits,
                              image_is_safe, read_bounded, validate_story)
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.core.progress import report_title
 from src.sources.registry import FIKBOOKS_HOSTS, FIKBOOKS_PATH, normalize_fikbooks_url
 from src.sources.safe_http import UnsafeRequestError, build_safe_opener, require_https_url
 
@@ -58,6 +59,7 @@ class FikbooksClient:
         root = normalize_fikbooks_url(url)
         soup = self._soup(root)
         title, author, translator = self._credits(soup)
+        report_title(progress, title)
         chapters = self._chapters(soup, root)
         if chapter_numbers is not None and (not chapter_numbers or any(
                 number < 1 or number > len(chapters) for number in chapter_numbers)):

@@ -46,6 +46,7 @@ from src.bot.ui import (
     developer_error_text as _developer_error_text,
     download_error_text as _download_error_text,
     download_progress_percent as _download_progress_percent,
+    download_identity as _download_identity,
     format_list as _format_list,
     main_keyboard as _main_keyboard,
     main_keyboard_for_message as _main_keyboard_for_message,
@@ -100,6 +101,7 @@ from src.sources.registry import is_ficbook_collection_url
 from src.monitoring.metrics import run_metrics_server
 from src.storage.retention import run_history_retention
 from src.core.models import Story, StoryPreview
+from src.core.progress import ProgressReporter
 from src.core.covers import cover_for_story
 from src.storage.users import UserStore, UserStoreError
 
@@ -329,12 +331,13 @@ class ProgressMessage:
 
 
 class DownloadProgressState:
-    def __init__(self) -> None:
+    def __init__(self, *, source_url: str = '') -> None:
         self._lock = Lock()
         self._attempt_started_at = monotonic()
         self._actual_percent = 0
         self._shown_percent = 0
         self._stage = 'Получаю информацию о фанфике'
+        self._identity = _download_identity(url=source_url)
 
     def start_attempt(self) -> None:
         with self._lock:
@@ -348,10 +351,20 @@ class DownloadProgressState:
         with self._lock:
             self._stage = text[:400]
 
+    def set_title(self, title: str) -> None:
+        if title.strip():
+            with self._lock:
+                self._identity = _download_identity(title=title)
+
+    def with_identity(self, text: str) -> str:
+        with self._lock:
+            identity = self._identity
+        return identity + '\n' + text if identity else text
+
     def status(self, formats: tuple[str, ...]) -> str:
         with self._lock:
             stage = self._stage
-        return _active_download_status(formats, self.percent()) + '\n' + escape(stage)
+        return self.with_identity(_active_download_status(formats, self.percent()) + '\n' + escape(stage))
 
     def set_actual(self, percent: int) -> None:
         with self._lock:
@@ -826,6 +839,7 @@ async def on_chapter_selection_text(
         premium_queue_user_ids,
         cover_enabled=pending.cover_enabled,
         chapter_numbers=chapter_numbers,
+        known_title=pending.preview.title,
     )
 
 
@@ -1226,13 +1240,14 @@ async def _process_download(
     formats: tuple[str, ...], premium_queue_user_ids: frozenset[int], *, cover_enabled: bool = True,
     chapter_numbers: set[int] | None = None, raise_forbidden: bool = False,
     initial_status: Message | None = None,
+    known_title: str = '',
 ) -> bool | None:
     return await _run_tracked(
         message, url, formats, cover_enabled, chapter_numbers, 'work', initial_status,
         lambda: _process_download_impl(
             message, ficbook_client, admin_chat_id, alert_bot, analytics_store, download_queues,
             url, formats, premium_queue_user_ids, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers,
-            raise_forbidden=raise_forbidden, initial_status=initial_status,
+            raise_forbidden=raise_forbidden, initial_status=initial_status, known_title=known_title,
         ),
     )
 
@@ -1252,12 +1267,14 @@ async def _process_download_impl(
     chapter_numbers: set[int] | None = None,
     raise_forbidden: bool = False,
     initial_status: Message | None = None,
+    known_title: str = '',
 ) -> bool:
     priority = _is_priority_download_user(message, premium_queue_user_ids)
     assignment = download_queues.assign(url)
     status: Message | None = initial_status
     progress = ProgressMessage(status, min_interval=5.0)
-    progress_state = DownloadProgressState()
+    progress_state = DownloadProgressState(source_url=url)
+    progress_state.set_title(known_title)
     download_id = None
     delivered = False
     try:
@@ -1280,6 +1297,7 @@ async def _process_download_impl(
                         and download_queues.is_site_unavailable("ficbook.net")
                     ),
                 )
+                text = progress_state.with_identity(text)
                 if status is None or progress is None:
                     status = await _optional_status(message, text)
                     progress = ProgressMessage(status, min_interval=5.0, initial_text=text)
@@ -1311,6 +1329,12 @@ async def _process_download_impl(
                             progress_state.status(formats)
                         )
 
+                    def observe_title(title: str) -> None:
+                        progress_state.set_title(title)
+                        active_progress.from_thread(progress_state.status(formats), force=True)
+
+                    reporter = ProgressReporter(observe_progress, observe_title)
+
                     updater = asyncio.create_task(
                         _active_progress_updater(active_progress, progress_state, formats)
                     )
@@ -1319,7 +1343,7 @@ async def _process_download_impl(
                             story = await run_worker(
                                 ficbook_client.download,
                                 url,
-                                observe_progress,
+                                reporter,
                                 chapter_numbers=chapter_numbers,
                                 account=current.account,
                             )
@@ -1340,10 +1364,12 @@ async def _process_download_impl(
                         download_queues,
                         active_progress,
                         formats,
+                        state=progress_state,
                     )
                     progress_state.start_attempt()
                 if not cover_enabled:
                     story.cover = None
+                progress_state.set_title(story.title)
                 progress_state.set_stage('Создаю файлы')
                 await active_progress.set(progress_state.status(formats), force=True)
                 updater = asyncio.create_task(_active_progress_updater(active_progress, progress_state, formats))
@@ -1361,7 +1387,7 @@ async def _process_download_impl(
                 file_stem = _safe_name(story.title)
                 if progress is None:
                     raise RuntimeError('Download status message is missing')
-                if not await progress.set_required(_sending_status(formats), wait_for_throttle=False):
+                if not await progress.set_required(progress_state.with_identity(_sending_status(formats)), wait_for_throttle=False):
                     logger.debug('Sending completed download without a final status edit')
                 await progress.close()
                 for index, (fmt, payload) in enumerate(files, 1):
@@ -1507,7 +1533,9 @@ async def _answer_status_with_retry(message: Message, text: str, **kwargs: Any) 
 
 
 async def _acknowledge_link(message: Message) -> Message | None:
-    return await _optional_status(message, 'Ссылка получена. Подготавливаю загрузку...')
+    identity = _download_identity(url=extract_download_url(message.text or '') or '')
+    text = 'Ссылка получена. Подготавливаю загрузку...'
+    return await _optional_status(message, text + '\n' + identity if identity else text)
 
 
 async def _optional_status(message: Message, text: str) -> Message | None:
@@ -1565,9 +1593,11 @@ async def _wait_for_ficbook_recovery(
     queues: DownloadQueuePool,
     progress: ProgressMessage,
     formats: tuple[str, ...],
+    *, state: DownloadProgressState | None = None,
 ) -> None:
+    waiting_text = _queue_status(formats, 1, 0, ficbook_unavailable=True)
     await progress.set(
-        _queue_status(formats, 1, 0, ficbook_unavailable=True),
+        state.with_identity(waiting_text) if state is not None else waiting_text,
         force=True,
     )
     while True:
@@ -1589,7 +1619,8 @@ async def _wait_for_ficbook_recovery(
                 "Попробуй повторить скачивание позже.",
                 technical="Ficbook recovery probe returned an unknown status",
             )
-        await progress.set(_active_download_status(formats, 0), force=True)
+        active_text = _active_download_status(formats, 0)
+        await progress.set(state.with_identity(active_text) if state is not None else active_text, force=True)
         return
 
 

@@ -21,6 +21,7 @@ from urllib.request import Request
 from bs4 import BeautifulSoup
 
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
+from src.core.progress import report_title
 from src.core.limits import bounded_operation, bounded_sleep as sleep, check_chapter_count, read_bounded
 from src.sources.safe_http import SafeRedirectHandler, UnsafeRequestError, build_safe_opener, require_https_url
 
@@ -146,6 +147,7 @@ class RanobelibClient:
     ) -> Story:
         slug = self._slug(url)
         info = self._info(slug)
+        report_title(progress, self._title(info))
         selected = self._select_chapters(self._chapters(slug), chapter_numbers)
         check_chapter_count(len(selected))
         chapters: list[Chapter] = []

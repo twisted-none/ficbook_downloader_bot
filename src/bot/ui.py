@@ -251,6 +251,15 @@ def queue_status(
     )
 
 
+def download_identity(*, title: str = '', url: str = '') -> str:
+    value = ' '.join((title or url).split())
+    if not value:
+        return ''
+    if len(value) > 240:
+        value = value[:237] + '...'
+    return f'Название: <b>{escape(value)}</b>' if title else f'Фанфик: {escape(value)}'
+
+
 def active_download_status(formats: tuple[str, ...], percent: int) -> str:
     return progress_text(
         f"Форматы: {format_list(formats)}.\nВаш фанфик скачивается...",

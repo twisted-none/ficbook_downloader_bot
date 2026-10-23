@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from html import escape, unescape
+import logging
+from struct import error as StructError
+import warnings
 from src.core.limits import LimitedBytesIO as BytesIO
+from src.core.limits import ResourceLimitError, check_deadline, image_is_safe
 from typing import Any
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -10,11 +14,13 @@ from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.image.exceptions import UnrecognizedImageError
+from docx.image.exceptions import InvalidImageStreamError, UnexpectedEndOfFileError
 from docx.image.image import Image as DocxImage
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.shared import Inches, Pt, RGBColor
+from PIL import Image as PillowImage, ImageOps, UnidentifiedImageError
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -28,6 +34,7 @@ from src.core.models import Story
 from src.exporters.navigation import chapter_id, prepare_chapters
 
 ALLOWED_FORMATS: tuple[str, ...] = ("fb2", "epub", "txt", "docx", "pdf")
+logger = logging.getLogger(__name__)
 DEFAULT_FORMATS: tuple[str, ...] = ALLOWED_FORMATS
 DOCX_PROPERTY_LIMIT = 255
 PDF_FONT_PATHS = (
@@ -179,24 +186,67 @@ def _configure_docx(document: Document, story: Story) -> None:
     _ensure_paragraph_style(document, "Ficbook Note Heading", bold=True, space_before=6)
 
 
+def _docx_cover_bytes(data: bytes) -> bytes | None:
+    check_deadline()
+    if not image_is_safe(data):
+        logger.warning('DOCX cover omitted: invalid image or pixel limit exceeded')
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', PillowImage.DecompressionBombWarning)
+            with PillowImage.open(BytesIO(data)) as image:
+                source_format = image.format
+                image.load()
+                try:
+                    oriented = ImageOps.exif_transpose(image)
+                except (OSError, ValueError, TypeError, SyntaxError, StructError):
+                    # Invalid EXIF must not discard otherwise readable pixels.
+                    oriented = image.copy()
+            with oriented:
+                alpha = 'A' in oriented.getbands() or 'transparency' in oriented.info
+                with oriented.convert('RGBA' if alpha else 'RGB') as clean:
+                    clean.info.clear()
+                    output = BytesIO()
+                    if source_format == 'JPEG' and not alpha:
+                        clean.save(output, format='JPEG', quality=95)
+                    else:
+                        clean.save(output, format='PNG')
+                    result = output.getvalue()
+    except ResourceLimitError:
+        check_deadline()
+        logger.warning('DOCX cover omitted: normalized image exceeds byte limit')
+        return None
+    except (UnidentifiedImageError, PillowImage.DecompressionBombError,
+            PillowImage.DecompressionBombWarning, OSError, ValueError, TypeError, SyntaxError, StructError):
+        logger.warning('DOCX cover omitted: image decoding failed')
+        return None
+    check_deadline()
+    return result
+
+
 def _add_docx_cover(document: Document, story: Story) -> None:
     if not story.cover:
         return
+    data = _docx_cover_bytes(story.cover.data)
+    if data is None:
+        return
     try:
-        image = DocxImage.from_blob(story.cover.data)
+        image = DocxImage.from_blob(data)
         section = document.sections[0]
         width = section.page_width - section.left_margin - section.right_margin
         # Reserve room for the inline-image baseline and the page-break paragraph.
         height = section.page_height - section.top_margin - section.bottom_margin - Pt(36)
         scale = min(width / image.width, height / image.height)
-        document.add_picture(BytesIO(story.cover.data), width=int(image.width * scale), height=int(image.height * scale))
+        document.add_picture(BytesIO(data), width=int(image.width * scale), height=int(image.height * scale))
         paragraph = document.paragraphs[-1]
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         paragraph.paragraph_format.space_before = Pt(0)
         paragraph.paragraph_format.space_after = Pt(0)
         document.add_page_break()
         section.different_first_page_header_footer = True
-    except (UnrecognizedImageError, ValueError):
+    except (UnrecognizedImageError, InvalidImageStreamError, UnexpectedEndOfFileError,
+            OSError, ValueError, StructError):
+        logger.warning('DOCX cover omitted: normalized image could not be embedded')
         return
 
 
