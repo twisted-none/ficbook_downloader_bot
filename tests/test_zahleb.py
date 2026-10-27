@@ -204,6 +204,33 @@ class ZahlebTests(unittest.TestCase):
                     self.assertRaises(ZahlebError):
                 client.preview(ROOT)
 
+    def test_story_may_redirect_to_first_chapter_of_the_same_story(self):
+        client = ZahlebClient()
+        state = {'props': {'pageProps': {'story': BOOK, 'episode': episode()}}}
+        response = BytesIO(('<script id="__NEXT_DATA__">' + json.dumps(state) + '</script>').encode())
+        response.geturl = lambda: ROOT + '/' + FIRST
+        with patch.object(client._opener, 'open', return_value=response):
+            self.assertEqual(client.preview(ROOT).title, BOOK['title'])
+
+    def test_root_redirect_must_be_first_chapter_and_match_embedded_identity(self):
+        for target, data in ((SECOND, {'story': BOOK, 'episode': episode(SECOND, 2)}),
+                             (FIRST, {'story': BOOK, 'episode': episode(SECOND, 2)}),
+                             (FIRST, {'story': dict(BOOK, objectId='OtherBook1'), 'episode': episode()})):
+            response = BytesIO(('<script id="__NEXT_DATA__">' + json.dumps({'props': {'pageProps': data}})
+                                + '</script>').encode())
+            response.geturl = lambda: ROOT + '/' + target
+            client = ZahlebClient()
+            with self.subTest(target=target, data=data), patch.object(client._opener, 'open', return_value=response), \
+                    self.assertRaises(ZahlebError):
+                client.preview(ROOT)
+
+    def test_requested_chapter_may_not_redirect_to_another_chapter(self):
+        client = ZahlebClient()
+        response = BytesIO(b'not needed')
+        response.geturl = lambda: ROOT + '/' + FIRST
+        with patch.object(client._opener, 'open', return_value=response), self.assertRaises(ZahlebError):
+            client._page(ROOT + '/' + SECOND)
+
     def test_broken_or_ambiguous_embedded_state_is_not_accepted(self):
         for content in ('<h1>Browser check</h1>', '<script id="__NEXT_DATA__">{invalid}</script>',
                         '<script id="__NEXT_DATA__">{}</script>' * 2,
@@ -220,6 +247,18 @@ class ZahlebTests(unittest.TestCase):
         client.episodes[FIRST]['content'] = [{'text': '\U0001f642'}]
         client.episodes[FIRST]['contentLength'] = 2
         self.assertEqual(len(client.download(ROOT, chapter_numbers={1}).chapters), 1)
+
+    def test_json_encoded_text_length_is_accepted_without_length_tolerance(self):
+        client = FakeClient()
+        content = [{'children': [{'text': 'Quoted "text" \U0001f642\n'}]}]
+        client.episodes[FIRST]['content'] = content
+        declared = sum(len(json.dumps(text, ensure_ascii=False).encode('utf-16-le')) // 2
+                       for text in ('', content[0]['children'][0]['text']))
+        client.episodes[FIRST]['contentLength'] = declared
+        self.assertEqual(len(client.download(ROOT, chapter_numbers={1}).chapters), 1)
+        client.episodes[FIRST]['contentLength'] = declared - 1
+        with self.assertRaises(ZahlebError):
+            client.download(ROOT, chapter_numbers={1})
 
     def test_malformed_rich_text_fails_as_source_error(self):
         for content in ([{'type': [], 'text': 'Text'}], [{'text': 42}], [{'children': {}}],

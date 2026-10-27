@@ -21,6 +21,24 @@ def callback(*, user_id=9, chat_id=9, message_id=12, token='test_token'):
 
 
 class AlertRedeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_handled_failure_and_success_are_logged_with_original_url(self):
+        async def failed(message, request, delivery):
+            delivery.failure = 'Взахлёб перенаправил запрос на другую страницу.'
+            return False
+        self.download.side_effect = failed
+        with self.assertLogs('src.bot.alert_redelivery', level='INFO') as output:
+            await self.call()
+        text = '\n'.join(output.output)
+        self.assertIn('alert_retry_started', text)
+        self.assertIn('alert_retry_failed', text)
+        self.assertIn(self.retry.url, text)
+        self.assertIn('Взахлёб перенаправил', text)
+        self.assertNotIn('test_token', text)
+        self.claim.request = replace(self.retry, delivered=True)
+        with self.assertLogs('src.bot.alert_redelivery', level='INFO') as output:
+            await self.call()
+        self.assertIn('alert_retry_succeeded', '\n'.join(output.output))
+
     async def test_retry_preserves_telegram_identity(self):
         self.claim.request = replace(self.retry, username='reader', full_name='Имя Читателя')
         await self.call()

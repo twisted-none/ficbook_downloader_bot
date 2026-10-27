@@ -4,6 +4,7 @@ from collections.abc import Callable
 from html import escape
 from io import BytesIO
 import json
+import logging
 import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -19,6 +20,9 @@ from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPre
 from src.core.progress import report_title
 from src.sources.registry import ZAHLEB_HOSTS, ZAHLEB_PATH, normalize_zahleb_url
 from src.sources.safe_http import build_safe_opener, require_https_url
+from src.core.retry_logging import public_url
+
+logger = logging.getLogger(__name__)
 
 _ID = re.compile(r'[A-Za-z0-9]{10}')
 _COVER_HOSTS = ZAHLEB_HOSTS | {'files.zahleb.me', 'images.zahleb.me'}
@@ -70,6 +74,7 @@ class _RichText:
     def __init__(self):
         self.nodes = 0
         self.text_units = 0
+        self.json_text_units = 0
         self.text_bytes = 0
         self.has_text = False
 
@@ -85,6 +90,7 @@ class _RichText:
             raise ZahlebError('Взахлёб вернул повреждённый текст главы.')
         try:
             self.text_units += len(text.encode('utf-16-le')) // 2
+            self.json_text_units += len(json.dumps(text, ensure_ascii=False).encode('utf-16-le')) // 2
         except UnicodeError:
             raise ZahlebError('Взахлёб вернул повреждённый текст главы.') from None
         self.has_text = self.has_text or bool(text.strip())
@@ -185,7 +191,12 @@ class ZahlebClient:
             length = ep.get('contentLength')
             if length is not None and (type(length) is not int or length < 0):
                 raise ZahlebError('Взахлёб вернул неверный размер текста главы.')
-            if not renderer.has_text or (length is not None and renderer.text_units < length):
+            # Public episodes use both raw UTF-16 and JSON-encoded text lengths.
+            # Accept the alternate representation only on an exact match, never a tolerance.
+            if not renderer.has_text or (length is not None and renderer.text_units < length
+                                         and renderer.json_text_units != length):
+                logger.warning('zahleb_content_length_rejected chapter_id=%s declared=%s utf16=%s json_utf16=%s',
+                               chapter['objectId'], length, renderer.text_units, renderer.json_text_units)
                 raise ZahlebError('Взахлёб вернул пустой или неполный текст главы. Книга не будет отправлена.')
             bodies.append(Chapter.from_download(chapter['title'], html, link))
         age = book.get('ageRating')
@@ -247,7 +258,9 @@ class ZahlebClient:
             with self._opener.open(request, timeout=30) as response:
                 final = require_https_url(response.geturl(), ZAHLEB_HOSTS)
                 actual = ZAHLEB_PATH.fullmatch(final.path)
-                if actual is None or actual.group(2, 3) != expected.group(2, 3):
+                if (actual is None or actual.group(2) != expected.group(2)
+                        or expected.group(3) is not None and actual.group(3) != expected.group(3)):
+                    logger.warning('zahleb_redirect_rejected requested=%s final=%s', public_url(url), public_url(response.geturl()))
                     raise ZahlebError('Взахлёб перенаправил запрос на другую страницу.')
                 data = read_bounded(response)
         except HTTPError as exc:
@@ -271,6 +284,14 @@ class ZahlebClient:
             page = state['props']['pageProps']
             if not isinstance(page, dict):
                 raise ValueError('Invalid page data')
+            if expected.group(3) is None and actual.group(3) is not None:
+                _, chapters = self._book(page, url)
+                ep = page.get('episode')
+                if (actual.group(3) != chapters[0]['objectId'] or not isinstance(ep, dict)
+                        or ep.get('objectId') != actual.group(3)):
+                    logger.warning('zahleb_redirect_rejected requested=%s final=%s', public_url(url), public_url(response.geturl()))
+                    raise ZahlebError('Взахлёб перенаправил запрос не на первую главу запрошенной истории.')
+                logger.info('zahleb_redirect_accepted requested=%s final=%s', public_url(url), public_url(response.geturl()))
             return page
         except (ValueError, TypeError, KeyError, RecursionError):
             raise ZahlebError('Взахлёб изменил страницу или не отдал данные истории. Попробуй позже.') from None

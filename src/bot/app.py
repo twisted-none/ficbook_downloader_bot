@@ -1310,9 +1310,10 @@ async def _process_download_impl(
     delivered = False
 
     async def report_failure(text: str, *, as_error: bool = False, admin_notified: bool = True,
-                             support: bool = True) -> None:
+                             support: bool = True, error: Exception | None = None) -> None:
         if redelivery is not None:
             redelivery.failure = text
+            redelivery.error = error
         elif as_error:
             await _replace_status_with_error(message, status, admin_chat_id, text,
                                             admin_notified=admin_notified, support=support)
@@ -1518,28 +1519,30 @@ async def _process_download_impl(
                     TelegramForbiddenError):
                 logger.debug('Could not remove cancelled download status')
         raise
-    except TelegramForbiddenError:
+    except TelegramForbiddenError as exc:
         await _finish_download(analytics_store, download_id, success=False, url=url, error='Telegram access revoked')
         if redelivery is not None:
             redelivery.failure = 'Пользователь заблокировал бота или чат больше недоступен.'
+            redelivery.error = exc
         if raise_forbidden:
             raise
     except TelegramDeliveryError as exc:
         logger.warning('Telegram file delivery failed: %s', exc)
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
-        await report_failure('Не удалось отправить готовый файл из-за сбоя Telegram. Попробуй позже.')
+        await report_failure('Не удалось отправить готовый файл из-за сбоя Telegram. Попробуй позже.', error=exc)
     except (ResourceLimitError, QueueFullError) as exc:
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
-        await report_failure(_resource_error_text(exc))
+        await report_failure(_resource_error_text(exc), error=exc)
     except FicbookPaidContentError as exc:
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
-        await report_failure(_user_error_message(exc))
+        await report_failure(_user_error_message(exc), error=exc)
     except FicbookNotFoundError as exc:
         await _discard_download(analytics_store, download_id)
         await report_failure(
             _user_error_message(exc), as_error=True,
             admin_notified=False,
             support=False,
+            error=exc,
         )
     except FicbookError as exc:
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
@@ -1547,15 +1550,16 @@ async def _process_download_impl(
             await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=True,
                                 retry_store=getattr(analytics_store, 'alert_retries', None),
                                 formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers)
-        await report_failure(_user_error_message(exc), as_error=True)
+        await report_failure(_user_error_message(exc), as_error=True, error=exc)
     except Exception as exc:
-        logger.exception("Unexpected error while processing Ficbook link")
+        if redelivery is None:
+            logger.exception("Unexpected error while processing Ficbook link")
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
         if redelivery is None:
             await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False,
                                 retry_store=getattr(analytics_store, 'alert_retries', None),
                                 formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers)
-        await report_failure(_developer_error_text(), as_error=True)
+        await report_failure(_developer_error_text(), as_error=True, error=exc)
     finally:
         if progress is not None:
             await progress.close()
