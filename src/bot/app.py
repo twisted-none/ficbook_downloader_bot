@@ -34,7 +34,10 @@ from aiogram.types import (
 )
 from aiogram.utils.chat_action import ChatActionSender
 
-from src.storage.analytics import AnalyticsStore, UserDownloadSettings
+from src.storage.analytics import AnalyticsStore, UserDownloadSettings, _public_story_url
+from src.storage.alert_retries import AlertRetry, AlertRetryStore
+from src.bot.alert_redelivery import AlertRedelivery, Redelivery, RETRY_PREFIX, poll_bots, retry_keyboard
+from src.bot.alert_relay import PREFIX as CARD_RETRY_PREFIX, relay_card_retry
 from src.bot.types import PendingChapterSelection, PendingSupportMessage, SettingsDraft, SettingsSession
 from src.bot.sessions import ExpiringDict, ExpiringSet
 from src.bot.jobs import JobRegistry, current_job, download_key
@@ -433,6 +436,19 @@ async def _expire_sessions() -> None:
         await asyncio.sleep(60)
         for store in _session_stores:
             store.expire()
+
+
+@router.callback_query(F.data.startswith(RETRY_PREFIX))
+async def on_alert_retry(callback: CallbackQuery, alert_redelivery: AlertRedelivery | None = None) -> None:
+    if alert_redelivery is not None:
+        await alert_redelivery.handle(callback)
+    else:
+        await callback.answer('Повторная отправка недоступна.', show_alert=True)
+
+
+@router.callback_query(F.data.startswith(CARD_RETRY_PREFIX))
+async def on_card_alert_retry(callback: CallbackQuery) -> None:
+    await relay_card_retry(callback)
 
 
 @router.message(CommandStart())
@@ -858,7 +874,7 @@ async def on_link(
     url = extract_download_url(message.text or "")
     if not url:
         await message.answer(
-            "Нужна ссылка на Ficbook, Fikbooks, AO3, Wattpad, Hogwartsnet, RanobeLIB или Litnet.",
+            "Нужна ссылка на Ficbook, Fikbooks, AO3, Wattpad, Hogwartsnet, RanobeLIB, Взахлёб (zahleb.me) или Litnet.",
             reply_markup=_main_keyboard_for_message(message, admin_chat_id),
         )
         return
@@ -1241,6 +1257,7 @@ async def _process_download(
     chapter_numbers: set[int] | None = None, raise_forbidden: bool = False,
     initial_status: Message | None = None,
     known_title: str = '',
+    redelivery: Redelivery | None = None,
 ) -> bool | None:
     return await _run_tracked(
         message, url, formats, cover_enabled, chapter_numbers, 'work', initial_status,
@@ -1248,6 +1265,7 @@ async def _process_download(
             message, ficbook_client, admin_chat_id, alert_bot, analytics_store, download_queues,
             url, formats, premium_queue_user_ids, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers,
             raise_forbidden=raise_forbidden, initial_status=initial_status, known_title=known_title,
+            redelivery=redelivery,
         ),
     )
 
@@ -1268,6 +1286,7 @@ async def _process_download_impl(
     raise_forbidden: bool = False,
     initial_status: Message | None = None,
     known_title: str = '',
+    redelivery: Redelivery | None = None,
 ) -> bool:
     priority = _is_priority_download_user(message, premium_queue_user_ids)
     assignment = download_queues.assign(url)
@@ -1390,13 +1409,20 @@ async def _process_download_impl(
                 if not await progress.set_required(progress_state.with_identity(_sending_status(formats)), wait_for_throttle=False):
                     logger.debug('Sending completed download without a final status edit')
                 await progress.close()
-                for index, (fmt, payload) in enumerate(files, 1):
+                pending_files = [(fmt, payload) for fmt, payload in files
+                                 if redelivery is None or fmt not in redelivery.sent_formats]
+                for index, (fmt, payload) in enumerate(pending_files, 1):
+                    caption = f'{escape(story.title)} ({fmt.upper()})'
+                    if redelivery is not None and index == len(pending_files):
+                        caption = redelivery.notice
                     await _answer_document_with_retry(
                         message, payload, filename=f'{file_stem}.{fmt}',
-                        caption=f'{escape(story.title)} ({fmt.upper()})',
+                        caption=caption,
                         reply_markup=(_main_keyboard_for_message(message, admin_chat_id)
-                                      if index == len(files) else None),
+                                      if index == len(pending_files) else None),
                     )
+                    if redelivery is not None:
+                        await redelivery.record_sent(fmt)
                 delivered = True
                 job = current_job.get()
                 if job is not None:
@@ -1490,7 +1516,10 @@ async def _process_download_impl(
         )
     except FicbookError as exc:
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
-        await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=True)
+        if redelivery is None:
+            await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=True,
+                                retry_store=getattr(analytics_store, 'alert_retries', None),
+                                formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers)
         await _replace_status_with_error(
             message,
             status,
@@ -1500,7 +1529,10 @@ async def _process_download_impl(
     except Exception as exc:
         logger.exception("Unexpected error while processing Ficbook link")
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
-        await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False)
+        if redelivery is None:
+            await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False,
+                                retry_store=getattr(analytics_store, 'alert_retries', None),
+                                formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers)
         await _replace_status_with_error(message, status, admin_chat_id, _developer_error_text())
     finally:
         if progress is not None:
@@ -1776,16 +1808,31 @@ async def run_bot(settings: Settings) -> None:
     )
     retention_task = asyncio.create_task(run_history_retention(analytics_store))
     sessions_task = asyncio.create_task(_expire_sessions())
+
+    async def redownload(message: Message, request: AlertRetry, delivery: Redelivery) -> bool | None:
+        return await _process_download(
+            message, dispatcher['ficbook_client'], settings.admin_chat_id, alert_bot,
+            analytics_store, dispatcher['download_queues'], request.url, request.formats,
+            settings.premium_queue_user_ids, cover_enabled=request.cover_enabled,
+            chapter_numbers=set(request.chapter_numbers) if request.chapter_numbers is not None else None,
+            redelivery=delivery,
+        )
+
+    redelivery = AlertRedelivery(bot, settings.admin_chat_id, analytics_store.alert_retries, redownload)
+    dispatcher['alert_redelivery'] = redelivery
     try:
         await _set_bot_commands(bot, settings.admin_chat_id)
-        await dispatcher.start_polling(bot, tasks_concurrency_limit=limits.max_queue_jobs + 64)
+        await poll_bots(dispatcher, bot, redelivery, alert_bot,
+                        tasks_concurrency_limit=limits.max_queue_jobs + 64)
     finally:
+        await redelivery.close()
         metrics_task.cancel()
         retention_task.cancel()
         sessions_task.cancel()
         await asyncio.gather(metrics_task, retention_task, sessions_task, return_exceptions=True)
         await asyncio.to_thread(close_download_workers)
         await asyncio.to_thread(analytics_store.close)
+        await bot.session.close()
         if alert_bot:
             await alert_bot.session.close()
 
@@ -2025,6 +2072,10 @@ async def _notify_admin(
     error: Exception,
     *,
     expected: bool,
+    retry_store: AlertRetryStore | None = None,
+    formats: tuple[str, ...] | None = None,
+    cover_enabled: bool = True,
+    chapter_numbers: set[int] | None = None,
 ) -> None:
     if admin_chat_id is None:
         return
@@ -2046,7 +2097,21 @@ async def _notify_admin(
         f"<b>URL:</b> {escape(url)}\n"
         f"<b>Error:</b> {escape(str(error))}"
     )
+    sender = alert_bot or message.bot
+    token = None
+    if retry_store is not None and formats and user:
+        try:
+            token = await asyncio.to_thread(
+                retry_store.create, user_id=user.id, chat_id=message.chat.id, url=_public_story_url(url),
+                formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers,
+                bot_id=sender.id, admin_chat_id=admin_chat_id,
+            )
+        except Exception:
+            logger.warning('Could not save admin redelivery request; sending alert without button')
     try:
-        await (alert_bot or message.bot).send_message(admin_chat_id, text)
+        kwargs = {'reply_markup': retry_keyboard(token)} if token else {}
+        alert = await sender.send_message(admin_chat_id, text, **kwargs)
+        if token is not None:
+            await asyncio.to_thread(retry_store.bind_message, token, alert.message_id)
     except Exception:
         logger.exception("Failed to notify admin about user error")

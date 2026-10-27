@@ -15,3 +15,11 @@ services:
       - "${METRICS_HOST_PORT:-18000}:${METRICS_PORT:-8000}"
     volumes:
       - /srv/projects/data/ficbook_downloader_bot/app-data:/app/data
+    networks:
+      - default
+      - bot-alerts
+
+networks:
+  bot-alerts:
+    name: bot-alerts
+    external: true

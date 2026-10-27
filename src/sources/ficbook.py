@@ -28,6 +28,7 @@ from fanficfare.exceptions import HTTPErrorFFF
 from src.sources.ao3 import AO3WorkUnavailableError, download_html_chapters
 from src.sources.collections import FicbookCollection, load_collection
 from src.sources.fikbooks import FikbooksClient, FikbooksError, FikbooksNotFoundError, FikbooksRateLimitError
+from src.sources.zahleb import ZahlebClient, ZahlebError, ZahlebNotFoundError, ZahlebRateLimitError
 from src.sources.litnet import (
     LitnetClient,
     LitnetError,
@@ -206,6 +207,7 @@ class FicbookClient:
         self.litnet = LitnetClient(litnet_login, litnet_password)
         self.ranobelib = RanobelibClient(ranobelib_login, ranobelib_password)
         self.fikbooks = FikbooksClient(request_delay=request_delay)
+        self.zahleb = ZahlebClient(request_delay=request_delay)
         self.defaults_ini = Path(fanficfare.__file__).with_name("defaults.ini")
         self._account_lock = Lock()
         self._next_account_index: dict[str, int] = {}
@@ -357,6 +359,8 @@ class FicbookClient:
         progress: Callable[[str], None] | None,
         chapter_numbers: set[int] | frozenset[int] | None,
     ) -> Story:
+        if _site_key(normalized) == 'zahleb.me':
+            return self._zahleb_request(normalized, progress=progress, chapter_numbers=chapter_numbers)
         if _site_key(normalized) == 'fikbooks.ru':
             return self._fikbooks_request(normalized, progress=progress, chapter_numbers=chapter_numbers)
         if _is_ranobelib_url(normalized):
@@ -458,6 +462,8 @@ class FicbookClient:
         )
 
     def _preview_once(self, normalized: str, account: FicbookAccount) -> StoryPreview:
+        if _site_key(normalized) == 'zahleb.me':
+            return self._zahleb_request(normalized, preview=True)
         if _site_key(normalized) == 'fikbooks.ru':
             return self._fikbooks_request(normalized, preview=True)
         if _is_ranobelib_url(normalized):
@@ -532,6 +538,20 @@ class FicbookClient:
             source_url=normalized,
             chapters=chapters,
         )
+
+    def _zahleb_request(self, url: str, *, preview: bool = False,
+                        progress: Callable[[str], None] | None = None,
+                        chapter_numbers: set[int] | frozenset[int] | None = None) -> Story | StoryPreview:
+        try:
+            if preview:
+                return self.zahleb.preview(url)
+            return self.zahleb.download(url, progress, chapter_numbers)
+        except ZahlebNotFoundError as exc:
+            raise FicbookNotFoundError(str(exc)) from exc
+        except ZahlebRateLimitError as exc:
+            raise FicbookRateLimitError(str(exc)) from exc
+        except ZahlebError as exc:
+            raise FicbookError(str(exc)) from exc
 
     def _fikbooks_request(self, url: str, *, preview: bool = False,
                           progress: Callable[[str], None] | None = None,

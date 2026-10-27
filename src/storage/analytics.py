@@ -14,6 +14,7 @@ from psycopg_pool import ConnectionPool
 
 from src.exporters.formats import DEFAULT_FORMATS, normalize_formats
 from src.sources.registry import is_supported_story_url, normalize_url
+from src.storage.alert_retries import AlertRetryStore
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class AnalyticsStore:
         self._settings_write_locks = tuple(Lock() for _ in range(64))
         self._settings_cache: OrderedDict[int, tuple[float, UserDownloadSettings]] = OrderedDict()
         self._settings_generation = 0
+        self.alert_retries = AlertRetryStore(self._connect)
         if initialize:
             try:
                 self._initialize()
@@ -158,6 +160,7 @@ class AnalyticsStore:
             raise ValueError("Cleanup batch size must be between 1 and 10000")
         with self.lock, self._connect() as db, db.transaction():
             db.execute("SET LOCAL statement_timeout = '15s'")
+            db.execute('DELETE FROM alert_retries WHERE expires_at <= now()')
             expired = list(db.execute(
                 """
                 SELECT id, url FROM downloads
@@ -380,6 +383,7 @@ class AnalyticsStore:
 
     def _initialize(self) -> None:
         with self.lock, self._connect() as db, db.transaction():
+            self.alert_retries.initialize(db)
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bot_users (

@@ -12,12 +12,31 @@ SUPPORTED_HOST_MARKERS = (
     "hogwartsnet.ru",
     "litnet.com",
     "ranobelib.me",
+    "zahleb.me",
 )
 
 FICBOOK_ID_PATTERN = r'(?:[0-9]+|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})'
 _COLLECTION_PATH = re.compile(rf'/collections/({FICBOOK_ID_PATTERN})(?:/(?:page|p)/[0-9]{{1,9}})?/?', re.I)
 FIKBOOKS_HOSTS = frozenset({'fikbooks.ru', 'www.fikbooks.ru'})
 FIKBOOKS_PATH = re.compile(r'/readfic/([1-9][0-9]{0,17})(?:/([1-9][0-9]{0,17}))?/?')
+ZAHLEB_HOSTS = frozenset({'zahleb.me', 'www.zahleb.me'})
+ZAHLEB_PATH = re.compile(r'/story/((?:[A-Za-z0-9][A-Za-z0-9_-]{0,240}-)?([A-Za-z0-9]{10}))'
+                         r'(?:/([A-Za-z0-9]{10}))?/?')
+
+
+def normalize_zahleb_url(url: str) -> str:
+    if (len(url) > 4096 or '\\' in url
+            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)):
+        raise ValueError('Invalid Zahleb URL')
+    parts = urlsplit(url)
+    match = ZAHLEB_PATH.fullmatch(parts.path)
+    tracking = {'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref'}
+    if (parts.scheme not in {'http', 'https'} or parts.hostname not in ZAHLEB_HOSTS
+            or parts.username is not None or parts.password is not None
+            or parts.port not in {None, 443 if parts.scheme == 'https' else 80} or match is None
+            or not set(parse_qs(parts.query, keep_blank_values=True)) <= tracking):
+        raise ValueError('Invalid Zahleb URL')
+    return 'https://zahleb.me/story/' + match.group(1)
 
 
 def normalize_fikbooks_url(url: str) -> str:
@@ -65,6 +84,8 @@ def extract_url(text: str) -> str | None:
 
 def normalize_url(url: str) -> str:
     parts = urlsplit(url.strip())
+    if parts.hostname in ZAHLEB_HOSTS:
+        return normalize_zahleb_url(url)
     if parts.hostname in FIKBOOKS_HOSTS:
         return normalize_fikbooks_url(url)
     scheme = parts.scheme or "https"
@@ -112,6 +133,12 @@ def is_supported_story_url(url: str) -> bool:
     value = url if re.match(r"^https?://", url, re.I) else f"https://{url}"
     parts = urlsplit(value)
     host = parts.netloc.lower().replace("www.", "")
+    if parts.hostname in ZAHLEB_HOSTS:
+        try:
+            normalize_zahleb_url(value)
+            return True
+        except ValueError:
+            return False
     if parts.hostname in FIKBOOKS_HOSTS:
         try:
             normalize_fikbooks_url(value)
@@ -177,5 +204,6 @@ def site_display_name(url: str) -> str:
         "hogwartsnet.ru": "Hogwartsnet",
         "litnet.com": "Litnet",
         "ranobelib.me": "RanobeLIB",
+        "zahleb.me": "Взахлёб",
     }
     return labels.get(site, site or "Сайт")
