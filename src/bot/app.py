@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from collections.abc import Awaitable, Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
@@ -1032,18 +1033,25 @@ async def _run_tracked(
     message: Message, url: str, formats: tuple[str, ...], cover_enabled: bool,
     chapter_numbers: set[int] | None, kind: str, initial_status: Message | None,
     operation: Callable[[], Awaitable[bool | None]],
+    *, redelivery: Redelivery | None = None,
 ) -> bool | None:
     user_id = message.from_user.id if message.from_user else message.chat.id
     key = download_key(user_id, message.chat.id, url, formats, cover_enabled, chapter_numbers)
     try:
         job, created = _jobs.reserve(key, user_id, message.chat.id, kind)
     except OverflowError:
-        await _replace_status_with_notice(message, initial_status, None, 'Сейчас очередь заполнена. Попробуй позже.')
+        if redelivery is not None:
+            redelivery.failure = 'Очередь загрузок заполнена. Повтори попытку позже.'
+        else:
+            await _replace_status_with_notice(message, initial_status, None, 'Сейчас очередь заполнена. Попробуй позже.')
         return None
     if not created:
-        await _replace_status_with_notice(
-            message, initial_status, None, 'Эта работа уже скачивается или ожидает очереди.\n' + job.text,
-        )
+        if redelivery is not None:
+            redelivery.failure = 'Эта работа уже скачивается или ожидает очереди.'
+        else:
+            await _replace_status_with_notice(
+                message, initial_status, None, 'Эта работа уже скачивается или ожидает очереди.\n' + job.text,
+            )
         parent = current_job.get()
         if kind == 'work' and parent is not None and parent.kind == 'collection' and job.task is not None:
             try:
@@ -1068,7 +1076,10 @@ async def _run_tracked(
         if not job.cancel_requested:
             raise
         text = ('Сборник остановлен.\n' + job.text if kind == 'collection' else 'Загрузка отменена.')
-        await message.answer(text)
+        if redelivery is not None:
+            redelivery.failure = 'Повторная загрузка отменена.'
+        else:
+            await message.answer(text)
         return None
     finally:
         _jobs.release(job)
@@ -1267,6 +1278,7 @@ async def _process_download(
             raise_forbidden=raise_forbidden, initial_status=initial_status, known_title=known_title,
             redelivery=redelivery,
         ),
+        redelivery=redelivery,
     )
 
 
@@ -1290,12 +1302,23 @@ async def _process_download_impl(
 ) -> bool:
     priority = _is_priority_download_user(message, premium_queue_user_ids)
     assignment = download_queues.assign(url)
-    status: Message | None = initial_status
+    status: Message | None = initial_status if redelivery is None else None
     progress = ProgressMessage(status, min_interval=5.0)
     progress_state = DownloadProgressState(source_url=url)
     progress_state.set_title(known_title)
     download_id = None
     delivered = False
+
+    async def report_failure(text: str, *, as_error: bool = False, admin_notified: bool = True,
+                             support: bool = True) -> None:
+        if redelivery is not None:
+            redelivery.failure = text
+        elif as_error:
+            await _replace_status_with_error(message, status, admin_chat_id, text,
+                                            admin_notified=admin_notified, support=support)
+        else:
+            await _replace_status_with_notice(message, status, admin_chat_id, text)
+
     try:
         download_id = await _start_download(analytics_store, message, url)
         attempted_slots: set[int] = set()
@@ -1307,6 +1330,8 @@ async def _process_download_impl(
 
             async def on_queued(estimate: Any) -> None:
                 nonlocal status, progress
+                if redelivery is not None:
+                    return
                 text = _queue_status(
                     formats,
                     estimate.position,
@@ -1326,6 +1351,8 @@ async def _process_download_impl(
             async def on_started() -> None:
                 nonlocal status, progress
                 progress_state.start_attempt()
+                if redelivery is not None:
+                    return
                 active_text = progress_state.status(formats)
                 if status is None:
                     await progress.close()
@@ -1358,7 +1385,9 @@ async def _process_download_impl(
                         _active_progress_updater(active_progress, progress_state, formats)
                     )
                     try:
-                        async with ChatActionSender.upload_document(bot=message.bot, chat_id=message.chat.id):
+                        action = (ChatActionSender.upload_document(bot=message.bot, chat_id=message.chat.id)
+                                  if redelivery is None else nullcontext())
+                        async with action:
                             story = await run_worker(
                                 ficbook_client.download,
                                 url,
@@ -1491,26 +1520,24 @@ async def _process_download_impl(
         raise
     except TelegramForbiddenError:
         await _finish_download(analytics_store, download_id, success=False, url=url, error='Telegram access revoked')
+        if redelivery is not None:
+            redelivery.failure = 'Пользователь заблокировал бота или чат больше недоступен.'
         if raise_forbidden:
             raise
     except TelegramDeliveryError as exc:
         logger.warning('Telegram file delivery failed: %s', exc)
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
-        await _replace_status_with_notice(message, status, admin_chat_id,
-                                         'Не удалось отправить готовый файл из-за сбоя Telegram. Попробуй позже.')
+        await report_failure('Не удалось отправить готовый файл из-за сбоя Telegram. Попробуй позже.')
     except (ResourceLimitError, QueueFullError) as exc:
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
-        await _replace_status_with_notice(message, status, admin_chat_id, _resource_error_text(exc))
+        await report_failure(_resource_error_text(exc))
     except FicbookPaidContentError as exc:
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
-        await _replace_status_with_notice(message, status, admin_chat_id, _user_error_message(exc))
+        await report_failure(_user_error_message(exc))
     except FicbookNotFoundError as exc:
         await _discard_download(analytics_store, download_id)
-        await _replace_status_with_error(
-            message,
-            status,
-            admin_chat_id,
-            _user_error_message(exc),
+        await report_failure(
+            _user_error_message(exc), as_error=True,
             admin_notified=False,
             support=False,
         )
@@ -1520,12 +1547,7 @@ async def _process_download_impl(
             await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=True,
                                 retry_store=getattr(analytics_store, 'alert_retries', None),
                                 formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers)
-        await _replace_status_with_error(
-            message,
-            status,
-            admin_chat_id,
-            _user_error_message(exc),
-        )
+        await report_failure(_user_error_message(exc), as_error=True)
     except Exception as exc:
         logger.exception("Unexpected error while processing Ficbook link")
         await _finish_download(analytics_store, download_id, success=False, url=url, error=str(exc))
@@ -1533,7 +1555,7 @@ async def _process_download_impl(
             await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False,
                                 retry_store=getattr(analytics_store, 'alert_retries', None),
                                 formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers)
-        await _replace_status_with_error(message, status, admin_chat_id, _developer_error_text())
+        await report_failure(_developer_error_text(), as_error=True)
     finally:
         if progress is not None:
             await progress.close()
@@ -2080,7 +2102,7 @@ async def _notify_admin(
     if admin_chat_id is None:
         return
     user = message.from_user
-    user_name = (user.username or user.full_name) if user else "unknown"
+    user_name = (f'@{user.username}' if user.username else user.full_name) if user else "unknown"
     error_kind = "Handled Ficbook error" if expected else "Unhandled bot error"
     technical = getattr(error, "technical", "")
     if technical:
@@ -2105,6 +2127,7 @@ async def _notify_admin(
                 retry_store.create, user_id=user.id, chat_id=message.chat.id, url=_public_story_url(url),
                 formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers,
                 bot_id=sender.id, admin_chat_id=admin_chat_id,
+                username=user.username or '', full_name=user.full_name or '',
             )
         except Exception:
             logger.warning('Could not save admin redelivery request; sending alert without button')

@@ -17,6 +17,7 @@ HIDDEN = b'<html><title>Mystery Work</title><div id="main"><p class="notice">' +
 
 class AO3AvailabilityTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch('src.sources.ao3_http.bounded_sleep'))
         browser = patch('src.sources.ao3_http.BrowserCollectionClient')
         self.browser = browser.start()
         self.addCleanup(browser.stop)

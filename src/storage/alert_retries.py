@@ -22,6 +22,8 @@ class AlertRetry:
     chapter_numbers: tuple[int, ...] | None
     sent_formats: tuple[str, ...] = ()
     delivered: bool = False
+    username: str = ''
+    full_name: str = ''
 
 
 def _release_connection(db: Connection, connection: AbstractContextManager, token: str, locked: bool) -> None:
@@ -85,10 +87,13 @@ class AlertRetryStore:
             )
         """)
         db.execute('CREATE INDEX IF NOT EXISTS idx_alert_retries_expiry ON alert_retries(expires_at)')
+        # Nullable for old snapshots; their unexpired profile can supply the identity.
+        db.execute('ALTER TABLE alert_retries ADD COLUMN IF NOT EXISTS username TEXT')
+        db.execute('ALTER TABLE alert_retries ADD COLUMN IF NOT EXISTS full_name TEXT')
 
     def create(self, *, user_id: int, chat_id: int, url: str, formats: tuple[str, ...],
                cover_enabled: bool, chapter_numbers: set[int] | None,
-               bot_id: int, admin_chat_id: int) -> str:
+               bot_id: int, admin_chat_id: int, username: str = '', full_name: str = '') -> str:
         if (not formats or len(set(formats)) != len(formats) or not set(formats) <= set(ALLOWED_FORMATS)
                 or len(url) > 4096 or not is_supported_story_url(url) or user_id <= 0
                 or (chapter_numbers is not None and (not chapter_numbers or len(chapter_numbers) > 10000
@@ -98,10 +103,12 @@ class AlertRetryStore:
         with self.connect() as db:
             db.execute("""
                 INSERT INTO alert_retries
-                    (token, user_id, chat_id, url, formats, cover_enabled, chapter_numbers, bot_id, admin_chat_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (token, user_id, chat_id, url, formats, cover_enabled, chapter_numbers, bot_id, admin_chat_id,
+                     username, full_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (token, user_id, chat_id, url, list(formats), cover_enabled,
-                      sorted(chapter_numbers) if chapter_numbers is not None else None, bot_id, admin_chat_id))
+                      sorted(chapter_numbers) if chapter_numbers is not None else None, bot_id, admin_chat_id,
+                      username[:64], full_name[:256]))
         return token
 
     def bind_message(self, token: str, message_id: int) -> None:
@@ -121,10 +128,16 @@ class AlertRetryStore:
                     AND admin_chat_id = %s AND message_id = %s AND expires_at > now()""",
                     (token, bot_id, admin_chat_id, message_id)).fetchone()
                 if row is not None:
+                    profile = {}
+                    if row['full_name'] is None:
+                        profile = db.execute('SELECT username, full_name FROM bot_users WHERE user_id = %s '
+                                             'AND profile_expires_at > now()', (row['user_id'],)).fetchone() or {}
                     request = AlertRetry(
                         row['token'], row['user_id'], row['chat_id'], row['url'], tuple(row['formats']),
                         row['cover_enabled'], tuple(row['chapter_numbers']) if row['chapter_numbers'] is not None else None,
                         tuple(row['sent_formats']), row['delivered'],
+                        row['username'] or profile.get('username', ''),
+                        row['full_name'] or profile.get('full_name', ''),
                     )
                     return RetryClaim(db, connection, request)
         except BaseException:

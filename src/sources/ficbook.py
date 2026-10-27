@@ -311,6 +311,13 @@ class FicbookClient:
                         ),
                     )
                     sleep(delay)
+                except FicbookError as exc:
+                    from src.sources.ao3_browser import enabled_for
+                    if enabled_for(normalized, exc):
+                        result = self._ao3_browser_recovery(normalized, progress, chapter_numbers)
+                        validate_story(result)
+                        return result
+                    raise
         if last_rate_limit:
             raise FicbookRateLimitError(
                 f"{site_name} временно ограничил запросы. Попробуй повторить позже.",
@@ -345,12 +352,32 @@ class FicbookClient:
                     delay = self._retry_delay(attempt)
                     _report(progress, f"{site_name} временно ограничил запросы. Повторю через {delay:.0f} сек.")
                     sleep(delay)
+                except FicbookError as exc:
+                    from src.sources.ao3_browser import enabled_for
+                    if enabled_for(normalized, exc):
+                        result = self._ao3_browser_recovery(normalized, progress, preview=True)
+                        validate_preview(result)
+                        return result
+                    raise
         if last_rate_limit:
             raise FicbookError(
                 f"{site_name} временно ограничил запросы. Попробуй повторить скачивание позже.",
                 technical=getattr(last_rate_limit, "technical", "") or str(last_rate_limit),
             ) from last_rate_limit
         raise FicbookError("Не удалось получить список глав.")
+
+    def _ao3_browser_recovery(self, url, progress=None, chapter_numbers=None, *, preview=False):
+        from src.sources.ao3_browser import BrowserDownloadError, download_browser_work
+        try:
+            return download_browser_work(url, progress, chapter_numbers, preview=preview)
+        except ResourceLimitError:
+            raise
+        except AO3WorkUnavailableError as exc:
+            raise FicbookError(str(exc)) from exc
+        except Exception as exc:
+            logger.warning('AO3 browser recovery failed (%s)', type(exc).__name__)
+            text = str(exc) if isinstance(exc, BrowserDownloadError) else 'Резервное скачивание AO3 не удалось. Попробуй позже.'
+            raise FicbookError(text) from exc
 
     def _download_once(
         self,
@@ -1585,6 +1612,9 @@ def _friendly_download_error(url: str, error: Exception) -> FicbookError:
     site_name = _site_display_name(url)
     if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3WorkUnavailableError):
         return FicbookError(str(error))
+    if _site_key(url) == 'archiveofourown.org' and getattr(error, 'status_code', None) == 525:
+        return FicbookError('AO3 временно недоступен: сбой защищённого соединения на стороне сайта. '
+                            'Попробуй повторить позже.', technical='AO3 HTTP 525')
     if _is_ao3_shields_error(url, error):
         return FicbookError(
             "AO3 включил браузерную проверку защиты. Бот не может пройти ее как обычный браузер, "
@@ -1617,6 +1647,9 @@ def _friendly_preview_error(url: str, error: Exception) -> FicbookError:
     site_name = _site_display_name(url)
     if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3WorkUnavailableError):
         return FicbookError(str(error))
+    if _site_key(url) == 'archiveofourown.org' and getattr(error, 'status_code', None) == 525:
+        return FicbookError('AO3 временно недоступен: сбой защищённого соединения на стороне сайта. '
+                            'Список глав пока получить не удалось. Попробуй позже.', technical='AO3 HTTP 525')
     if _is_ao3_shields_error(url, error):
         return FicbookError(
             "AO3 включил браузерную проверку защиты, поэтому список глав сейчас получить не удалось. "
@@ -1668,6 +1701,9 @@ def _is_network_error(error: Exception) -> bool:
 def _is_ao3_shields_error(url: str, error: Exception) -> bool:
     if _site_key(url) != "archiveofourown.org":
         return False
+    code = getattr(error, 'status_code', getattr(error, 'code', None))
+    if code is not None and code != 403:
+        return False
     text = repr(error).lower()
     return any(marker in text for marker in ("shields are up", "not a robot", "cloudflare", "challenge-platform"))
 
@@ -1675,6 +1711,14 @@ def _is_ao3_shields_error(url: str, error: Exception) -> bool:
 def _is_ao3_transient_failure(url: str, error: Exception) -> bool:
     if _site_key(url) != "archiveofourown.org":
         return False
+    if getattr(error, 'ao3_retry_exhausted', False):
+        return False
+    from src.sources.ao3_http import is_transient_ao3_error
+    if is_transient_ao3_error(error):
+        return True
+    code = getattr(error, 'status_code', getattr(error, 'code', None))
+    if code is not None:
+        return code == 403 and _is_ao3_shields_error(url, error)
     text = f"{error!r} {getattr(error, 'technical', '')}".lower()
     return any(
         marker in text

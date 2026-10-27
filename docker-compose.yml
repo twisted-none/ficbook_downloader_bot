@@ -8,6 +8,7 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
       TEST_BOT_TOKEN: ""
+      AO3_BROWSER_URL: http://ao3-browser:8000
       DATABASE_URL: ${DATABASE_URL}
       METRICS_HOST: ${METRICS_HOST:-0.0.0.0}
       METRICS_PORT: ${METRICS_PORT:-8000}
@@ -18,8 +19,33 @@ services:
     networks:
       - default
       - bot-alerts
+      - ao3-browser
+
+  ao3-browser:
+    build:
+      context: .
+      dockerfile: browser/Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./browser/seccomp.json
+    shm_size: 256mb
+    mem_limit: 1536m
+    pids_limit: 512
+    tmpfs:
+      - /tmp:rw,nosuid,size=256m,mode=1777
+    networks:
+      - ao3-browser
+      - ao3-egress
 
 networks:
+  ao3-browser:
+    internal: true
+  ao3-egress:
   bot-alerts:
     name: bot-alerts
     external: true

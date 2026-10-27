@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiogram import Bot
-from aiogram.methods import AnswerCallbackQuery, DeleteMessage, EditMessageReplyMarkup, SendMessage
+from aiogram.methods import AnswerCallbackQuery, DeleteMessage, EditMessageReplyMarkup, EditMessageText, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, User
 
 from src.bot.alert_redelivery import AlertRedelivery, RETRY_NOTICE, poll_bots, retry_keyboard
@@ -21,6 +21,13 @@ def callback(*, user_id=9, chat_id=9, message_id=12, token='test_token'):
 
 
 class AlertRedeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_preserves_telegram_identity(self):
+        self.claim.request = replace(self.retry, username='reader', full_name='Имя Читателя')
+        await self.call()
+        target = self.download.await_args.args[0]
+        self.assertEqual(target.from_user.username, 'reader')
+        self.assertEqual(target.from_user.full_name, 'Имя Читателя')
+
     async def asyncSetUp(self):
         self.bot = Bot('123456:fake_test_token')
         self.addAsyncCleanup(self.bot.session.close)
@@ -33,7 +40,7 @@ class AlertRedeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.answer, self.delete, self.edit, self.notice = (AsyncMock() for _ in range(4))
         async def api(method, **kwargs):
             handler = {AnswerCallbackQuery: self.answer, DeleteMessage: self.delete,
-                       EditMessageReplyMarkup: self.edit, SendMessage: self.notice}[type(method)]
+                       EditMessageReplyMarkup: self.edit, EditMessageText: self.edit, SendMessage: self.notice}[type(method)]
             return await handler(**method.model_dump(exclude_none=True))
         self.enterContext(patch.object(Bot, '__call__', new=AsyncMock(side_effect=api)))
         from src.bot.telegram_delivery import TelegramDeliveryGate
@@ -55,6 +62,9 @@ class AlertRedeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(request.cover_enabled)
             self.delete.assert_not_awaited()
             self.assertEqual(delivery.notice, RETRY_NOTICE)
+            self.assertIn('Повторная отправка выполняется', self.edit.await_args.kwargs['text'])
+            self.assertIn('Error', self.edit.await_args.kwargs['text'])
+            self.notice.assert_not_awaited()
             self.claim.request = replace(request, delivered=True)
             return True
         self.download.side_effect = download
@@ -98,6 +108,8 @@ class AlertRedeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.edit.await_args.kwargs['reply_markup'],
                          retry_keyboard('test_token').model_dump(exclude_none=True))
         self.claim.close.assert_called_once()
+        self.notice.assert_not_awaited()
+        self.assertIn('Не удалось отправить', self.edit.await_args.kwargs['text'])
 
     async def test_already_delivered_only_retries_alert_deletion(self):
         self.claim.request = replace(self.retry, delivered=True)
@@ -115,6 +127,33 @@ class AlertRedeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_callback_is_rejected(self):
         await self.call(token='x' * 200)
         self.store.claim.assert_not_called()
+
+    async def test_failure_reason_is_in_original_alert_and_html_escaped(self):
+        async def download(message, request, delivery):
+            delivery.failure = '<source> & unavailable'
+            return False
+        self.download.side_effect = download
+        await self.call()
+        self.assertIn('&lt;source&gt; &amp; unavailable', self.edit.await_args.kwargs['text'])
+        self.assertEqual(self.edit.await_args.kwargs['message_id'], 12)
+        self.assertEqual(self.edit.await_args.kwargs['chat_id'], 9)
+        self.notice.assert_not_awaited()
+
+    async def test_status_replaces_old_footer_and_preserves_original_formatting(self):
+        from aiogram.types import MessageEntity
+        from src.bot.alert_redelivery import STATUS_HEADER
+        query = callback().as_(self.bot)
+        updated = query.message.model_copy(update={
+            'text': 'Error' + STATUS_HEADER + 'Previous failure',
+            'entities': [MessageEntity(type='bold', offset=0, length=5)],
+        }).as_(self.bot)
+        query = query.model_copy(update={'message': updated}).as_(self.bot)
+        self.download.return_value = False
+        await self.service.handle(query)
+        body = self.edit.await_args.kwargs['text']
+        self.assertIn('<b>Error</b>', body)
+        self.assertNotIn('Previous failure', body)
+        self.assertEqual(body.count('<b>Повторная отправка</b>'), 1)
 
     async def test_delete_failure_never_repeats_successful_delivery(self):
         self.claim.request = replace(self.retry, delivered=True)
@@ -196,6 +235,7 @@ class RedeliveryDownloadFlowTests(unittest.IsolatedAsyncioTestCase):
         for name, value in (
             ('_start_download', AsyncMock(return_value=1)),
             ('_finish_download', AsyncMock()),
+            ('_discard_download', AsyncMock()),
             ('_notify_admin', AsyncMock()),
             ('_build_selected_files', AsyncMock(return_value=[('epub', b'epub'), ('fb2', b'fb2')])),
             ('_telegram_edit_gate', app.TelegramEditGate(min_interval=0)),
@@ -205,7 +245,7 @@ class RedeliveryDownloadFlowTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch('src.bot.telegram_delivery.telegram_delivery',
                                TelegramDeliveryGate(chat_interval=0, bot_interval=0)))
 
-    async def run_download(self, *, sent=(), fail_second=False):
+    async def run_download(self, *, sent=(), fail_second=False, source_error=None):
         from src.bot.alert_redelivery import Redelivery
         from src.bot.telegram_delivery import TelegramDeliveryError
         from src.core.download_queue import DownloadQueuePool
@@ -219,6 +259,8 @@ class RedeliveryDownloadFlowTests(unittest.IsolatedAsyncioTestCase):
             await send(*args, **kwargs)
         message.answer_document = send_document
         client = SimpleNamespace(download=Mock(return_value=Story('Book', 'Author', 'https://ficbook.net/readfic/123')))
+        if source_error is not None:
+            client.download.side_effect = source_error
         receipt = AsyncMock()
         result = await self.app._process_download(message, client, None, None, object(), DownloadQueuePool(),
             'https://ficbook.net/readfic/123', ('epub', 'fb2'), frozenset(),
@@ -249,6 +291,51 @@ class RedeliveryDownloadFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(message.documents), 1)
         receipt.assert_awaited_once_with('epub')
         self.app._notify_admin.assert_not_awaited()
+        self.assertEqual(message.statuses, [])
+
+    async def test_successful_admin_download_sends_no_progress_messages(self):
+        result, message, _, _ = await self.run_download()
+        self.assertTrue(result)
+        self.assertEqual(message.statuses, [])
+        self.app.ChatActionSender.upload_document.assert_not_called()
+
+    async def test_source_failures_never_send_user_error_messages(self):
+        from src.sources.ficbook import FicbookError, FicbookNotFoundError, FicbookPaidContentError
+        from src.core.limits import ResourceLimitError
+        from src.core.download_queue import QueueFullError
+        for error in (FicbookError('Temporary source error'), FicbookNotFoundError('Missing'),
+                      FicbookPaidContentError('Paid'), ResourceLimitError('Too big'), QueueFullError('Queue full')):
+            with self.subTest(error=type(error).__name__):
+                result, message, _, receipt = await self.run_download(source_error=error)
+                self.assertFalse(result)
+                self.assertEqual(message.statuses, [])
+                self.assertEqual(message.documents, [])
+                receipt.assert_not_awaited()
+        self.app._notify_admin.assert_not_awaited()
+
+    async def test_full_registry_does_not_notify_user(self):
+        from src.bot.alert_redelivery import Redelivery
+        from src.core.download_queue import DownloadQueuePool
+        from tests.test_download_status_flow import IncomingMessage
+        message, delivery = IncomingMessage(), Redelivery((), AsyncMock())
+        with patch.object(self.app._jobs, 'reserve', side_effect=OverflowError):
+            result = await self.app._process_download(message, object(), None, None, object(), DownloadQueuePool(),
+                'https://ficbook.net/readfic/123', ('epub',), frozenset(), redelivery=delivery)
+        self.assertIsNone(result)
+        self.assertEqual(message.statuses, [])
+        self.assertIn('заполнена', delivery.failure)
+
+    async def test_duplicate_job_does_not_notify_user(self):
+        from src.bot.alert_redelivery import Redelivery
+        from src.core.download_queue import DownloadQueuePool
+        from tests.test_download_status_flow import IncomingMessage
+        message, delivery = IncomingMessage(), Redelivery((), AsyncMock())
+        with patch.object(self.app._jobs, 'reserve', return_value=(SimpleNamespace(text='Busy', task=None), False)):
+            result = await self.app._process_download(message, object(), None, None, object(), DownloadQueuePool(),
+                'https://ficbook.net/readfic/123', ('epub',), frozenset(), redelivery=delivery)
+        self.assertIsNone(result)
+        self.assertEqual(message.statuses, [])
+        self.assertIn('уже скачивается', delivery.failure)
 
 
 class AlertSnapshotTests(unittest.IsolatedAsyncioTestCase):
@@ -263,6 +350,11 @@ class AlertSnapshotTests(unittest.IsolatedAsyncioTestCase):
                             formats=('epub', 'fb2'), cover_enabled=False, chapter_numbers={2, 4})
         self.assertEqual(store.create.call_args.kwargs['url'], 'https://ficbook.net/readfic/123')
         self.assertEqual(store.create.call_args.kwargs['user_id'], 101)
+        self.assertEqual(store.create.call_args.kwargs['username'], 'user')
+        self.assertEqual(store.create.call_args.kwargs['full_name'], 'User')
+        self.assertIn('<b>User:</b> @user', sender.send_message.await_args.args[1])
+        self.assertEqual(retry_keyboard('test_token').inline_keyboard[0][0].text,
+                         'Отправить пользователю еще раз')
         self.assertEqual(store.create.call_args.kwargs['chapter_numbers'], {2, 4})
         self.assertFalse(store.create.call_args.kwargs['cover_enabled'])
         store.bind_message.assert_called_once_with('test_token', 12)

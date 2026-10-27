@@ -4,34 +4,38 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import escape
 import logging
 import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
+from aiogram.utils.text_decorations import html_decoration
 
 from src.bot.telegram_delivery import deliver
 from src.storage.alert_retries import AlertRetry, AlertRetryStore
 from src.bot.alert_relay import PREFIX as CARD_RETRY_PREFIX, relay_card_retry
 
 logger = logging.getLogger(__name__)
-RETRY_NOTICE = 'админ исправил вашу ошибку, вот ваша работа'
+RETRY_NOTICE = 'Проблема со скачиванием исправлена. Вот ваша работа:'
 RETRY_PREFIX = 'alert:retry:'
+STATUS_HEADER = '\n\nПовторная отправка\n'
 # A claim holds one pool connection; leave two of the four for normal downloads.
 MAX_ACTIVE_REDELIVERIES = 2
 
 
 def retry_keyboard(token: str, *, busy: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-        text='Отправляется...' if busy else 'Отправить пользователю', callback_data=RETRY_PREFIX + token)]])
+        text='Отправляется...' if busy else 'Отправить пользователю еще раз', callback_data=RETRY_PREFIX + token)]])
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class Redelivery:
     sent_formats: tuple[str, ...]
     record_sent: Callable[[str], Awaitable[None]]
     notice: str = RETRY_NOTICE
+    failure: str = ''
 
 
 class AlertRedelivery:
@@ -62,11 +66,18 @@ class AlertRedelivery:
         except Exception:
             logger.warning('Could not acknowledge admin redelivery button')
 
-    async def _keyboard(self, message: Message, token: str, *, busy: bool = False) -> None:
+    async def _status(self, message: Message, token: str, text: str, *, busy: bool = False) -> None:
+        base = (message.text or '').split(STATUS_HEADER, 1)[0]
+        base = base.encode('utf-16-le')[:6400].decode('utf-16-le', 'ignore')
+        text = text.encode('utf-16-le')[:1000].decode('utf-16-le', 'ignore')
+        length = len(base.encode('utf-16-le')) // 2
+        entities = [entity for entity in message.entities or () if entity.offset + entity.length <= length]
+        body = html_decoration.unparse(base, entities) + '\n\n<b>Повторная отправка</b>\n' + escape(text)
         try:
-            await deliver(message, lambda: message.edit_reply_markup(reply_markup=retry_keyboard(token, busy=busy)))
+            await deliver(message, lambda: message.edit_text(
+                body, parse_mode='HTML', reply_markup=retry_keyboard(token, busy=busy)))
         except Exception:
-            logger.warning('Could not update admin redelivery button')
+            logger.warning('Could not update admin redelivery status')
 
     async def _delete(self, message: Message, token: str) -> None:
         try:
@@ -80,14 +91,9 @@ class AlertRedelivery:
 
     async def _delete_failed(self, message: Message, token: str) -> None:
         logger.warning('Files delivered but Telegram did not delete the alert')
-        await self._keyboard(message, token)
-        await self._notice(message, 'Файлы отправлены. Не удалось удалить алерт; повторное нажатие повторит только удаление.')
-
-    async def _notice(self, message: Message, text: str) -> None:
-        try:
-            await deliver(message, lambda: message.answer(text))
-        except Exception:
-            logger.warning('Could not send admin redelivery outcome')
+        await self._status(message, token,
+            'Работа отправлена. Telegram не позволил удалить алерт. '
+            'Повторное нажатие повторит только удаление, без отправки файлов.')
 
     async def handle(self, callback: CallbackQuery) -> None:
         message = callback.message
@@ -123,10 +129,11 @@ class AlertRedelivery:
                 await self._delete(message, token)
                 return
             await self._answer(callback, 'Начинаю повторную загрузку.')
-            await self._keyboard(message, token, busy=True)
+            await self._status(message, token, 'Повторная отправка выполняется…', busy=True)
             request = claim.request
             target = Message(message_id=0, date=datetime.now(timezone.utc),
-                from_user=User(id=request.user_id, is_bot=False, first_name='User'),
+                from_user=User(id=request.user_id, is_bot=False, username=request.username or None,
+                               first_name=request.full_name or f'ID {request.user_id}'),
                 chat=Chat(id=request.chat_id, type='private' if request.chat_id > 0 else 'supergroup'),
                 text=request.url).as_(self.main_bot)
 
@@ -138,12 +145,13 @@ class AlertRedelivery:
                     await write
                     raise
 
-            await self.download(target, request, Redelivery(request.sent_formats, record_sent))
+            delivery = Redelivery(request.sent_formats, record_sent)
+            await self.download(target, request, delivery)
             if claim.request.delivered:
                 await self._delete(message, token)
             else:
-                await self._keyboard(message, token)
-                await self._notice(message, 'Не удалось отправить все файлы. Алерт сохранён; можно повторить попытку.')
+                reason = delivery.failure or 'Не все файлы удалось доставить. Можно повторить попытку.'
+                await self._status(message, token, 'Не удалось отправить работу.\n' + reason)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -151,8 +159,8 @@ class AlertRedelivery:
             if claim is not None and claim.request.delivered:
                 await self._delete(message, token)
             else:
-                await self._keyboard(message, token)
-                await self._notice(message, 'Повторная отправка не удалась. Алерт сохранён.')
+                await self._status(message, token,
+                    'Не удалось отправить работу. Временный сбой при повторной загрузке. Можно повторить попытку.')
         finally:
             try:
                 if claim is not None:

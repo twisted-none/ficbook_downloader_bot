@@ -103,6 +103,29 @@ class AlertRetryStorageTests(unittest.TestCase):
         claim = self.claim(self.create(chapter_numbers=None))
         self.assertIsNone(claim.request.chapter_numbers)
 
+    def test_identity_survives_restart(self):
+        token = self.create(username='reader', full_name='Имя Читателя')
+        restarted = AnalyticsStore(self.dsn)
+        self.addCleanup(restarted.close)
+        claim = restarted.alert_retries.claim(token, 123456, 9, 12)
+        self.addCleanup(claim.close)
+        self.assertEqual(claim.request.username, 'reader')
+        self.assertEqual(claim.request.full_name, 'Имя Читателя')
+
+    def test_old_snapshot_uses_only_unexpired_profile(self):
+        from aiogram.types import User
+        self.analytics.record_user(User(id=101, is_bot=False, first_name='Reader', username='reader'))
+        token = self.create()
+        with self.analytics._connect() as db:
+            db.execute('UPDATE alert_retries SET username = NULL, full_name = NULL WHERE token = %s', (token,))
+        claim = self.store.claim(token, 123456, 9, 12)
+        self.assertEqual(claim.request.username, 'reader')
+        claim.close()
+        with self.analytics._connect() as db:
+            db.execute("UPDATE bot_users SET profile_expires_at = now() - interval '1 second' WHERE user_id = 101")
+        claim = self.claim(token)
+        self.assertFalse(claim.request.username)
+
     def test_expiry_is_thirty_days_and_cleanup_does_not_change_statistics(self):
         token = self.create()
         before = self.analytics.snapshot()

@@ -1,7 +1,9 @@
 """Requests compatibility for AO3 with bounded, pinned HTTPS connections."""
 
 import socket
+import ssl
 import re
+import logging
 from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -14,9 +16,9 @@ from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
 from urllib3.connection import HTTPSConnection
 from urllib3.connectionpool import HTTPSConnectionPool
-from urllib3.exceptions import NewConnectionError
+from urllib3.exceptions import NewConnectionError, ProtocolError, TimeoutError as UrllibTimeoutError
 
-from src.core.limits import (ResponseLimitError, check_deadline, current_limits,
+from src.core.limits import (ResponseLimitError, bounded_sleep, check_deadline, current_limits,
                              read_bounded, request_timeout)
 from src.sources.fanficfare_http import SafeFanficFareFetcher
 from src.sources.ao3 import require_available_work
@@ -26,6 +28,24 @@ from src.sources.safe_http import (DeadlineHTTPResponse, UnsafeRequestError,
 
 
 HOSTS = frozenset({'archiveofourown.org', 'www.archiveofourown.org', 'download.archiveofourown.org'})
+TRANSIENT_CODES = frozenset({408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525})
+logger = logging.getLogger(__name__)
+
+
+def is_transient_ao3_error(error: Exception) -> bool:
+    if (isinstance(error, (UnsafeRequestError, requests.exceptions.SSLError, ssl.SSLError))
+            or isinstance(error, URLError) and isinstance(error.reason, ssl.SSLError)):
+        return False
+    if isinstance(error, (HTTPErrorFFF, HTTPError)):
+        return getattr(error, 'status_code', getattr(error, 'code', None)) in TRANSIENT_CODES
+    return isinstance(error, (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError,
+                             requests.exceptions.ContentDecodingError, ProtocolError, UrllibTimeoutError,
+                             URLError, TimeoutError, ConnectionError))
+
+
+def _failure_summary(transport: str, error: Exception) -> str:
+    code = getattr(error, 'status_code', getattr(error, 'code', None))
+    return f'{transport}:HTTP {code}' if isinstance(code, int) else f'{transport}:{type(error).__name__}'
 
 
 def _browser_failure(error: Exception) -> bool:
@@ -34,7 +54,7 @@ def _browser_failure(error: Exception) -> bool:
     if not isinstance(error, HTTPErrorFFF):
         return False
     return error.status_code == 525 or (error.status_code == 403 and any(
-        marker in repr(error).lower() for marker in ('shields are up', 'cloudflare', 'challenge-platform')
+        marker in repr(error).lower() for marker in ('shields are up', 'not a robot', 'cloudflare', 'challenge-platform')
     ))
 
 
@@ -186,42 +206,62 @@ class AO3RequestsFetcher(RequestsFetcher):
         probe = (urlunsplit(parts._replace(path=parts.path.removesuffix('/navigate'), query='view_adult=true'))
                  if (method == 'GET' and parameters is None and json is None
                      and re.fullmatch(r'/works/\d+/navigate', parts.path)) else None)
-        try:
-            result = self._request_page(method, url, headers=headers, parameters=parameters, json=json)
-        except HTTPErrorFFF as exc:
-            if probe and _browser_failure(exc):
-                # A failed chapter index must not hide AO3's real access notice.
-                try:
-                    response = self._request_page('GET', probe, headers=headers)
-                    require_available_work(response.content)
-                except (HTTPErrorFFF, requests.RequestException):
-                    pass
-            raise
+        result = self._request_page(method, url, headers=headers, parameters=parameters, json=json, probe=probe)
         if probe and result.redirecturl and urlsplit(result.redirecturl).path in {'', '/'}:
             # AO3 sends unrevealed work indexes home; FFF mistakes home for a login wall.
-            response = self._request_page('GET', probe, headers=headers)
+            response = self._request_page('GET', probe, headers=headers, attempts=1)
             require_available_work(response.content)
         if method == 'GET':
             require_available_work(result.content)
         return result
 
-    def _request_page(self, method, url, headers=None, parameters=None, json=None):
-        try:
+    def _request_page(self, method, url, headers=None, parameters=None, json=None, *, probe=None, attempts=3):
+        replay = (method == 'GET' and parameters is None and json is None
+                  and re.match(r'^/(?:works|downloads)/', urlsplit(url).path))
+        if not replay:
             return super().request(method, url, headers=headers, parameters=parameters, json=json)
-        except (HTTPErrorFFF, requests.Timeout, requests.ConnectionError) as error:
-            if (method != 'GET' or parameters is not None or json is not None or not _browser_failure(error)
-                    or not re.match(r'^/(?:works|downloads)/', urlsplit(url).path)):
-                raise
-            # This client receives no account, cookies, request headers or POST body.
-            browser = BrowserCollectionClient(
-                lambda target: require_https_url(target, HOSTS), allowed_hosts=HOSTS, timeout_seconds=25,
-            )
-            try:
-                content, target = browser.fetch(url)
-                return FetcherResponse(content, target)
-            except (HTTPError, URLError) as fallback_error:
-                if isinstance(fallback_error, HTTPError):
-                    fallback_error.close()
-                raise error from None
-            finally:
+        first_error = None
+        failures = []
+        browser = None
+        try:
+            for attempt in range(attempts):
+                check_deadline()
+                if attempt:
+                    bounded_sleep(attempt)
+                # All transports and the optional access probe share three attempts.
+                public = attempt == 1 and _browser_failure(first_error)
+                access_probe = (attempt == 2 and probe and isinstance(first_error, HTTPErrorFFF)
+                                and first_error.status_code == 403)
+                transport = 'public' if public else 'access-probe' if access_probe else 'requests'
+                try:
+                    if public:
+                        # Do not forward account headers, cookies or request bodies.
+                        browser = BrowserCollectionClient(
+                            lambda target: require_https_url(target, HOSTS), allowed_hosts=HOSTS, timeout_seconds=25)
+                        content, target = browser.fetch(url)
+                        return FetcherResponse(content, target)
+                    response = super().request('GET', probe if access_probe else url, headers=headers)
+                    if not access_probe:
+                        return response
+                    require_available_work(response.content)
+                    break
+                except (HTTPErrorFFF, requests.RequestException, URLError, TimeoutError, ConnectionError,
+                        ProtocolError, UrllibTimeoutError) as error:
+                    failures.append(_failure_summary(transport, error))
+                    if isinstance(error, HTTPError):
+                        error.close()
+                    if first_error is None:
+                        first_error = error
+                    if not is_transient_ao3_error(error) and not _browser_failure(error):
+                        if attempt == 0:
+                            raise
+                        break
+            first_error.ao3_retry_exhausted = True
+            first_error.ao3_failures = tuple(failures)
+            identity = re.search(r'/(?:works|downloads)/(\d+)', urlsplit(url).path)
+            logger.warning('AO3 recovery exhausted for work %s: %s',
+                           identity.group(1) if identity else 'unknown', '; '.join(failures))
+            raise first_error from None
+        finally:
+            if browser is not None:
                 browser.close()
