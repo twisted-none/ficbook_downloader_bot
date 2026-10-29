@@ -3,6 +3,7 @@ services:
     build: .
     container_name: ficbook-bot
     restart: unless-stopped
+    stop_grace_period: 2m
     env_file:
       - .env
     environment:
@@ -16,9 +17,10 @@ services:
       - "${METRICS_HOST_PORT:-18000}:${METRICS_PORT:-8000}"
     volumes:
       - /srv/projects/data/ficbook_downloader_bot/app-data:/app/data
+    extra_hosts:
+      - "janitor_characters_bot=host-gateway"
     networks:
       - default
-      - bot-alerts
       - ao3-browser
 
   ao3-browser:
@@ -46,6 +48,3 @@ networks:
   ao3-browser:
     internal: true
   ao3-egress:
-  bot-alerts:
-    name: bot-alerts
-    external: true

@@ -389,6 +389,7 @@ class AlertSnapshotTests(unittest.IsolatedAsyncioTestCase):
                                 RuntimeError('Error'), expected=False, retry_store=store, formats=('epub',))
         sender.send_message.assert_awaited_once()
         self.assertNotIn('reply_markup', sender.send_message.await_args.kwargs)
+        self.assertIn('не удалось сохранить задание', sender.send_message.await_args.args[1])
 
 
 class DualPollingTests(unittest.IsolatedAsyncioTestCase):

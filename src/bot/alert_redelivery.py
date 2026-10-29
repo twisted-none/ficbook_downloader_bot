@@ -217,10 +217,30 @@ async def poll_bots(dispatcher: Dispatcher, bot: Bot, redelivery: AlertRedeliver
         for task in done:
             await task
     finally:
-        for poller, task in zip(pollers, tasks):
-            if not task.done():
-                try:
-                    await poller.stop_polling()
-                except RuntimeError:
-                    task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        async def stop_and_drain():
+            for poller, task in zip(pollers, tasks):
+                if not task.done():
+                    try:
+                        await poller.stop_polling()
+                    except Exception as error:
+                        logger.warning('Polling stop failed; cancelling poller type=%s', type(error).__name__)
+                        task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # aiogram 3.31 stops polling without awaiting its per-update tasks.
+            # Drain both dispatchers while the executors, DB and Bot sessions still exist.
+            handlers = {handler for poller in pollers
+                        for handler in getattr(poller, '_handle_update_tasks', ()) if not handler.done()}
+            for handler in handlers:
+                handler.cancel()
+            await asyncio.gather(*handlers, return_exceptions=True)
+
+        shutdown = asyncio.create_task(stop_and_drain())
+        interrupted = False
+        while not shutdown.done():
+            try:
+                await asyncio.shield(shutdown)
+            except asyncio.CancelledError:
+                interrupted = True
+        shutdown.result()
+        if interrupted:
+            raise asyncio.CancelledError

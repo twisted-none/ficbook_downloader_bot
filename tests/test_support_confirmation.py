@@ -24,7 +24,8 @@ class SupportConfirmationTests(unittest.IsolatedAsyncioTestCase):
             from_user=SimpleNamespace(id=10), answer=AsyncMock(return_value=self.prompt),
         )
         self.dependencies = dict(ficbook_client=object(), admin_chat_id=100, alert_bot=None,
-                                 analytics_store=object(), download_queues=object(), premium_queue_user_ids=frozenset())
+                                 analytics_store=SimpleNamespace(alert_retries=object()),
+                                 download_queues=object(), premium_queue_user_ids=frozenset())
 
     def tearDown(self):
         app._support_waiting.clear()
@@ -96,7 +97,8 @@ class SupportConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 if select_chapters:
                     select.assert_awaited_once_with(self.message, self.dependencies["ficbook_client"], 100, None,
                                                    target, ("txt",), False, self.dependencies['download_queues'],
-                                                   initial_status=self.message.answer.return_value)
+                                                   initial_status=self.message.answer.return_value,
+                                                   retry_store=self.dependencies['analytics_store'].alert_retries)
                     download.assert_not_awaited()
                 else:
                     self.assertEqual(download.call_args.args[6:8], (target, ("txt",)))
@@ -206,7 +208,8 @@ class SupportConfirmationTests(unittest.IsolatedAsyncioTestCase):
             await app.on_support_decision(self.callback("download"), **self.dependencies)
             select.assert_awaited_once_with(self.message, self.dependencies["ficbook_client"], 100, None,
                                           "https://ficbook.net/readfic/123", ("epub",), False,
-                                  self.dependencies['download_queues'], initial_status=self.message.answer.return_value)
+                                  self.dependencies['download_queues'], initial_status=self.message.answer.return_value,
+                                  retry_store=self.dependencies['analytics_store'].alert_retries)
             download.assert_not_awaited()
 
     async def test_foreign_user_and_old_buttons_cannot_consume_new_request(self):

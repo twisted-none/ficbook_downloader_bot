@@ -916,6 +916,7 @@ async def on_link(
             cover_enabled,
             download_queues,
             initial_status=initial_status,
+            retry_store=getattr(analytics_store, 'alert_retries', None),
         )
         return
     await _process_download(
@@ -950,6 +951,7 @@ async def _ask_chapter_selection(
     download_queues: DownloadQueuePool | None = None,
     *,
     initial_status: Message | None = None,
+    retry_store: AlertRetryStore | None = None,
 ) -> None:
     if initial_status is not None:
         try:
@@ -1008,7 +1010,8 @@ async def _ask_chapter_selection(
         )
         return
     except FicbookError as exc:
-        await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=True)
+        await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=True,
+                            retry_store=retry_store, formats=formats, cover_enabled=cover_enabled)
         await _replace_status_with_error(
             message,
             status,
@@ -1018,7 +1021,8 @@ async def _ask_chapter_selection(
         return
     except Exception as exc:
         logger.exception("Unexpected error while previewing Ficbook chapters")
-        await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False)
+        await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False,
+                            retry_store=retry_store, formats=formats, cover_enabled=cover_enabled)
         await _replace_status_with_error(message, status, admin_chat_id, _developer_error_text())
         return
     finally:
@@ -2181,8 +2185,10 @@ async def _notify_admin(
                 bot_id=sender.id, admin_chat_id=admin_chat_id,
                 username=user.username or '', full_name=user.full_name or '',
             )
-        except Exception:
-            logger.warning('Could not save admin redelivery request; sending alert without button')
+        except Exception as snapshot_error:
+            logger.warning('Could not save admin redelivery request; sending alert without button type=%s',
+                           type(snapshot_error).__name__)
+            text += '\n\nПовторная отправка недоступна: не удалось сохранить задание. Проверь логи бота.'
     try:
         kwargs = {'reply_markup': retry_keyboard(token)} if token else {}
         alert = await sender.send_message(admin_chat_id, text, **kwargs)
