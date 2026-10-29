@@ -6,10 +6,53 @@ from fanficfare.exceptions import HTTPErrorFFF
 from fanficfare.fetchers.base_fetcher import FetcherResponse
 
 MAINTENANCE = b'<html><title>Down for Maintenance | Archive of Our Own</title><div id="main"><h2>Error 503</h2><p>AO3 is temporarily down for maintenance.</p></div></html>'
+DENIED_MAINTENANCE = b'<html><title>Request temporarily denied. | Archive of Our Own</title><h1>Archive of Our Own</h1><h2>The archive is down for maintenance.</h2></html>'
 URL = 'https://archiveofourown.org/works/1'
 
 
 class MaintenanceRecognitionTests(unittest.TestCase):
+    def test_maintenance_error_body_is_checked_regardless_of_http_code(self):
+        from src.sources.ficbook import FicbookClient, AO3SiteUnavailableError
+        for method in ('download', 'preview'):
+            for code in (403, 404, 418, 429, 500, 503):
+                with self.subTest(method=method, code=code), \
+                        patch('fanficfare.fetchers.RequestsFetcher.request',
+                              side_effect=HTTPErrorFFF(URL, code, 'Denied', DENIED_MAINTENANCE)) as send, \
+                        patch('src.sources.ficbook.FicbookClient._ao3_browser_recovery') as browser, \
+                        self.assertRaises(AO3SiteUnavailableError):
+                    getattr(FicbookClient(), method)(URL)
+                self.assertEqual(send.call_count, 1)
+                browser.assert_not_called()
+
+    def test_public_transport_418_maintenance_is_detected_and_response_closed(self):
+        import io
+        from urllib.error import HTTPError
+        from src.sources.ao3_status import AO3MaintenanceError
+        from src.sources.ficbook import FicbookClient, FicbookAccount
+        fetcher = FicbookClient()._build_config(URL, FicbookAccount()).get_fetcher()
+        body = io.BytesIO(DENIED_MAINTENANCE)
+        error = HTTPError(URL, 418, 'Denied', {}, body)
+        with patch('fanficfare.fetchers.RequestsFetcher.request',
+                   side_effect=HTTPErrorFFF(URL, 525, 'TLS failure', b'')) as send, \
+                patch('src.sources.ao3_http.bounded_sleep'), \
+                patch('src.sources.ao3_http.BrowserCollectionClient') as browser, \
+                self.assertRaises(AO3MaintenanceError):
+            browser.return_value.fetch.side_effect = error
+            fetcher.request('GET', URL)
+        self.assertEqual(send.call_count, 1)
+        self.assertTrue(body.closed)
+        browser.return_value.close.assert_called_once()
+
+    def test_ordinary_denials_are_not_reported_as_maintenance(self):
+        from src.sources.ficbook import FicbookClient, FicbookError, AO3SiteUnavailableError
+        for code in (403, 404, 418, 429):
+            with self.subTest(code=code), \
+                    patch('fanficfare.fetchers.RequestsFetcher.request',
+                          side_effect=HTTPErrorFFF(URL, code, 'Denied', b'<h1>Request denied</h1>')), \
+                    self.assertRaises(FicbookError) as caught:
+                FicbookClient().download(URL)
+            self.assertNotIsInstance(caught.exception, AO3SiteUnavailableError)
+
     def test_browser_can_confirm_recovery_when_plain_http_is_challenged(self):
         from src.sources.ao3_status import AO3SiteStatus, probe_status
         with patch.dict('os.environ', {'AO3_BROWSER_URL': 'http://ao3-browser:8000'}), \
@@ -188,6 +231,42 @@ class MaintenanceFlowTests(unittest.IsolatedAsyncioTestCase):
         notify.assert_not_awaited()
         self.assertFalse(queues.is_site_unavailable('archiveofourown.org'))
         self.assertIsNone(queues.ao3_recovery.task)
+
+    async def test_admin_retry_waits_for_recovery_without_sending_user_statuses(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, call
+        from src.bot import app
+        from src.bot.alert_redelivery import Redelivery
+        from src.core.download_queue import DownloadQueuePool
+        from src.core.models import Story
+        from src.sources.ficbook import AO3SiteUnavailableError
+        from src.sources.ao3_status import AO3SiteStatus
+        from tests.test_download_status_flow import IncomingMessage
+        queues = DownloadQueuePool()
+        queues.ao3_recovery.interval = 0.001
+        client = SimpleNamespace(download=Mock(side_effect=[AO3SiteUnavailableError('maintenance'),
+                                                           Story('Book', 'Writer', URL)]))
+        message = IncomingMessage()
+        delivery = Redelivery((), AsyncMock())
+        with patch.object(app, '_start_download', AsyncMock()), \
+                patch.object(app, '_finish_download', AsyncMock()), \
+                patch.object(app, '_notify_admin', AsyncMock()) as notify, \
+                patch.object(app, '_build_selected_files', AsyncMock(
+                    return_value=[('epub', b'epub'), ('fb2', b'fb2')])), \
+                patch.object(app.ChatActionSender, 'upload_document') as action, \
+                patch.object(app, 'probe_ao3_status', Mock(return_value=AO3SiteStatus.AVAILABLE)):
+            result = await app._process_download(message, client, None, None, object(), queues,
+                URL, ('epub', 'fb2'), frozenset(), chapter_numbers={2}, redelivery=delivery)
+        self.assertTrue(result)
+        self.assertEqual(client.download.call_count, 2)
+        self.assertEqual(client.download.call_args.kwargs['chapter_numbers'], {2})
+        self.assertEqual(message.statuses, [])
+        self.assertEqual(len(message.documents), 2)
+        self.assertEqual(message.documents[-1]['caption'], delivery.notice)
+        self.assertEqual(delivery.record_sent.await_args_list, [call('epub'), call('fb2')])
+        self.assertEqual(delivery.failure, '')
+        notify.assert_not_awaited()
+        action.assert_not_called()
 
     async def test_preview_waits_for_recovery_and_does_not_raise_an_alert(self):
         from types import SimpleNamespace

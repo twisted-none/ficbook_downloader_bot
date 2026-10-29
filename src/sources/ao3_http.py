@@ -250,14 +250,15 @@ class AO3RequestsFetcher(RequestsFetcher):
                     break
                 except (HTTPErrorFFF, requests.RequestException, URLError, TimeoutError, ConnectionError,
                         ProtocolError, UrllibTimeoutError) as error:
-                    if getattr(error, 'status_code', getattr(error, 'code', None)) in {500, 502, 503, 504}:
-                        if isinstance(error, HTTPError):
-                            try:
-                                require_no_maintenance(read_bounded(error))
-                            finally:
-                                error.close()
-                        else:
-                            require_no_maintenance(getattr(error, 'data', None) or b'')
+                    # AO3 also serves its maintenance page with HTTP 418 (and other codes).
+                    # Classify the body before retry, access-denied or not-found handling.
+                    if isinstance(error, HTTPError):
+                        try:
+                            require_no_maintenance(read_bounded(error))
+                        finally:
+                            error.close()
+                    else:
+                        require_no_maintenance(getattr(error, 'data', None) or b'')
                     failures.append(_failure_summary(transport, error))
                     if isinstance(error, HTTPError):
                         error.close()
