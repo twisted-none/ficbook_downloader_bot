@@ -118,6 +118,25 @@ class MaintenanceRecognitionTests(unittest.TestCase):
 
 
 class RecoveryMonitorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_status_stays_waiting_despite_late_worker_update(self):
+        from src.bot import app
+        from src.core.download_queue import DownloadQueuePool
+        from tests.test_progress_message import SuccessfulProgressMessage
+        message = SuccessfulProgressMessage()
+        progress = app.ProgressMessage(message, min_interval=0)
+        queues = DownloadQueuePool()
+
+        async def wait(_):
+            self.assertIn('AO3 сейчас на техническом обслуживании', message.texts[-1])
+            await asyncio.wrap_future(progress.from_thread('Скачиваю описание', force=True))
+            self.assertIn('AO3 сейчас на техническом обслуживании', message.texts[-1])
+
+        with patch.object(queues.ao3_recovery, 'wait', side_effect=wait):
+            await app._wait_for_ao3_recovery(queues, progress, ('epub',))
+        await asyncio.wrap_future(progress.from_thread('Скачиваю главы', force=True))
+        self.assertEqual(message.texts[-1], 'Скачиваю главы')
+        await progress.close()
+
     async def test_idle_monitor_does_not_create_a_task(self):
         from src.core.site_recovery import SiteRecovery
         monitor = SiteRecovery()
@@ -184,7 +203,8 @@ class MaintenanceFlowTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await asyncio.Event().wait()
         queues.ao3_recovery.sleep = sleep
-        task = asyncio.create_task(app._wait_for_ao3_recovery(queues, SimpleNamespace(set=AsyncMock()), ('epub',)))
+        task = asyncio.create_task(app._wait_for_ao3_recovery(
+            queues, SimpleNamespace(start_phase=AsyncMock()), ('epub',)))
         await entered.wait()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

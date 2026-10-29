@@ -4,6 +4,7 @@ import unittest
 import asyncio
 from time import monotonic
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.methods import EditMessageText
@@ -64,6 +65,40 @@ class TimedProgressMessage:
 
 
 class ProgressMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_waiting_phase_discards_queued_and_late_thread_progress(self) -> None:
+        message = SuccessfulProgressMessage()
+        progress = ProgressMessage(message, min_interval=0)
+        queued = progress.from_thread('Скачиваю описание')
+        await progress.start_phase('AO3 на техработах', thread_updates=False)
+        await asyncio.wrap_future(queued)
+        await asyncio.wrap_future(progress.from_thread('Поздний прогресс', force=True))
+        self.assertEqual(message.texts, ['AO3 на техработах'])
+        await progress.start_phase('Возобновляю загрузку')
+        await asyncio.wrap_future(progress.from_thread('Скачиваю главы'))
+        self.assertEqual(message.texts[-2:], ['Возобновляю загрузку', 'Скачиваю главы'])
+        await progress.close()
+
+    async def test_waiting_status_retries_after_telegram_network_error(self) -> None:
+        from aiogram.exceptions import TelegramNetworkError
+        message = SuccessfulProgressMessage()
+        progress = ProgressMessage(message, min_interval=0)
+        attempts = []
+
+        async def edit(_, text):
+            attempts.append(text)
+            if len(attempts) == 1:
+                raise TelegramNetworkError(method=EditMessageText(chat_id=1, message_id=1, text=text),
+                                           message='Temporary connection failure')
+            await message.edit_text(text)
+
+        with patch('src.bot.app._telegram_edit_gate.edit', side_effect=edit), \
+                patch('src.bot.app.TELEGRAM_SEND_RETRY_DELAY_SECONDS', 0.01):
+            await progress.start_phase('AO3 на техработах', thread_updates=False)
+            await asyncio.sleep(0.1)
+        self.assertEqual(attempts, ['AO3 на техработах', 'AO3 на техработах'])
+        self.assertEqual(message.texts, ['AO3 на техработах'])
+        await progress.close()
+
     async def test_chat_edit_gate_serializes_parallel_edits(self) -> None:
         gate = TelegramEditGate(min_interval=0.02)
         first = TimedProgressMessage(1)

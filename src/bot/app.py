@@ -199,10 +199,20 @@ class ProgressMessage:
         self._pending_force = False
         self._pending_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._phase = 0
+        self._thread_phase = 0
 
-    async def set(self, text: str, *, force: bool = False) -> None:
+    async def start_phase(self, text: str, *, thread_updates: bool = True) -> None:
         async with self._lock:
-            if self._closed:
+            self._phase += 1
+            phase = self._phase
+            self._thread_phase = phase if thread_updates else -1
+            self._clear_pending_locked()
+        await self.set(text, force=True, _phase=phase)
+
+    async def set(self, text: str, *, force: bool = False, _phase: int | None = None) -> None:
+        async with self._lock:
+            if self._closed or (_phase is not None and _phase != self._phase):
                 return
             job = current_job.get()
             if job is not None:
@@ -300,7 +310,9 @@ class ProgressMessage:
             await asyncio.sleep(max(0.05, delay))
 
     def from_thread(self, text: str, *, force: bool = False) -> Future[None]:
-        return asyncio.run_coroutine_threadsafe(self.set(text, force=force), self._loop)
+        # Capture the phase before scheduling: an old callback may run after maintenance starts.
+        phase = self._thread_phase
+        return asyncio.run_coroutine_threadsafe(self.set(text, force=force, _phase=phase), self._loop)
 
     async def close(self) -> None:
         async with self._lock:
@@ -329,11 +341,12 @@ class ProgressMessage:
         async with self._lock:
             text = self._pending_text
             force = self._pending_force
+            phase = self._phase
             self._pending_text = ""
             self._pending_force = False
             self._pending_task = None
         if text:
-            await self.set(text, force=force)
+            await self.set(text, force=force, _phase=phase)
 
 
 class DownloadProgressState:
@@ -1680,7 +1693,7 @@ async def _answer_document_with_retry(
 
 async def _wait_for_ao3_recovery(queues, progress, formats, *, state=None):
     waiting = _queue_status(formats, 1, 0, ao3_maintenance=True)
-    await progress.set(state.with_identity(waiting) if state else waiting, force=True)
+    await progress.start_phase(state.with_identity(waiting) if state else waiting, thread_updates=False)
 
     async def probe():
         result = await run_worker(probe_ao3_status)
@@ -1695,7 +1708,7 @@ async def _wait_for_ao3_recovery(queues, progress, formats, *, state=None):
     finally:
         await queues.clear_idle_ao3_outage()
     active = _active_download_status(formats, 0)
-    await progress.set(state.with_identity(active) if state else active, force=True)
+    await progress.start_phase(state.with_identity(active) if state else active)
 
 
 async def _wait_for_ficbook_recovery(
