@@ -91,6 +91,19 @@ def bounded_operation(function):
     return wrapped
 
 
+@contextmanager
+def suspend_deadline():
+    budget = _budget.get()
+    started = monotonic()
+    token = _budget.set(None)
+    try:
+        yield
+    finally:
+        _budget.reset(token)
+        if budget is not None and budget.deadline > 0:
+            budget.deadline += monotonic() - started
+
+
 def bounded_async_operation(function):
     @wraps(function)
     async def wrapped(*args, **kwargs):

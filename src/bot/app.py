@@ -97,11 +97,13 @@ from src.sources.ficbook import (
     FicbookRateLimitError,
     FicbookSiteStatus,
     FicbookSiteUnavailableError,
+    AO3SiteUnavailableError,
 )
+from src.sources.ao3_status import AO3SiteStatus, probe_status as probe_ao3_status
 from src.exporters.formats import ALLOWED_FORMATS, build_docx, build_pdf, build_txt, normalize_formats
 from src.sources.share_links import ShareLinkError, extract_download_url, is_google_share_url, resolve_share_url
 from src.sources.collections import CollectionError, FicbookCollection
-from src.sources.registry import is_ficbook_collection_url
+from src.sources.registry import is_ficbook_collection_url, site_key
 from src.monitoring.metrics import run_metrics_server
 from src.storage.retention import run_history_retention
 from src.core.models import Story, StoryPreview
@@ -966,8 +968,17 @@ async def _ask_chapter_selection(
     progress = ProgressMessage(status)
     try:
         queues = download_queues or DownloadQueuePool()
+        async def preview_job():
+            while True:
+                if site_key(url) == 'archiveofourown.org' and queues.is_site_unavailable('archiveofourown.org'):
+                    await _wait_for_ao3_recovery(queues, progress, formats)
+                try:
+                    return await run_worker(ficbook_client.preview, url, progress.from_thread)
+                except AO3SiteUnavailableError:
+                    queues.mark_site_unavailable('archiveofourown.org')
+                    await _wait_for_ao3_recovery(queues, progress, formats)
         preview = await queues.run_preview(
-            lambda: run_worker(ficbook_client.preview, url, progress.from_thread),
+            preview_job,
             user_id=message.from_user.id if message.from_user else None,
         )
     except (ResourceLimitError, QueueFullError) as exc:
@@ -1341,6 +1352,8 @@ async def _process_download_impl(
                         current.ficbook_slot is not None
                         and download_queues.is_site_unavailable("ficbook.net")
                     ),
+                    ao3_maintenance=(current.key == 'archiveofourown.org'
+                                     and download_queues.is_site_unavailable(current.key)),
                 )
                 text = progress_state.with_identity(text)
                 if status is None or progress is None:
@@ -1369,6 +1382,10 @@ async def _process_download_impl(
                 active_progress = progress
                 while True:
                     site_unavailable = False
+                    ao3_maintenance = False
+                    if current.key == 'archiveofourown.org' and download_queues.is_site_unavailable(current.key):
+                        await _wait_for_ao3_recovery(download_queues, active_progress, formats, state=progress_state)
+                        progress_state.start_attempt()
 
                     def observe_progress(text: str) -> None:
                         progress_state.observe(text)
@@ -1396,6 +1413,10 @@ async def _process_download_impl(
                                 chapter_numbers=chapter_numbers,
                                 account=current.account,
                             )
+                    except AO3SiteUnavailableError:
+                        if current.key != 'archiveofourown.org':
+                            raise
+                        ao3_maintenance = True
                     except FicbookSiteUnavailableError:
                         if current.ficbook_slot is None:
                             raise
@@ -1403,6 +1424,11 @@ async def _process_download_impl(
                     finally:
                         updater.cancel()
                         await asyncio.gather(updater, return_exceptions=True)
+                    if ao3_maintenance:
+                        download_queues.mark_site_unavailable(current.key)
+                        await _wait_for_ao3_recovery(download_queues, active_progress, formats, state=progress_state)
+                        progress_state.start_attempt()
+                        continue
                     if not site_unavailable:
                         if current.ficbook_slot is not None:
                             download_queues.mark_site_available("ficbook.net")
@@ -1563,6 +1589,8 @@ async def _process_download_impl(
     finally:
         if progress is not None:
             await progress.close()
+        if site_key(url) == 'archiveofourown.org':
+            await download_queues.clear_idle_ao3_outage()
     return False
 
 
@@ -1644,6 +1672,26 @@ async def _answer_document_with_retry(
             )
             if not isinstance(exc, TelegramRetryAfter):
                 await asyncio.sleep(TELEGRAM_SEND_RETRY_DELAY_SECONDS)
+
+
+async def _wait_for_ao3_recovery(queues, progress, formats, *, state=None):
+    waiting = _queue_status(formats, 1, 0, ao3_maintenance=True)
+    await progress.set(state.with_identity(waiting) if state else waiting, force=True)
+
+    async def probe():
+        result = await run_worker(probe_ao3_status)
+        logger.info('ao3_recovery_probe status=%s', result.value)
+        if result is AO3SiteStatus.AVAILABLE:
+            queues.mark_site_available('archiveofourown.org')
+            return True
+        return False
+
+    try:
+        await queues.ao3_recovery.wait(probe)
+    finally:
+        await queues.clear_idle_ao3_outage()
+    active = _active_download_status(formats, 0)
+    await progress.set(state.with_identity(active) if state else active, force=True)
 
 
 async def _wait_for_ficbook_recovery(

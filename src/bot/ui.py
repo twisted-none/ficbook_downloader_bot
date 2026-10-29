@@ -226,7 +226,17 @@ def queue_status(
     estimated_wait: float,
     *,
     ficbook_unavailable: bool = False,
+    ao3_maintenance: bool = False,
 ) -> str:
+    if ao3_maintenance:
+        return progress_text('\n'.join([
+            f'Место в очереди: {position}.',
+            'Примерное ожидание: до восстановления AO3.', '',
+            'AO3 сейчас на техническом обслуживании.',
+            'Загрузка продолжится автоматически после восстановления сайта.',
+            'Проверяю доступность каждые 5 минут.', '',
+            f'Форматы: {format_list(formats)}.',
+        ]), 0)
     wait_line = (
         "Примерное ожидание: до восстановления Ficbook."
         if ficbook_unavailable

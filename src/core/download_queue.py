@@ -9,6 +9,7 @@ from threading import Lock
 from typing import Any, TypeVar
 
 from src.sources.registry import site_key
+from src.core.site_recovery import SiteRecovery
 
 T = TypeVar("T")
 JOB_SECONDS = 120.0
@@ -351,6 +352,7 @@ class DownloadQueuePool:
         self._assignment_lock = Lock()
         self._site_state_lock = Lock()
         self._unavailable_sites: set[str] = set()
+        self.ao3_recovery = SiteRecovery(interval=300)
 
     def assign(self, url: str) -> QueueAssignment:
         key = site_key(url)
@@ -400,6 +402,13 @@ class DownloadQueuePool:
     def mark_site_unavailable(self, key: str) -> None:
         with self._site_state_lock:
             self._unavailable_sites.add(key)
+
+    async def clear_idle_ao3_outage(self) -> None:
+        queue = self._site_queues.get('archiveofourown.org')
+        jobs = await queue.total_jobs() if queue else 0
+        if jobs == 0 and self.ao3_recovery.waiters == 0:
+            # A later, unrelated submission must check its page immediately.
+            self.mark_site_available('archiveofourown.org')
 
     def mark_site_available(self, key: str) -> None:
         with self._site_state_lock:

@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup, Tag
 
 from src.core.models import Chapter
 from src.core.limits import ResourceLimitError, ResponseLimitError
+from src.sources.ao3_status import AO3MaintenanceError
 
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ def download_html_chapters(
 ) -> list[Chapter] | None:
     try:
         page = adapter.get_request(adapter.url + adapter.addurl)
-    except ResourceLimitError:
+    except (ResourceLimitError, AO3MaintenanceError):
         raise
     except Exception as exc:
         logger.info('AO3 download menu unavailable (%s); using chapter loader', type(exc).__name__)
@@ -141,7 +142,7 @@ def download_html_chapters(
     except ResponseLimitError:
         logger.info('AO3 HTML export exceeds response limit; using chapter loader')
         return None
-    except ResourceLimitError:
+    except (ResourceLimitError, AO3MaintenanceError):
         raise
     except Exception as exc:
         logger.info('AO3 HTML download unavailable (%s); using chapter loader', type(exc).__name__)

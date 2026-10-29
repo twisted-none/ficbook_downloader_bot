@@ -17,6 +17,7 @@ from src.core.limits import (ResourceLimitError, check_chapter_count, check_dead
 from src.core.models import Chapter, ChapterPreview, Story, StoryPreview
 from src.core.progress import report_title
 from src.sources.ao3 import parse_download, require_available_work
+from src.sources.ao3_status import AO3MaintenanceError, require_no_maintenance
 from src.sources.safe_http import require_https_url
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,27 @@ class _NoRedirect(HTTPRedirectHandler):
         raise BrowserDownloadError('Браузерный сервис вернул неожиданный ответ.')
 
 
+def probe_browser_status():
+    from src.sources.ao3_status import AO3SiteStatus
+    endpoint = os.getenv('AO3_BROWSER_URL', '').rstrip('/')
+    if endpoint not in {'http://ao3-browser:8000', 'http://127.0.0.1:18080'}:
+        return AO3SiteStatus.UNKNOWN
+    try:
+        with build_opener(ProxyHandler({}), _NoRedirect()).open(endpoint + '/status', timeout=request_timeout(175)) as response:
+            data = json.loads(read_bounded(response, max_bytes=4096))
+        if not isinstance(data, dict) or data.get('work_id') != 'status':
+            return AO3SiteStatus.UNKNOWN
+        if data.get('maintenance') is True:
+            return AO3SiteStatus.MAINTENANCE
+        return AO3SiteStatus.AVAILABLE if data.get('status') == 'available' else AO3SiteStatus.UNKNOWN
+    except HTTPError as error:
+        code = error.code
+        error.close()
+        return AO3SiteStatus.MAINTENANCE if code == 409 else AO3SiteStatus.UNKNOWN
+    except Exception:
+        return AO3SiteStatus.UNKNOWN
+
+
 def fetch_bundle(url: str) -> dict:
     endpoint = os.getenv('AO3_BROWSER_URL', '').rstrip('/')
     # This is a trusted internal service, never an arbitrary user URL/proxy.
@@ -75,6 +97,8 @@ def fetch_bundle(url: str) -> dict:
     except HTTPError as error:
         status = error.code
         error.close()
+        if status == 409:
+            raise AO3MaintenanceError('AO3 сейчас на техническом обслуживании.') from None
         if status == 503:
             raise BrowserDownloadError('Резервный загрузчик AO3 занят. Попробуй немного позже.') from None
         raise BrowserDownloadError('AO3 не отдал работу через резервный загрузчик. Попробуй позже.') from None
@@ -111,6 +135,7 @@ def _clean(fragment: str, origin: str) -> str:
 def parse_browser_work(url: str, bundle: dict, selected: set[int] | frozenset[int] | None) -> Story:
     origin = f'https://archiveofourown.org/works/{work_id(url)}'
     page = bundle['page']
+    require_no_maintenance(page)
     if len(page.encode()) + len(bundle['download'].encode()) > current_limits().max_response_bytes:
         raise ResourceLimitError()
     require_available_work(page.encode())

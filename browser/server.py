@@ -62,12 +62,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == '/health':
             return self.respond(200, b'{"ok":true}')
         match = re.fullmatch(r'/works/([1-9][0-9]{0,15})', self.path)
-        if match is None:
+        if match is None and self.path != '/status':
             return self.respond(404, b'{}')
         if not SLOT.acquire(blocking=False):
             return self.respond(503, b'{"error":"busy"}')
         try:
-            self.respond(200, download(match[1]))
+            payload = download('status' if self.path == '/status' else match[1])
+            self.respond(409 if json.loads(payload).get('maintenance') is True else 200, payload)
         except subprocess.TimeoutExpired:
             try:
                 self.respond(502, b'{"error":"timeout"}')

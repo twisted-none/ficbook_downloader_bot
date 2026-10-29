@@ -26,6 +26,7 @@ from fanficfare.configurable import Configuration
 from fanficfare.exceptions import HTTPErrorFFF
 
 from src.sources.ao3 import AO3WorkUnavailableError, download_html_chapters
+from src.sources.ao3_status import AO3MaintenanceError
 from src.sources.collections import FicbookCollection, load_collection
 from src.sources.fikbooks import FikbooksClient, FikbooksError, FikbooksNotFoundError, FikbooksRateLimitError
 from src.sources.zahleb import ZahlebClient, ZahlebError, ZahlebNotFoundError, ZahlebRateLimitError
@@ -146,6 +147,10 @@ class FicbookPaidContentError(FicbookError):
 
 class FicbookSiteUnavailableError(FicbookError):
     """Ficbook is serving a maintenance page instead of the normal site."""
+
+
+class AO3SiteUnavailableError(FicbookError):
+    """AO3 explicitly reports maintenance, rather than a generic HTTP failure."""
 
 
 class FicbookChapterDownloadError(FicbookError):
@@ -372,6 +377,8 @@ class FicbookClient:
             return download_browser_work(url, progress, chapter_numbers, preview=preview)
         except ResourceLimitError:
             raise
+        except AO3MaintenanceError as exc:
+            raise AO3SiteUnavailableError(str(exc)) from exc
         except AO3WorkUnavailableError as exc:
             raise FicbookError(str(exc)) from exc
         except Exception as exc:
@@ -1610,6 +1617,8 @@ def _friendly_download_error(url: str, error: Exception) -> FicbookError:
     if isinstance(error, ResourceLimitError):
         raise error
     site_name = _site_display_name(url)
+    if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3MaintenanceError):
+        return AO3SiteUnavailableError(str(error))
     if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3WorkUnavailableError):
         return FicbookError(str(error))
     if _site_key(url) == 'archiveofourown.org' and getattr(error, 'status_code', None) == 525:
@@ -1644,6 +1653,8 @@ def _ficbook_site_unavailable_error(error: Exception) -> FicbookSiteUnavailableE
 
 
 def _friendly_preview_error(url: str, error: Exception) -> FicbookError:
+    if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3MaintenanceError):
+        return AO3SiteUnavailableError(str(error))
     site_name = _site_display_name(url)
     if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3WorkUnavailableError):
         return FicbookError(str(error))

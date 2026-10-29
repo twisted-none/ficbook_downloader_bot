@@ -17,6 +17,10 @@ from browser.transport import HOSTS, allowed_url, native_transport
 MAX_BYTES = 16 * 1024 * 1024
 
 
+class Maintenance(Exception):
+    pass
+
+
 def work_document(page):
     return page.evaluate('''() => {
       const root = document.querySelector('#main');
@@ -45,7 +49,8 @@ def complete(page):
 
 
 def run(identifier):
-    origin = f'https://archiveofourown.org/works/{identifier}'
+    status_probe = identifier == 'status'
+    origin = 'https://archiveofourown.org/' if status_probe else f'https://archiveofourown.org/works/{identifier}'
     with native_transport() as proxy, Camoufox(
         executable_path='/opt/camoufox/camoufox-bin', headless=False, geoip=False,
         block_webrtc=True, exclude_addons=list(DefaultAddons), timeout=60000,
@@ -63,10 +68,11 @@ def run(identifier):
                 return handler.abort()
             parts = urlsplit(request.url)
             if request.is_navigation_request() and request.frame == page.main_frame:
-                if parts.hostname not in HOSTS - {'challenges.cloudflare.com'} or not (
+                target_allowed = (parts.path == '/' if status_probe else bool(
                     re.fullmatch(rf'/works/{identifier}(?:/navigate)?/?', parts.path)
-                    or parts.path.startswith(f'/downloads/{identifier}/') and parts.path.endswith('.html')
-                    or parts.path.startswith('/cdn-cgi/')):
+                    or parts.path.startswith(f'/downloads/{identifier}/') and parts.path.endswith('.html')))
+                if (parts.hostname not in HOSTS - {'challenges.cloudflare.com'}
+                        or not (target_allowed or parts.path.startswith('/cdn-cgi/'))):
                     return handler.abort()
             if request.method not in {'GET', 'HEAD'} and not (
                     parts.hostname == 'challenges.cloudflare.com' or parts.path.startswith('/cdn-cgi/')):
@@ -76,12 +82,28 @@ def run(identifier):
         context.route_web_socket('**/*', lambda websocket: websocket.close())
         page = context.new_page()
         page.set_default_timeout(12000)
+        page_status = 0
+        def record_status(response):
+            nonlocal page_status
+            if response.request.is_navigation_request() and response.request.frame == page.main_frame:
+                page_status = response.status
+        page.on('response', record_status)
         downloads = []
         page.on('download', lambda download: downloads.append(download))
 
         def navigate(url):
             try:
                 response = page.goto(url, wait_until='domcontentloaded', timeout=25000)
+                if page.evaluate('''() => {
+                  if (document.querySelector('#workskin, #chapters')) return false;
+                  const title = document.title.toLowerCase();
+                  const headings = [...document.querySelectorAll('h1,h2')].map(n => n.textContent).join(' ').toLowerCase();
+                  const text = (document.querySelector('#main') || document.body)?.textContent.toLowerCase().replace(/\\s+/g,' ') || '';
+                  return (title.includes('maintenance') || headings.includes('maintenance')) &&
+                    (title.includes('archive of our own') || text.includes('ao3')) &&
+                    /(?:ao3|the archive|archive of our own) (?:is )?(?:temporarily |currently )?down for (?:scheduled )?maintenance/.test(text);
+                }'''):
+                    raise Maintenance()
                 if response and response.status in {401, 404, 429}:
                     raise ValueError(f'AO3 HTTP {response.status}')
                 if response and response.status == 403 and not response.headers.get('cf-mitigated') == 'challenge':
@@ -91,6 +113,16 @@ def run(identifier):
                 if not downloads:
                     return False
             return True
+
+        if status_probe:
+            navigate(origin)
+            try:
+                page.wait_for_function("document.title.toLowerCase().startsWith('home | archive of our own') && !!document.querySelector('#main')",
+                                       timeout=12000)
+            except BrowserTimeout:
+                pass
+            available = page.evaluate("document.title.toLowerCase().startsWith('home | archive of our own') && !!document.querySelector('#main')")
+            return {'work_id': 'status', 'status': 'available' if available and page_status == 200 else 'unknown'}
 
         navigate(origin + '?view_full_work=true&view_adult=true')
         try:
@@ -139,9 +171,13 @@ def run(identifier):
 
 if __name__ == '__main__':
     identifier = sys.argv[1] if len(sys.argv) == 2 else ''
-    if not re.fullmatch(r'[1-9][0-9]{0,15}', identifier):
+    if identifier != 'status' and not re.fullmatch(r'[1-9][0-9]{0,15}', identifier):
         raise SystemExit(2)
-    result = json.dumps(run(identifier), ensure_ascii=False).encode('utf-8')
+    try:
+        bundle = run(identifier)
+    except Maintenance:
+        bundle = {'work_id': identifier, 'maintenance': True}
+    result = json.dumps(bundle, ensure_ascii=False).encode('utf-8')
     if len(result) > MAX_BYTES:
         raise SystemExit(3)
     sys.stdout.buffer.write(result)

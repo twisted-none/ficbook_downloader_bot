@@ -22,6 +22,7 @@ from src.core.limits import (ResponseLimitError, bounded_sleep, check_deadline, 
                              read_bounded, request_timeout)
 from src.sources.fanficfare_http import SafeFanficFareFetcher
 from src.sources.ao3 import require_available_work
+from src.sources.ao3_status import require_no_maintenance
 from src.sources.collection_http import BrowserCollectionClient
 from src.sources.safe_http import (DeadlineHTTPResponse, UnsafeRequestError,
                                    require_https_url, resolve_addresses)
@@ -239,14 +240,24 @@ class AO3RequestsFetcher(RequestsFetcher):
                         browser = BrowserCollectionClient(
                             lambda target: require_https_url(target, HOSTS), allowed_hosts=HOSTS, timeout_seconds=25)
                         content, target = browser.fetch(url)
+                        require_no_maintenance(content)
                         return FetcherResponse(content, target)
                     response = super().request('GET', probe if access_probe else url, headers=headers)
+                    require_no_maintenance(response.content)
                     if not access_probe:
                         return response
                     require_available_work(response.content)
                     break
                 except (HTTPErrorFFF, requests.RequestException, URLError, TimeoutError, ConnectionError,
                         ProtocolError, UrllibTimeoutError) as error:
+                    if getattr(error, 'status_code', getattr(error, 'code', None)) in {500, 502, 503, 504}:
+                        if isinstance(error, HTTPError):
+                            try:
+                                require_no_maintenance(read_bounded(error))
+                            finally:
+                                error.close()
+                        else:
+                            require_no_maintenance(getattr(error, 'data', None) or b'')
                     failures.append(_failure_summary(transport, error))
                     if isinstance(error, HTTPError):
                         error.close()
