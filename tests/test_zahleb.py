@@ -57,11 +57,16 @@ class ZahlebTests(unittest.TestCase):
     def test_unsafe_urls_are_rejected(self):
         for url in ('https://zahleb.me.evil/story/test-lBH5frx0bi',
                     'https://user@zahleb.me/story/test-lBH5frx0bi', ROOT + '/../../secret',
-                    ROOT.replace('zahleb.me', 'zahleb.me:444'), ROOT + '?next=http://127.0.0.1',
+                    ROOT.replace('zahleb.me', 'zahleb.me:444'),
                     ROOT + '/bad', ROOT + '/%2e%2e', ROOT + '\\bad', ROOT + '/a/b',
                     'https://zahleb.me/catalog'):
             with self.subTest(url=url):
                 self.assertFalse(is_supported_story_url(url))
+
+    def test_unneeded_query_is_removed_before_downloading(self):
+        client = FakeClient()
+        client.download(ROOT + '?ysclid=abc&next=http://127.0.0.1#reader')
+        self.assertEqual(client.requested, [ROOT, ROOT + '/' + FIRST, ROOT + '/' + SECOND])
 
     def test_preview_has_ordered_chapters_and_does_not_download_text(self):
         client = FakeClient()

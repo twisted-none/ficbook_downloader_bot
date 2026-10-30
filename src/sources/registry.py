@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qs, urlencode, urlsplit, urlunsplit
 
 SUPPORTED_HOST_MARKERS = (
     "ficbook.net",
@@ -24,44 +24,40 @@ ZAHLEB_PATH = re.compile(r'/story/((?:[A-Za-z0-9][A-Za-z0-9_-]{0,240}-)?([A-Za-z
                          r'(?:/([A-Za-z0-9]{10}))?/?')
 
 
-def normalize_zahleb_url(url: str) -> str:
+def _story_parts(url: str) -> SplitResult:
     if (len(url) > 4096 or '\\' in url
             or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)):
-        raise ValueError('Invalid Zahleb URL')
+        raise ValueError('Invalid story URL')
     parts = urlsplit(url)
-    match = ZAHLEB_PATH.fullmatch(parts.path)
-    tracking = {'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref'}
-    if (parts.scheme not in {'http', 'https'} or parts.hostname not in ZAHLEB_HOSTS
+    host = (parts.hostname or '').removeprefix('www.')
+    if (parts.scheme not in {'http', 'https'} or host not in SUPPORTED_HOST_MARKERS
             or parts.username is not None or parts.password is not None
-            or parts.port not in {None, 443 if parts.scheme == 'https' else 80} or match is None
-            or not set(parse_qs(parts.query, keep_blank_values=True)) <= tracking):
+            or parts.port not in {None, 443 if parts.scheme == 'https' else 80}):
+        raise ValueError('Invalid story URL')
+    return parts
+
+
+def normalize_zahleb_url(url: str) -> str:
+    parts = _story_parts(url)
+    match = ZAHLEB_PATH.fullmatch(parts.path)
+    if parts.hostname not in ZAHLEB_HOSTS or match is None:
         raise ValueError('Invalid Zahleb URL')
     return 'https://zahleb.me/story/' + match.group(1)
 
 
 def normalize_fikbooks_url(url: str) -> str:
-    if (len(url) > 4096 or '\\' in url
-            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)):
-        raise ValueError('Invalid Fikbooks URL')
-    parts = urlsplit(url)
+    parts = _story_parts(url)
     match = FIKBOOKS_PATH.fullmatch(parts.path)
-    if (parts.scheme not in {'http', 'https'} or parts.hostname not in FIKBOOKS_HOSTS
-            or parts.username is not None or parts.password is not None or parts.query
-            or parts.port not in {None, 443 if parts.scheme == 'https' else 80} or match is None):
+    if parts.hostname not in FIKBOOKS_HOSTS or match is None:
         raise ValueError('Invalid Fikbooks URL')
     return 'https://fikbooks.ru/readfic/' + match.group(1)
 
 
 def normalize_collection_url(url: str) -> str:
-    if (len(url) > 4096 or '\\' in url
-            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url)):
-        raise ValueError('Invalid collection URL')
-    parts = urlsplit(url)
+    parts = _story_parts(url)
     match = _COLLECTION_PATH.fullmatch(parts.path)
-    if (parts.scheme not in {'http', 'https'}
-            or parts.hostname not in {'ficbook.net', 'www.ficbook.net', 'ficbook.com', 'www.ficbook.com'}
-            or parts.username is not None or parts.password is not None
-            or parts.port not in {None, 443 if parts.scheme == 'https' else 80} or match is None):
+    if (parts.hostname not in {'ficbook.net', 'www.ficbook.net', 'ficbook.com', 'www.ficbook.com'}
+            or match is None):
         raise ValueError('Invalid collection URL')
     return f'https://ficbook.net/collections/{match.group(1).lower()}'
 
@@ -83,14 +79,14 @@ def extract_url(text: str) -> str | None:
 
 
 def normalize_url(url: str) -> str:
-    parts = urlsplit(url.strip())
+    parts = _story_parts(url)
     if parts.hostname in ZAHLEB_HOSTS:
         return normalize_zahleb_url(url)
     if parts.hostname in FIKBOOKS_HOSTS:
         return normalize_fikbooks_url(url)
     scheme = parts.scheme or "https"
-    host = parts.netloc.lower()
-    if "ficbook." in host:
+    host = parts.hostname
+    if host in {'ficbook.net', 'www.ficbook.net', 'ficbook.com', 'www.ficbook.com'}:
         host = host.replace("www.", "").replace("ficbook.com", "ficbook.net")
     if host in {"hogwartsnet.ru", "www.hogwartsnet.ru"}:
         scheme = "https"
@@ -102,14 +98,19 @@ def normalize_url(url: str) -> str:
         scheme = "https"
         host = "ranobelib.me"
     path = parts.path.rstrip("/")
-    query = parts.query
+    # Keep only parameters with meaning for the downloader. Never forward arbitrary
+    # user parameters (including redirect destinations) to a source site.
+    query = ''
+    if host.removeprefix('www.') == 'archiveofourown.org':
+        params = parse_qs(parts.query)
+        query = urlencode({key: params[key][0] for key in ('view_adult', 'view_full_work') if key in params})
     if "readfic" in path:
         segments = [segment for segment in path.split("/") if segment]
         if len(segments) >= 2:
             path = f"/{segments[0]}/{segments[1]}"
             query = ""
     if host == "hogwartsnet.ru":
-        params = parse_qs(query)
+        params = parse_qs(parts.query)
         fid = params.get("fid", [""])[0]
         query = urlencode({"fid": fid}) if fid else query
     if host == "litnet.com":
@@ -131,8 +132,11 @@ def normalize_url(url: str) -> str:
 
 def is_supported_story_url(url: str) -> bool:
     value = url if re.match(r"^https?://", url, re.I) else f"https://{url}"
-    parts = urlsplit(value)
-    host = parts.netloc.lower().replace("www.", "")
+    try:
+        parts = _story_parts(value)
+    except ValueError:
+        return False
+    host = parts.hostname.removeprefix('www.')
     if parts.hostname in ZAHLEB_HOSTS:
         try:
             normalize_zahleb_url(value)
@@ -162,7 +166,7 @@ def is_supported_story_url(url: str) -> bool:
 
 
 def site_key(url: str) -> str:
-    host = urlsplit(url).netloc.lower().replace("www.", "")
+    host = (urlsplit(url).hostname or '').removeprefix('www.')
     if host in {"ficbook.net", "ficbook.com"}:
         return "ficbook.net"
     if host == "archiveofourown.org":

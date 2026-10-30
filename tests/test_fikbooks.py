@@ -62,10 +62,15 @@ class FikbooksTests(unittest.TestCase):
         for url in ('https://fikbooks.ru.evil/readfic/1', 'https://fikbooks.ru@evil/readfic/1',
                     'https://user@fikbooks.ru/readfic/1', 'https://fikbooks.ru:444/readfic/1',
                     'https://fikbooks.ru/readfic/0', 'https://fikbooks.ru/readfic/1/2/3',
-                    'https://fikbooks.ru/readfic/../1', 'https://fikbooks.ru/readfic/1?url=http://127.0.0.1',
+                    'https://fikbooks.ru/readfic/../1',
                     'https://fikbooks.ru/readfic/1\\2'):
             with self.subTest(url=url):
                 self.assertFalse(is_supported_story_url(url))
+
+    def test_unneeded_query_is_removed_before_downloading(self):
+        client = FakeClient()
+        client.download(ROOT + '?ysclid=abc&url=http://127.0.0.1#part_content')
+        self.assertEqual(client.requested, [ROOT, ROOT + '/11', ROOT + '/12'])
 
     def test_chapter_link_downloads_whole_book_and_metadata(self):
         client = FakeClient()
