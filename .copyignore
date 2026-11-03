@@ -3,6 +3,7 @@
 .github/
 .agents/
 .codex/
+.codex-remote-attachments/
 .idea/
 .vscode/
 .gitignore
@@ -18,10 +19,19 @@ docs/
 graphify-out/
 README.md
 .pytest_cache/
+**/.pytest_cache/
 .mypy_cache/
+**/.mypy_cache/
 .ruff_cache/
+**/.ruff_cache/
+.cache/
+**/.cache/
+.hypothesis/
+**/.hypothesis/
 .tox/
+**/.tox/
 .nox/
+**/.nox/
 .coverage
 .coverage.*
 coverage.xml
@@ -29,13 +39,18 @@ htmlcov/
 
 # Local environments, dependencies and build artifacts
 .venv*/
+**/.venv*/
 venv/
+**/venv/
 env/
 node_modules/
+**/node_modules/
 __pycache__/
 **/__pycache__/
 *.pyc
+**/*.pyc
 *.pyo
+**/*.pyo
 *.pyd
 build/
 dist/
@@ -78,6 +93,7 @@ cookies*.json
 
 # Editor and operating-system leftovers
 *.tmp
+**/*.tmp
 *.swp
 *.swo
 *~
