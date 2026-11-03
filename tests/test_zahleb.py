@@ -265,6 +265,28 @@ class ZahlebTests(unittest.TestCase):
         with self.assertRaises(ZahlebError):
             client.download(ROOT, chapter_numbers={1})
 
+    def test_length_mismatch_requires_matching_public_reader_content(self):
+        client = FakeClient()
+        client.episodes[FIRST]['contentLength'] = 999
+        original_page = client._page
+        client._page = lambda url: {**original_page(url), '_next_build_id': 'build-1'}
+        reader_url = ('https://zahleb.me/_next/data/build-1'
+                      '/story/test-book-lBH5frx0bi/' + FIRST + '.json')
+        for matches in (True, False):
+            episode_data = deepcopy(client.episodes[FIRST])
+            if not matches:
+                episode_data['content'] = [{'text': 'Different text'}]
+            response = BytesIO(json.dumps({'pageProps': {
+                'story': BOOK, 'episode': episode_data}}).encode())
+            response.geturl = lambda: reader_url
+            with self.subTest(matches=matches), patch.object(client._opener, 'open', return_value=response) as request:
+                if matches:
+                    self.assertEqual(len(client.download(ROOT, chapter_numbers={1}).chapters), 1)
+                else:
+                    with self.assertRaises(ZahlebError):
+                        client.download(ROOT, chapter_numbers={1})
+                self.assertEqual(request.call_args.args[0].full_url, reader_url)
+
     def test_malformed_rich_text_fails_as_source_error(self):
         for content in ([{'type': [], 'text': 'Text'}], [{'text': 42}], [{'children': {}}],
                         [{'text': '\ud800'}], [None]):

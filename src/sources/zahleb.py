@@ -193,11 +193,15 @@ class ZahlebClient:
                 raise ZahlebError('Взахлёб вернул неверный размер текста главы.')
             # Public episodes use both raw UTF-16 and JSON-encoded text lengths.
             # Accept the alternate representation only on an exact match, never a tolerance.
-            if not renderer.has_text or (length is not None and renderer.text_units < length
-                                         and renderer.json_text_units != length):
+            length_mismatch = (length is not None and renderer.text_units < length
+                               and renderer.json_text_units != length)
+            if not renderer.has_text or (length_mismatch and not self._reader_confirms(
+                    link, page.get('_next_build_id'), ep)):
                 logger.warning('zahleb_content_length_rejected chapter_id=%s declared=%s utf16=%s json_utf16=%s',
                                chapter['objectId'], length, renderer.text_units, renderer.json_text_units)
                 raise ZahlebError('Взахлёб вернул пустой или неполный текст главы. Книга не будет отправлена.')
+            if length_mismatch:
+                logger.info('zahleb_content_confirmed_by_reader chapter_id=%s', chapter['objectId'])
             bodies.append(Chapter.from_download(chapter['title'], html, link))
         age = book.get('ageRating')
         rating = f'{age}+' if type(age) is int and age in {0, 6, 12, 16, 18} else ''
@@ -292,9 +296,38 @@ class ZahlebClient:
                     logger.warning('zahleb_redirect_rejected requested=%s final=%s', public_url(url), public_url(response.geturl()))
                     raise ZahlebError('Взахлёб перенаправил запрос не на первую главу запрошенной истории.')
                 logger.info('zahleb_redirect_accepted requested=%s final=%s', public_url(url), public_url(response.geturl()))
-            return page
+            return {**page, '_next_build_id': state.get('buildId')}
         except (ValueError, TypeError, KeyError, RecursionError):
             raise ZahlebError('Взахлёб изменил страницу или не отдал данные истории. Попробуй позже.') from None
+
+    def _reader_confirms(self, chapter_url: str, build_id: object, episode: dict) -> bool:
+        if not isinstance(build_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', build_id):
+            return False
+        path = urlsplit(chapter_url).path
+        url = f'https://zahleb.me/_next/data/{build_id}{path}.json'
+        request = Request(url, headers={'Accept': 'application/json'})
+        try:
+            with self._opener.open(request, timeout=30) as response:
+                if response.geturl() != url:
+                    return False
+                page = json.loads(read_bounded(response))['pageProps']
+            reader_episode = page['episode']
+            story = page['story']
+            if not isinstance(reader_episode, dict) or not isinstance(story, dict):
+                return False
+            _check_access(story)
+            _check_access(reader_episode)
+            owner = reader_episode.get('story')
+            story_id = episode['story']['objectId']
+            return (isinstance(owner, dict) and owner.get('objectId') == story_id
+                    and story.get('objectId') == story_id
+                    and all(reader_episode.get(key) == episode[key]
+                            for key in ('objectId', 'order', 'status', 'content')))
+        except HTTPError as error:
+            error.close()
+            return False
+        except (URLError, OSError, ValueError, KeyError, TypeError, RecursionError, ZahlebError):
+            return False
 
     def _cover(self, value: object) -> CoverImage | None:
         url = _string(value)
