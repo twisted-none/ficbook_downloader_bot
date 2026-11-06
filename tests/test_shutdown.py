@@ -59,8 +59,11 @@ class ShutdownTests(unittest.IsolatedAsyncioTestCase):
         dispatcher.stop_polling = AsyncMock()
         bot = SimpleNamespace(id=1, session=SimpleNamespace(close=AsyncMock(side_effect=lambda: events.append('session_close'))))
         analytics = SimpleNamespace(alert_retries=object(), close=Mock(side_effect=lambda: events.append('database_close')))
+        from tempfile import TemporaryDirectory
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
         settings = SimpleNamespace(bot_token='111111:fake_test_token', alert_bot_token='',
-            database_url='unused', history_retention_days=30, data_dir=Path('unused'),
+            database_url='unused', history_retention_days=30, data_dir=Path(temporary.name),
             admin_chat_id=9, premium_queue_user_ids=frozenset(), metrics_host='127.0.0.1', metrics_port=8000,
             litnet_login='', litnet_password='', ranobelib_login='', ranobelib_password='',
             ficbook_request_delay_seconds=0, ficbook_retry_attempts=1, ficbook_retry_base_delay_seconds=0,

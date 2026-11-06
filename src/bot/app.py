@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import nullcontext
 from collections.abc import Awaitable, Callable
 from concurrent.futures import Future
@@ -8,6 +9,7 @@ from dataclasses import dataclass, replace
 from html import escape
 import logging
 import re
+import sqlite3
 from secrets import token_urlsafe
 from threading import Lock
 from time import monotonic
@@ -37,6 +39,7 @@ from aiogram.utils.chat_action import ChatActionSender
 
 from src.storage.analytics import AnalyticsStore, UserDownloadSettings, _public_story_url
 from src.storage.alert_retries import AlertRetry, AlertRetryStore
+from src.storage.download_jobs import DownloadJobs, restoring_job
 from src.bot.alert_redelivery import AlertRedelivery, Redelivery, RETRY_PREFIX, poll_bots, retry_keyboard
 from src.bot.alert_relay import PREFIX as CARD_RETRY_PREFIX, relay_card_retry
 from src.bot.types import PendingChapterSelection, PendingSupportMessage, SettingsDraft, SettingsSession
@@ -103,7 +106,10 @@ from src.sources.ao3_status import AO3SiteStatus, probe_status as probe_ao3_stat
 from src.exporters.formats import ALLOWED_FORMATS, build_docx, build_pdf, build_txt, normalize_formats
 from src.sources.share_links import ShareLinkError, extract_download_url, is_google_share_url, resolve_share_url
 from src.sources.collections import CollectionError, FicbookCollection
-from src.sources.registry import is_ficbook_collection_url, site_key
+from src.sources.registry import (
+    SUPPORTED_HOST_MARKERS, is_ficbook_collection_url, normalize_collection_url, normalize_url,
+    site_display_name, site_key,
+)
 from src.monitoring.metrics import run_metrics_server
 from src.storage.retention import run_history_retention
 from src.core.models import Story, StoryPreview
@@ -522,8 +528,88 @@ async def on_queue_command(
     if not _is_admin(message, admin_chat_id):
         await message.answer("Команда доступна только администратору.")
         return
-    total = await download_queues.total_jobs()
-    await message.answer(f"Количество фанфиков в очереди: {total}")
+    saved = download_queues.saved_jobs
+    counts = await download_queues.counts_by_site()
+    if saved is not None:
+        counts = {}
+        for entry in saved.entries.values():
+            key = site_key(entry.payload['url'])
+            active, waiting = counts.get(key, (0, 0))
+            job = _jobs.get(entry.payload['token'])
+            if job is not None and job.started and not job.waiting_for_site:
+                active += 1
+            else:
+                waiting += 1
+            counts[key] = (active, waiting)
+    lines = ['Загрузки на паузе.' if saved and saved.paused else 'Очередь загрузок']
+    deferred_sites = ({site_key(saved.entries[entry_id].payload['url']) for entry_id in saved.deferred}
+                      if saved is not None else set())
+    for key in dict.fromkeys(site_key('https://' + host) for host in SUPPORTED_HOST_MARKERS):
+        active, waiting = counts.get(key, (0, 0))
+        outage = ' · техработы' if key in deferred_sites or download_queues.is_site_unavailable(key) else ''
+        lines.append(f'{site_display_name("https://" + key)}: выполняется {active}, ждёт {waiting}{outage}')
+    await message.answer('\n'.join(lines))
+
+
+@router.message(Command('stop'))
+async def on_stop_queue(message: Message, admin_chat_id: int | None, download_queues: DownloadQueuePool,
+                        restore_downloads: Callable[[], None] | None = None) -> None:
+    if not _is_admin(message, admin_chat_id):
+        await message.answer('Команда доступна только администратору.')
+        return
+    saved = download_queues.saved_jobs
+    if saved is None or saved.paused:
+        await message.answer('Загрузки уже на паузе.' if saved else 'Сохранение очереди недоступно.')
+        return
+    cutoff = saved.pause()
+    generation = saved.generation
+    await _answer_status_with_retry(
+        message, 'Новые заявки сохраню до /resume. Завершаю текущую очередь на доступных сайтах.')
+    while saved.paused and saved.generation == generation:
+        draining = []
+        cancelled = []
+        for entry in list(saved.entries.values()):
+            if entry.id > cutoff or entry.id in saved.deferred:
+                continue
+            job = _jobs.get(entry.payload['token'])
+            unavailable = download_queues.is_site_unavailable(site_key(entry.payload['url']))
+            if (job is not None and job.waiting_for_site) or (unavailable and (job is None or not job.started)):
+                saved.deferred.add(entry.id)
+                if job is not None and job.task is not None and not job.task.done():
+                    job.task.cancel()
+                    cancelled.append(job.owner or job.task)
+            else:
+                draining.append(entry.id)
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+        if saved.generation != generation:
+            if not saved.paused and restore_downloads is not None:
+                restore_downloads()
+            return
+        if not any(entry_id in saved.entries for entry_id in draining):
+            saved.cutoff = 0
+            remaining = sum(entry_id <= cutoff for entry_id in saved.entries)
+            await _answer_status_with_retry(message,
+                'Очередь на доступных платформах обработана. Можно перезапускать бота.\n'
+                f'Оставлено до восстановления сайтов: {remaining}.')
+            return
+        await asyncio.sleep(1)
+
+
+@router.message(Command('resume'))
+async def on_resume_queue(message: Message, admin_chat_id: int | None, download_queues: DownloadQueuePool,
+                          restore_downloads: Callable[[], None] | None = None) -> None:
+    if not _is_admin(message, admin_chat_id):
+        await message.answer('Команда доступна только администратору.')
+        return
+    saved = download_queues.saved_jobs
+    if saved is None or not saved.paused:
+        await message.answer('Очередь уже работает.' if saved else 'Сохранение очереди недоступно.')
+        return
+    saved.resume()
+    if restore_downloads is not None:
+        restore_downloads()
+    await message.answer('Загрузки возобновлены.')
 
 
 @router.message(Command("cancel"))
@@ -919,18 +1005,17 @@ async def on_link(
         )
         return
     if chapter_selection_enabled and message.from_user:
-        await _ask_chapter_selection(
-            message,
-            ficbook_client,
-            admin_chat_id,
-            alert_bot,
-            url,
-            formats,
-            cover_enabled,
-            download_queues,
-            initial_status=initial_status,
-            retry_store=getattr(analytics_store, 'alert_retries', None),
-        )
+        async def preview():
+            await _ask_chapter_selection(
+                message, ficbook_client, admin_chat_id, alert_bot, url, formats, cover_enabled, download_queues,
+                initial_status=initial_status, retry_store=getattr(analytics_store, 'alert_retries', None),
+            )
+        saved = getattr(download_queues, 'saved_jobs', None)
+        if saved is not None and saved.paused:
+            await _run_tracked(message, url, formats, cover_enabled, None, 'preview', initial_status,
+                               preview, saved_jobs=saved)
+        else:
+            await preview()
         return
     await _process_download(
         message,
@@ -984,14 +1069,17 @@ async def _ask_chapter_selection(
     try:
         queues = download_queues or DownloadQueuePool()
         async def preview_job():
+            job = current_job.get()
+            if job is not None:
+                job.started = True
             while True:
                 if site_key(url) == 'archiveofourown.org' and queues.is_site_unavailable('archiveofourown.org'):
-                    await _wait_for_ao3_recovery(queues, progress, formats)
+                    await _site_wait(_wait_for_ao3_recovery(queues, progress, formats))
                 try:
                     return await run_worker(ficbook_client.preview, url, progress.from_thread)
                 except AO3SiteUnavailableError:
                     queues.mark_site_unavailable('archiveofourown.org')
-                    await _wait_for_ao3_recovery(queues, progress, formats)
+                    await _site_wait(_wait_for_ao3_recovery(queues, progress, formats))
         preview = await queues.run_preview(
             preview_job,
             user_id=message.from_user.id if message.from_user else None,
@@ -1061,12 +1149,28 @@ async def _run_tracked(
     message: Message, url: str, formats: tuple[str, ...], cover_enabled: bool,
     chapter_numbers: set[int] | None, kind: str, initial_status: Message | None,
     operation: Callable[[], Awaitable[bool | None]],
-    *, redelivery: Redelivery | None = None,
+    *, redelivery: Redelivery | None = None, saved_jobs: DownloadJobs | None = None,
+    retry_collection: FicbookCollection | None = None,
 ) -> bool | None:
     user_id = message.from_user.id if message.from_user else message.chat.id
     key = download_key(user_id, message.chat.id, url, formats, cover_enabled, chapter_numbers)
+    parent = current_job.get()
+    restored = restoring_job.get() if parent is None else None
+    entry = saved_jobs.entries.get(restored) if saved_jobs is not None and restored is not None else None
+    if restored is not None and entry is None:
+        return None
+    saved_key = json.dumps(key)
+    if saved_jobs is not None and parent is None and entry is None and any(
+            item.payload.get('key') == saved_key for item in saved_jobs.entries.values()):
+        text = 'Эта работа уже скачивается или ожидает очереди.'
+        if redelivery is not None:
+            redelivery.failure = text
+        else:
+            await _replace_status_with_notice(message, initial_status, None, text)
+        return None
     try:
-        job, created = _jobs.reserve(key, user_id, message.chat.id, kind)
+        job, created = _jobs.reserve(key, user_id, message.chat.id, kind,
+                                     token=entry.payload['token'] if entry else None)
     except OverflowError:
         if redelivery is not None:
             redelivery.failure = 'Очередь загрузок заполнена. Повтори попытку позже.'
@@ -1090,19 +1194,78 @@ async def _run_tracked(
                 raise
         return None
 
+    job.parent = parent
+    job.owner = asyncio.current_task()
+    if saved_jobs is not None and parent is None and entry is None:
+        payload = dict(token=job.token, key=saved_key, kind=kind, url=normalize_collection_url(url) if kind == 'collection'
+                       else normalize_url(url), formats=list(formats), cover_enabled=cover_enabled,
+                       chapters=sorted(chapter_numbers) if chapter_numbers is not None else None,
+                       message=message.model_dump(mode='json', exclude_none=True, include={
+                           'message_id': True, 'date': True, 'message_thread_id': True, 'is_topic_message': True,
+                           'chat': {'id', 'type'}, 'from_user': {'id', 'is_bot', 'first_name', 'last_name', 'username'},
+                       }))
+        if retry_collection is not None:
+            payload['collection'] = {'title': retry_collection.title, 'urls': retry_collection.urls}
+        if redelivery is not None:
+            payload['alert'] = redelivery.alert
+        try:
+            entry = saved_jobs.add(payload)
+        except (OverflowError, sqlite3.Error) as error:
+            _jobs.release(job)
+            full = isinstance(error, OverflowError)
+            if not full:
+                logger.error('Could not persist download job: %s', type(error).__name__)
+            text = ('Сейчас очередь заполнена. Попробуй позже.' if full else
+                    'Не удалось сохранить заявку. Отправь ссылку ещё раз позже.')
+            if redelivery is not None:
+                redelivery.failure = text
+            else:
+                await _replace_status_with_notice(message, initial_status, None, text)
+            return None
+    job.saved = entry
+
     async def execute():
         context = current_job.set(job)
         try:
+            if entry and kind == 'collection':
+                async with saved_jobs.collection_slot(user_id):
+                    job.started = True
+                    return await operation()
             return await operation()
+        finally:
+            current_job.reset(context)
+
+    if entry is not None and saved_jobs.paused and (entry.id > saved_jobs.cutoff or entry.id in saved_jobs.deferred):
+        _jobs.release(job)
+        context = current_job.set(job)
+        try:
+            if redelivery is not None:
+                redelivery.deferred = True
+            else:
+                text = 'Бот на техническом обслуживании. Ваша работа добавлена в очередь и скачается после возобновления.'
+                if initial_status is not None:
+                    try:
+                        await deliver(initial_status, lambda: initial_status.edit_text(text, **_job_markup()))
+                    except (TelegramBadRequest, TelegramNetworkError, TelegramServerError, TelegramRetryAfter,
+                            TelegramDeliveryError):
+                        await _optional_status(message, text)
+                else:
+                    await _optional_status(message, text)
+            return None
         finally:
             current_job.reset(context)
 
     job.task = asyncio.create_task(execute())
     try:
-        return await job.task
+        result = await job.task
+        if entry is not None:
+            saved_jobs.finish(entry)
+        return result
     except asyncio.CancelledError:
         if not job.cancel_requested:
             raise
+        if entry is not None:
+            saved_jobs.finish(entry)
         text = ('Сборник остановлен.\n' + job.text if kind == 'collection' else 'Загрузка отменена.')
         if redelivery is not None:
             redelivery.failure = 'Повторная загрузка отменена.'
@@ -1114,11 +1277,27 @@ async def _run_tracked(
 
 
 @router.callback_query(F.data.startswith('download:cancel:'))
-async def on_cancel_download(callback: CallbackQuery) -> None:
+async def on_cancel_download(callback: CallbackQuery, download_queues: DownloadQueuePool | None = None) -> None:
     if callback.message is None or not isinstance(callback.message, Message):
         await callback.answer('Сообщение недоступно.', show_alert=True)
         return
     token = (callback.data or '').removeprefix('download:cancel:')
+    saved = download_queues.saved_jobs if download_queues is not None else None
+    job = _jobs.get(token)
+    if saved is not None:
+        if (job is not None and job.saved is not None and job.user_id == callback.from_user.id
+                and job.chat_id == callback.message.chat.id and job.cancel_allowed
+                and job.task is not None and not job.task.done()):
+            saved.finish(job.saved)
+        elif job is None:
+            for entry in saved.entries.values():
+                sender = entry.payload['message'].get('from_user') or {}
+                chat = entry.payload['message']['chat']
+                if (entry.payload['token'] == token and chat['id'] == callback.message.chat.id
+                        and sender.get('id', chat['id']) == callback.from_user.id):
+                    saved.finish(entry)
+                    await callback.answer('Загрузка отменена.')
+                    return
     if not _jobs.cancel(token, callback.from_user.id, callback.message.chat.id):
         await callback.answer('Задача уже завершена или недоступна.', show_alert=True)
         return
@@ -1166,7 +1345,7 @@ async def _process_collection(
             message, ficbook_client, admin_chat_id, alert_bot, analytics_store, download_queues,
             url, formats, premium_queue_user_ids, cover_enabled=cover_enabled,
             initial_status=initial_status, retry_collection=retry_collection,
-        ),
+        ), saved_jobs=getattr(download_queues, 'saved_jobs', None), retry_collection=retry_collection,
     )
 
 
@@ -1197,6 +1376,10 @@ async def _process_collection_impl(
         )
         return
     _collection_users.add(user_id)
+    job = current_job.get()
+    entry = job.saved if job else None
+    saved = getattr(download_queues, 'saved_jobs', None)
+    checkpoint = entry.checkpoint if entry else {}
     status = initial_status
     progress = None
     try:
@@ -1214,20 +1397,28 @@ async def _process_collection_impl(
                 future.cancel()
                 logger.warning('Could not deliver collection discovery progress')
 
-        collection = retry_collection or await download_queues.run_preview(
-            lambda: run_worker(ficbook_client.collection, url, report_discovery), user_id=user_id,
-        )
+        if 'collection_urls' in checkpoint:
+            collection = FicbookCollection(checkpoint['collection_title'], url, tuple(checkpoint['collection_urls']))
+        else:
+            if saved is not None and saved.paused and download_queues.is_site_unavailable('ficbook.net'):
+                await _site_wait(_wait_for_ficbook_recovery(ficbook_client, download_queues, progress, formats))
+            collection = retry_collection or await download_queues.run_preview(
+                lambda: run_worker(ficbook_client.collection, url, report_discovery), user_id=user_id,
+            )
+            if entry is not None:
+                saved.save(entry, collection_urls=collection.urls, collection_title=collection.title)
         total = len(collection.urls)
         if not total:
             await progress.close()
             await _replace_status_with_notice(message, status, admin_chat_id, 'Этот сборник пуст.')
             return
-        sent = 0
-        cancelled = 0
-        failed = []
+        processed = checkpoint.get('processed', 0)
+        sent = checkpoint.get('sent', 0)
+        cancelled = checkpoint.get('cancelled', 0)
+        failed = list(checkpoint.get('failed', []))
         title = escape(collection.title)
-        await progress.set(f'Сборник: {title}\nОбработано 0 из {total}.\nОтправлено: 0.', force=True)
-        for index, work_url in enumerate(collection.urls, 1):
+        await progress.set(f'Сборник: {title}\nОбработано {processed} из {total}.\nОтправлено: {sent}.', force=True)
+        for index, work_url in enumerate(collection.urls[processed:], processed + 1):
             success = await _process_download(
                 message, ficbook_client, admin_chat_id, alert_bot, analytics_store,
                 download_queues, work_url, formats, premium_queue_user_ids,
@@ -1239,6 +1430,8 @@ async def _process_collection_impl(
                 sent += 1
             else:
                 failed.append(work_url)
+            if entry is not None:
+                saved.save(entry, processed=index, sent=sent, cancelled=cancelled, failed=failed, sent_formats=[])
             await progress.set(
                 f'Сборник: {title}\nОбработано {index} из {total}.\nОтправлено: {sent}.', force=True,
             )
@@ -1279,6 +1472,9 @@ async def _process_collection_impl(
         if progress is not None:
             await progress.close()
         await _replace_status_with_notice(message, status, admin_chat_id, _resource_error_text(exc))
+    except sqlite3.Error:
+        logger.exception('Could not checkpoint collection; leaving it in the saved queue')
+        raise
     except Exception as exc:
         logger.exception('Unexpected error while processing Ficbook collection')
         await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False)
@@ -1307,6 +1503,7 @@ async def _process_download(
             redelivery=redelivery,
         ),
         redelivery=redelivery,
+        saved_jobs=getattr(download_queues, 'saved_jobs', None),
     )
 
 
@@ -1328,6 +1525,13 @@ async def _process_download_impl(
     known_title: str = '',
     redelivery: Redelivery | None = None,
 ) -> bool:
+    job = current_job.get()
+    root_job = (job.parent or job) if job else None
+    entry = root_job.saved if root_job else None
+    saved = getattr(download_queues, 'saved_jobs', None)
+    sent_formats = set(entry.checkpoint.get('sent_formats', ())) if entry else set()
+    if redelivery is None and set(formats) <= sent_formats:
+        return True
     priority = _is_priority_download_user(message, premium_queue_user_ids)
     assignment = download_queues.assign(url)
     status: Message | None = initial_status if redelivery is None else None
@@ -1359,6 +1563,8 @@ async def _process_download_impl(
 
             async def on_queued(estimate: Any) -> None:
                 nonlocal status, progress
+                if root_job is not None:
+                    root_job.started = False
                 if redelivery is not None:
                     return
                 text = _queue_status(
@@ -1381,6 +1587,8 @@ async def _process_download_impl(
 
             async def on_started() -> None:
                 nonlocal status, progress
+                if root_job is not None:
+                    root_job.started = True
                 progress_state.start_attempt()
                 if redelivery is not None:
                     return
@@ -1401,7 +1609,7 @@ async def _process_download_impl(
                     site_unavailable = False
                     ao3_maintenance = False
                     if current.key == 'archiveofourown.org' and download_queues.is_site_unavailable(current.key):
-                        await _wait_for_ao3_recovery(download_queues, active_progress, formats, state=progress_state)
+                        await _site_wait(_wait_for_ao3_recovery(download_queues, active_progress, formats, state=progress_state))
                         progress_state.start_attempt()
 
                     def observe_progress(text: str) -> None:
@@ -1443,7 +1651,7 @@ async def _process_download_impl(
                         await asyncio.gather(updater, return_exceptions=True)
                     if ao3_maintenance:
                         download_queues.mark_site_unavailable(current.key)
-                        await _wait_for_ao3_recovery(download_queues, active_progress, formats, state=progress_state)
+                        await _site_wait(_wait_for_ao3_recovery(download_queues, active_progress, formats, state=progress_state))
                         progress_state.start_attempt()
                         continue
                     if not site_unavailable:
@@ -1451,13 +1659,13 @@ async def _process_download_impl(
                             download_queues.mark_site_available("ficbook.net")
                         break
                     download_queues.mark_site_unavailable("ficbook.net")
-                    await _wait_for_ficbook_recovery(
+                    await _site_wait(_wait_for_ficbook_recovery(
                         ficbook_client,
                         download_queues,
                         active_progress,
                         formats,
                         state=progress_state,
-                    )
+                    ))
                     progress_state.start_attempt()
                 if not cover_enabled:
                     story.cover = None
@@ -1483,7 +1691,7 @@ async def _process_download_impl(
                     logger.debug('Sending completed download without a final status edit')
                 await progress.close()
                 pending_files = [(fmt, payload) for fmt, payload in files
-                                 if redelivery is None or fmt not in redelivery.sent_formats]
+                                 if fmt not in (redelivery.sent_formats if redelivery else sent_formats)]
                 for index, (fmt, payload) in enumerate(pending_files, 1):
                     caption = f'{escape(story.title)} ({fmt.upper()})'
                     if redelivery is not None and index == len(pending_files):
@@ -1496,6 +1704,9 @@ async def _process_download_impl(
                     )
                     if redelivery is not None:
                         await redelivery.record_sent(fmt)
+                    elif entry is not None:
+                        sent_formats.add(fmt)
+                        saved.save(entry, sent_formats=sorted(sent_formats))
                 delivered = True
                 job = current_job.get()
                 if job is not None:
@@ -1594,6 +1805,9 @@ async def _process_download_impl(
                                 retry_store=getattr(analytics_store, 'alert_retries', None),
                                 formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers)
         await report_failure(_user_error_message(exc), as_error=True, error=exc)
+    except sqlite3.Error:
+        logger.exception('Could not checkpoint file delivery; leaving it in the saved queue')
+        raise
     except Exception as exc:
         if redelivery is None:
             logger.exception("Unexpected error while processing Ficbook link")
@@ -1689,6 +1903,18 @@ async def _answer_document_with_retry(
             )
             if not isinstance(exc, TelegramRetryAfter):
                 await asyncio.sleep(TELEGRAM_SEND_RETRY_DELAY_SECONDS)
+
+
+async def _site_wait(operation: Awaitable[None]) -> None:
+    job = current_job.get()
+    root_job = (job.parent or job) if job else None
+    if root_job is not None:
+        root_job.waiting_for_site = True
+    try:
+        await operation
+    finally:
+        if root_job is not None:
+            root_job.waiting_for_site = False
 
 
 async def _wait_for_ao3_recovery(queues, progress, formats, *, state=None):
@@ -1868,6 +2094,13 @@ async def run_bot(settings: Settings) -> None:
     ficbook_accounts = _ficbook_accounts(settings)
     _account_pair(settings.litnet_login, settings.litnet_password, "LITNET_LOGIN")
     _account_pair(settings.ranobelib_login, settings.ranobelib_password, "RANOBELIB_LOGIN")
+    queues = DownloadQueuePool(
+        ficbook_accounts=ficbook_accounts,
+        min_start_interval=settings.ficbook_download_interval_seconds,
+        account_cooldown_seconds=settings.ficbook_retry_max_delay_seconds or 60.0,
+        max_jobs=limits.max_queue_jobs,
+        max_active=limits.max_active_jobs,
+    )
     dispatcher = create_dispatcher(
         FicbookClient(
             accounts=ficbook_accounts,
@@ -1885,13 +2118,7 @@ async def run_bot(settings: Settings) -> None:
         alert_bot,
         UserStore(settings.data_dir / "users.json"),
         analytics_store,
-        DownloadQueuePool(
-            ficbook_accounts=ficbook_accounts,
-            min_start_interval=settings.ficbook_download_interval_seconds,
-            account_cooldown_seconds=settings.ficbook_retry_max_delay_seconds or 60.0,
-            max_jobs=limits.max_queue_jobs,
-            max_active=limits.max_active_jobs,
-        ),
+        queues,
         settings.premium_queue_user_ids,
     )
     metrics_task = asyncio.create_task(
@@ -1911,12 +2138,70 @@ async def run_bot(settings: Settings) -> None:
 
     redelivery = AlertRedelivery(bot, settings.admin_chat_id, analytics_store.alert_retries, redownload)
     dispatcher['alert_redelivery'] = redelivery
+    saved = DownloadJobs(settings.data_dir / 'download-queue.sqlite3', bot.id,
+                         limits.max_queue_jobs, limits.max_collection_batches)
+    queues.saved_jobs = saved
+    restore_tasks: dict[int, asyncio.Task] = {}
+
+    async def restore(entry):
+        context = restoring_job.set(entry.id)
+        try:
+            if entry.id not in saved.entries:
+                return
+            payload = entry.payload
+            url, formats = payload['url'], tuple(payload['formats'])
+            message = Message.model_validate(payload['message']).as_(bot)
+            client = dispatcher['ficbook_client']
+            if alert := payload.get('alert'):
+                source = alert_bot or bot
+                admin_message = Message.model_validate(alert['message']).as_(source)
+                if source.id != alert['bot_id'] or admin_message.chat.id != settings.admin_chat_id:
+                    logger.error('Cannot restore alert retry %s: alert bot or admin chat changed', entry.id)
+                    return
+                if await redelivery.retry(admin_message, alert['token']):
+                    saved.finish(entry)
+            elif payload['kind'] == 'collection':
+                selection = payload.get('collection')
+                await _process_collection(message, client, settings.admin_chat_id, alert_bot, analytics_store,
+                    queues, url, formats, settings.premium_queue_user_ids, cover_enabled=payload['cover_enabled'],
+                    retry_collection=(FicbookCollection(selection['title'], url, tuple(selection['urls']))
+                                      if selection is not None else None))
+            elif payload['kind'] == 'preview':
+                await _run_tracked(message, url, formats, payload['cover_enabled'], None, 'preview', None,
+                    lambda: _ask_chapter_selection(message, client, settings.admin_chat_id, alert_bot, url,
+                        formats, payload['cover_enabled'], queues, retry_store=analytics_store.alert_retries),
+                    saved_jobs=saved)
+            else:
+                chapters = payload['chapters']
+                await _process_download(message, client, settings.admin_chat_id, alert_bot, analytics_store,
+                    queues, url, formats, settings.premium_queue_user_ids, cover_enabled=payload['cover_enabled'],
+                    chapter_numbers=set(chapters) if chapters is not None else None)
+        except Exception as error:
+            logger.error('Could not restore download job %s: %s', entry.id, type(error).__name__)
+        finally:
+            restoring_job.reset(context)
+            restore_tasks.pop(entry.id, None)
+
+    def restore_downloads():
+        if saved.paused:
+            return
+        for entry in saved.entries.values():
+            if entry.id not in restore_tasks and _jobs.get(entry.payload['token']) is None:
+                restore_tasks[entry.id] = asyncio.create_task(restore(entry))
+
+    dispatcher['restore_downloads'] = restore_downloads
     try:
         await _set_bot_commands(bot, settings.admin_chat_id)
+        restore_downloads()
         await poll_bots(dispatcher, bot, redelivery, alert_bot,
                         tasks_concurrency_limit=limits.max_queue_jobs + 64)
     finally:
+        tasks = tuple(restore_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await redelivery.close()
+        saved.db.close()
         metrics_task.cancel()
         retention_task.cancel()
         sessions_task.cancel()
@@ -1946,7 +2231,9 @@ async def _set_bot_commands(bot: Bot, admin_chat_id: int | None) -> None:
                 [
                     *commands,
                     BotCommand(command="broadcast", description="Рассылка пользователям"),
-                    BotCommand(command="queue", description="Количество фанфиков в очереди"),
+                    BotCommand(command="queue", description="Очередь по платформам"),
+                    BotCommand(command="stop", description="Подготовить бота к перезапуску"),
+                    BotCommand(command="resume", description="Возобновить скачивания"),
                 ],
                 scope=BotCommandScopeChat(chat_id=admin_chat_id),
             )

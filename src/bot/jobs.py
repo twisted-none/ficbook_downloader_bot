@@ -7,6 +7,7 @@ import re
 from secrets import token_urlsafe
 from urllib.parse import urlsplit
 
+from src.storage.download_jobs import SavedDownload
 from src.sources.registry import normalize_collection_url, normalize_url, is_ficbook_collection_url
 
 
@@ -34,6 +35,11 @@ class ActiveJob:
     cancel_requested: bool = False
     cancel_allowed: bool = True
     text: str = 'Подготавливаю загрузку...'
+    saved: SavedDownload | None = None
+    parent: 'ActiveJob | None' = None
+    owner: asyncio.Task | None = None
+    started: bool = False
+    waiting_for_site: bool = False
 
 
 current_job: ContextVar[ActiveJob | None] = ContextVar('active_download_job', default=None)
@@ -45,12 +51,13 @@ class JobRegistry:
         self._jobs: dict[str, ActiveJob] = {}
         self._keys: dict[tuple, ActiveJob] = {}
 
-    def reserve(self, key: tuple, user_id: int, chat_id: int, kind: str = 'work') -> tuple[ActiveJob, bool]:
+    def reserve(self, key: tuple, user_id: int, chat_id: int, kind: str = 'work', *,
+                token: str | None = None) -> tuple[ActiveJob, bool]:
         if key in self._keys:
             return self._keys[key], False
         if len(self._jobs) >= self.max_entries:
             raise OverflowError('Active job capacity reached')
-        job = ActiveJob(token_urlsafe(9), key, user_id, chat_id, kind)
+        job = ActiveJob(token or token_urlsafe(9), key, user_id, chat_id, kind)
         self._jobs[job.token] = self._keys[key] = job
         return job, True
 

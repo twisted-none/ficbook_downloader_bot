@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 
 from src.sources.registry import site_key
 from src.core.site_recovery import SiteRecovery
+from src.storage.download_jobs import DownloadJobs
 
 T = TypeVar("T")
 JOB_SECONDS = 120.0
@@ -353,6 +354,13 @@ class DownloadQueuePool:
         self._site_state_lock = Lock()
         self._unavailable_sites: set[str] = set()
         self.ao3_recovery = SiteRecovery(interval=300)
+        self.saved_jobs: DownloadJobs | None = None
+
+    async def counts_by_site(self) -> dict[str, tuple[int, int]]:
+        groups = {'ficbook.net': self._ficbook_queues,
+                  **{key: (queue,) for key, queue in self._site_queues.items()}}
+        return {key: (sum(queue._active_token is not None for queue in queues),
+                      sum(len(queue._waiting) for queue in queues)) for key, queues in groups.items()}
 
     def assign(self, url: str) -> QueueAssignment:
         key = site_key(url)

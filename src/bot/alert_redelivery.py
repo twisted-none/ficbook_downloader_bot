@@ -39,6 +39,8 @@ class Redelivery:
     notice: str = RETRY_NOTICE
     failure: str = ''
     error: Exception | None = None
+    alert: dict | None = None
+    deferred: bool = False
 
 
 class AlertRedelivery:
@@ -50,6 +52,7 @@ class AlertRedelivery:
         self.download = download
         self.active: set[str] = set()
         self.tasks: set[asyncio.Task] = set()
+        self.changed = asyncio.Event()
 
     async def close(self) -> None:
         tasks = tuple(self.tasks)
@@ -108,11 +111,21 @@ class AlertRedelivery:
         if re.fullmatch(r'[A-Za-z0-9_-]{1,32}', token) is None:
             await self._answer(callback, 'Некорректная кнопка.')
             return
+        await self.retry(message, token, callback)
+
+    async def retry(self, message: Message, token: str, callback: CallbackQuery | None = None) -> bool | None:
+        async def answer(text: str) -> None:
+            if callback is not None:
+                await self._answer(callback, text)
+
         retry_id = uuid4().hex[:12]
         log_retry(logger, 'alert_retry_clicked', retry_id=retry_id, alert_id=message.message_id)
+        while callback is None and (token in self.active or len(self.active) >= MAX_ACTIVE_REDELIVERIES):
+            self.changed.clear()
+            await self.changed.wait()
         if token in self.active or len(self.active) >= MAX_ACTIVE_REDELIVERIES:
             log_retry(logger, 'alert_retry_rejected', retry_id=retry_id, alert_id=message.message_id, reason='Retry busy')
-            await self._answer(callback, 'Отправка уже выполняется. Дождись завершения.')
+            await answer('Отправка уже выполняется. Дождись завершения.')
             return
         self.active.add(token)
         task = asyncio.current_task()
@@ -121,7 +134,7 @@ class AlertRedelivery:
         try:
             # Shield acquisition so cancellation cannot leak a pooled session/advisory lock.
             acquisition = asyncio.create_task(asyncio.to_thread(
-                self.store.claim, token, callback.bot.id, message.chat.id, message.message_id))
+                self.store.claim, token, message.bot.id, message.chat.id, message.message_id))
             try:
                 claim = await asyncio.shield(acquisition)
             except asyncio.CancelledError:
@@ -130,15 +143,17 @@ class AlertRedelivery:
             if claim is None:
                 log_retry(logger, 'alert_retry_rejected', retry_id=retry_id, alert_id=message.message_id,
                           reason='Expired, claimed or mismatched alert')
-                await self._answer(callback, 'Алерт истёк, недоступен или уже обрабатывается.')
-                return
+                await answer('Алерт истёк, недоступен или уже обрабатывается.')
+                if callback is None:
+                    await self._status(message, token, 'Не удалось восстановить повторную отправку. Алерт недоступен или истёк.')
+                return True
             if claim.request.delivered:
                 log_retry(logger, 'alert_retry_succeeded', retry_id=retry_id, alert_id=message.message_id,
                           url=claim.request.url, already_delivered=True)
-                await self._answer(callback, 'Уже отправлено. Удаляю алерт.')
+                await answer('Уже отправлено. Удаляю алерт.')
                 await self._delete(message, token)
-                return
-            await self._answer(callback, 'Начинаю повторную загрузку.')
+                return True
+            await answer('Начинаю повторную загрузку.')
             await self._status(message, token, 'Повторная отправка выполняется…', busy=True)
             request = claim.request
             log_retry(logger, 'alert_retry_started', retry_id=retry_id, alert_id=message.message_id,
@@ -159,9 +174,16 @@ class AlertRedelivery:
                 log_retry(logger, 'alert_retry_file_sent', retry_id=retry_id,
                           alert_id=message.message_id, url=request.url, format=fmt)
 
-            delivery = Redelivery(request.sent_formats, record_sent)
+            delivery = Redelivery(request.sent_formats, record_sent, alert={
+                'token': token, 'bot_id': message.bot.id,
+                'message': message.model_dump(mode='json', exclude_none=True, include={
+                    'message_id': True, 'date': True, 'chat': {'id', 'type'}, 'text': True, 'entities': True,
+                }),
+            })
             await self.download(target, request, delivery)
-            if claim.request.delivered:
+            if delivery.deferred:
+                await self._status(message, token, 'Задание сохранено. Повторится после /resume.', busy=True)
+            elif claim.request.delivered:
                 log_retry(logger, 'alert_retry_succeeded', retry_id=retry_id,
                           alert_id=message.message_id, url=request.url,
                           sent_formats=list(claim.request.sent_formats))
@@ -199,6 +221,7 @@ class AlertRedelivery:
             finally:
                 self.active.discard(token)
                 self.tasks.discard(task)
+                self.changed.set()
 
 
 async def poll_bots(dispatcher: Dispatcher, bot: Bot, redelivery: AlertRedelivery, alert_bot: Bot | None,
