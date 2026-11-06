@@ -24,7 +24,9 @@ def build_fb2(story: Story) -> bytes:
     translator = f"<translator><nickname>{escape(story.translator)}</nickname></translator>" if story.translator else ""
     info = _info_section_xml(story)
     prepared = prepare_chapters(story)
-    chapters = "".join(_chapter_to_xml(chapter, index) for index, chapter in enumerate(prepared, 1))
+    notes: list[str] = []
+    chapters = "".join(_chapter_to_xml(chapter, index, notes) for index, chapter in enumerate(prepared, 1))
+    notes_body = '<body name="notes">' + ''.join(notes) + '</body>' if notes else ''
     toc = '<section><title><p>Оглавление</p></title>' + ''.join(
         f'<p><a l:href="#{chapter_id(index)}">{escape(chapter.title or f"Глава {index}")}</a></p>'
         for index, chapter in enumerate(prepared, 1)
@@ -45,12 +47,30 @@ def build_fb2(story: Story) -> bytes:
   <book-title>{escape(story.title)}</book-title>{annotation}{keywords}{coverpage}<lang>{escape(language)}</lang>{translator}</title-info>
   <document-info><author><nickname>ficbook_bot</nickname></author><id>{uuid5(NAMESPACE_URL, story.source_url)}</id>
   <program-used>ficbook_bot</program-used><src-url>{escape(story.source_url)}</src-url></document-info>{custom_pages}</description>
-  <body>{info}{toc}{chapters}</body>{binary}</FictionBook>"""
+  <body>{info}{toc}{chapters}</body>{notes_body}{binary}</FictionBook>"""
     return fb2.encode("utf-8")
 
 
-def _chapter_to_xml(chapter: Chapter, index: int = 1) -> str:
-    paragraphs = "".join(_fragment_to_blocks(chapter.html))
+def _chapter_to_xml(chapter: Chapter, index: int, notes: list[str]) -> str:
+    soup = BeautifulSoup(chapter.html, 'lxml')
+    references = {str(link['href'])[1:] for link in soup.select('a[href^="#"]')}
+    note_ids: set[str] = set()
+    for container in soup.select('.interactive-footnotes'):
+        for node in container.find_all('div', id=True, recursive=False):
+            note_id = str(node['id'])
+            if note_id not in references or not node.get_text(strip=True):
+                continue
+            # The section itself is the link target and contains the note text.
+            blocks = ''.join(_fragment_to_blocks(node.decode_contents()))
+            if blocks:
+                notes.append(f'<section id="{escape(note_id, quote=True)}">{blocks}</section>')
+                note_ids.add(note_id)
+                node.decompose()
+        remaining = container.find_all(recursive=False)
+        if (note_ids and len(remaining) == 1
+                and container.get_text(strip=True) == 'Интерактивные примечания:'):
+            container.decompose()
+    paragraphs = "".join(_soup_to_blocks(soup, note_ids))
     return f'<section id="{chapter_id(index)}"><title><p>{escape(chapter.title or f"Глава {index}")}</p></title>{paragraphs or "<empty-line/>"}</section>'
 
 
@@ -108,25 +128,28 @@ def _cover_id(story: Story) -> str:
 def _fragment_to_blocks(html: str) -> list[str]:
     if not html.strip():
         return []
-    soup = BeautifulSoup(html, "lxml")
+    return _soup_to_blocks(BeautifulSoup(html, "lxml"), set())
+
+
+def _soup_to_blocks(soup: BeautifulSoup, note_ids: set[str]) -> list[str]:
     root = soup.body or soup
     for node in list(root.select('[id]')):
         anchor = soup.new_tag('fb2-anchor', id=str(node['id']))
         block = node if node.name in BLOCK_TAGS else node.find_parent(list(BLOCK_TAGS))
         (block or node).insert_before(anchor)
-    return _blocks_from_container(root)
+    return _blocks_from_container(root, note_ids)
 
 
-def _blocks_from_container(container: Tag) -> list[str]:
+def _blocks_from_container(container: Tag, note_ids: set[str]) -> list[str]:
     blocks: list[str] = []
     current: list[str] = []
     for child in container.children:
-        _consume_node(child, blocks, current)
+        _consume_node(child, blocks, current, note_ids)
     _flush_paragraph(blocks, current)
     return blocks
 
 
-def _consume_node(node: Tag | NavigableString, blocks: list[str], current: list[str]) -> None:
+def _consume_node(node: Tag | NavigableString, blocks: list[str], current: list[str], note_ids: set[str]) -> None:
     if isinstance(node, NavigableString):
         _consume_text(str(node), blocks, current)
         return
@@ -146,9 +169,9 @@ def _consume_node(node: Tag | NavigableString, blocks: list[str], current: list[
         return
     if node.name in BLOCK_TAGS:
         _flush_paragraph(blocks, current)
-        blocks.extend(_blocks_from_container(node))
+        blocks.extend(_blocks_from_container(node, note_ids))
         return
-    inline = _render_inline(node)
+    inline = _render_inline(node, note_ids)
     if inline:
         current.append(inline)
 
@@ -170,16 +193,17 @@ def _flush_paragraph(blocks: list[str], current: list[str]) -> None:
     current.clear()
 
 
-def _render_inline(node: Tag | NavigableString) -> str:
+def _render_inline(node: Tag | NavigableString, note_ids: set[str]) -> str:
     if isinstance(node, NavigableString):
         return escape(_normalize_text(str(node)))
     if node.name in SKIP_TAGS or node.name == "br":
         return ""
-    content = "".join(_render_inline(child) for child in node.children)
+    content = "".join(_render_inline(child, note_ids) for child in node.children)
     if node.name == 'a' and content.strip():
         href = str(node.get('href') or '')
         if href.startswith(('#', 'http://', 'https://')):
-            return f'<a l:href="{escape(href, quote=True)}">{content}</a>'
+            note_type = ' type="note"' if href.startswith('#') and href[1:] in note_ids else ''
+            return f'<a l:href="{escape(href, quote=True)}"{note_type}>{content}</a>'
     if node.name in {'sup', 'sub'} and content:
         return f'<{node.name}>{content}</{node.name}>'
     if node.name == "a" and not content.strip():

@@ -150,7 +150,7 @@ def _render_list_item(node: Tag | NavigableString) -> str:
 
 
 def _render_inline_children(node: Tag) -> str:
-    return _normalize_inline("".join(_render_inline(child) for child in node.children))
+    return "".join(_render_inline(child) for child in node.children)
 
 
 def _render_inline(node: Tag | NavigableString) -> str:
@@ -165,7 +165,7 @@ def _anchor(node: Tag | NavigableString) -> str:
 
 def _render_inline_content(node: Tag | NavigableString) -> str:
     if isinstance(node, NavigableString):
-        return escape(_normalize_text(str(node)))
+        return escape(re.sub(r"[ \t\r\n]+", " ", str(node)))
     if node.name in SKIP_TAGS:
         return ""
     if node.name == "br":
@@ -180,11 +180,6 @@ def _render_inline_content(node: Tag | NavigableString) -> str:
         href = escape(str(node.get("href", "")).strip(), quote=True)
         return f'<a href="{href}">{content}</a>' if href.startswith(("http://", "https://", "#", "chapter-")) else content
     return content
-
-
-def _normalize_inline(text: str) -> str:
-    text = re.sub(r"[ \t\r\n]+", " ", text.replace("\xa0", " "))
-    return re.sub(r">\s+<", "><", text).strip()
 
 
 def _normalize_text(text: str) -> str:

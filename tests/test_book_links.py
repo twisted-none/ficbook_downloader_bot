@@ -23,6 +23,37 @@ def linked_story(host: str = 'ficbook.net') -> Story:
 
 
 class BookLinkTests(unittest.TestCase):
+    def test_epub_preserves_spaces_at_inline_boundaries(self) -> None:
+        story = linked_story()
+        story.chapters = [Chapter('Chapter', '<p>Before <em>italic</em> after.</p>'
+                                '<p><em>One</em> <strong>two</strong>, <em>three</em>.</p>'
+                                '<p>Pre<em>fix</em> <i> word </i>end.</p>')]
+        with ZipFile(BytesIO(build_epub(story))) as archive:
+            page = ET.fromstring(archive.read('OEBPS/chapter-0001.xhtml'))
+        self.assertEqual([''.join(p.itertext()) for p in page.findall('.//{*}p')],
+                         ['Before italic after.', 'One two, three.', 'Prefix  word end.'])
+
+    def test_fb2_ficbook_footnote_points_to_nonempty_notes_section(self) -> None:
+        story = linked_story()
+        story.chapters = [Chapter('Chapter', '<p>Text<sup class="footnote-ref">'
+            '<a href="#footnote-1">[1]</a></sup>.</p>'
+            '<div class="interactive-footnotes"><p>Интерактивные примечания:</p>'
+            '<div id="footnote-1"><p>Note with <em>emphasis</em>.</p></div></div>')]
+        root = ET.fromstring(build_fb2(story))
+        href = '{http://www.w3.org/1999/xlink}href'
+        main, notes = root.findall('{*}body')
+        self.assertEqual(notes.get('name'), 'notes')
+        [reference] = main.findall('.//{*}a[@type="note"]')
+        [section] = notes.findall('{*}section')
+        self.assertEqual(reference.get(href), '#' + section.get('id'))
+        self.assertIn('Note with emphasis.', ''.join(section.itertext()))
+        self.assertIsNotNone(section.find('.//{*}emphasis'))
+        backlink = section.find('.//{*}a')
+        self.assertIn(backlink.get(href)[1:], {node.get('id') for node in main.iter()})
+        self.assertNotIn('Note with', ''.join(main.itertext()))
+        self.assertTrue(any(a.get(href) == '#chapter-0001' and a.get('type') is None
+                            for a in main.findall('.//{*}a')))
+
     def test_epub_links_resolve_across_chapters_and_toc_is_in_spine(self) -> None:
         for host in ('ficbook.net', 'archiveofourown.org', 'www.wattpad.com',
                      'hogwartsnet.ru', 'ranobelib.me', 'litnet.com'):
