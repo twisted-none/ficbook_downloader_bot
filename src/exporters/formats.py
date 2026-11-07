@@ -30,7 +30,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
 from src.exporters.html_utils import html_to_text, html_to_text_blocks, normalize_inline_text, normalize_text, tag_text
-from src.core.models import Story
+from src.core.models import CoverImage, Story
 from src.exporters.navigation import chapter_id, prepare_chapters
 from src.exporters.xml_text import xml_safe_story
 
@@ -109,7 +109,7 @@ def build_docx(story: Story) -> bytes:
     for index, chapter in enumerate(prepare_chapters(story), 1):
         heading = document.add_heading(chapter.title or f"Глава {index}", level=1)
         _add_docx_bookmark(heading, chapter_id(index))
-        _add_html_to_document(document, chapter.html)
+        _add_html_to_document(document, chapter.html, illustrations=chapter.illustrations)
     buffer = BytesIO()
     document.save(buffer)
     return buffer.getvalue()
@@ -164,8 +164,16 @@ def build_pdf(story: Story) -> bytes:
             flow.append(PageBreak())
         title = _pdf_escape(chapter.title or f"Глава {index}")
         flow.append(Paragraph(f'<a name="{chapter_id(index)}"/>{title}', styles["Heading1"]))
-        for markup in _pdf_html_blocks(chapter.html):
-            flow.append(Paragraph(markup, styles['Body']))
+        for block in _pdf_html_blocks(chapter.html, chapter.illustrations):
+            if isinstance(block, CoverImage):
+                image = Image(BytesIO(block.data))
+                scale = min(12 * cm / image.imageWidth, 16 * cm / image.imageHeight, 1)
+                image.drawWidth = image.imageWidth * scale
+                image.drawHeight = image.imageHeight * scale
+                image.hAlign = 'CENTER'
+                flow.append(image)
+            else:
+                flow.append(Paragraph(block, styles['Body']))
     def first_page(canvas, doc):
         if not has_cover:
             _draw_pdf_page_number(canvas, doc)
@@ -379,11 +387,11 @@ def _add_pdf_blocks(flow: list[Any], blocks: list[str], styles: dict[str, Paragr
         flow.append(Paragraph(_pdf_escape(block), styles["Body"]))
 
 
-def _pdf_html_blocks(html: str) -> list[str]:
+def _pdf_html_blocks(html: str, illustrations: dict[str, CoverImage] | None = None) -> list[str | CoverImage]:
     soup = BeautifulSoup(html, 'lxml')
 
-    def blocks(container: Tag) -> list[str]:
-        result: list[str] = []
+    def blocks(container: Tag) -> list[str | CoverImage]:
+        result: list[str | CoverImage] = []
         current: list[str] = []
 
         def flush() -> None:
@@ -393,14 +401,24 @@ def _pdf_html_blocks(html: str) -> list[str]:
             current.clear()
 
         for node in container.children:
+            if isinstance(node, Tag) and node.name == 'img':
+                image = (illustrations or {}).get(str(node.get('src') or ''))
+                if image is not None:
+                    flush()
+                    result.append(image)
+                continue
             if isinstance(node, Tag) and node.name in SKIP_TAGS:
                 continue
             if isinstance(node, Tag) and node.name in CONTAINER_TAGS | {'p', 'blockquote', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}:
                 flush()
                 content = blocks(node)
                 anchor = _pdf_anchor(node)
-                if content:
+                if content and isinstance(content[0], str):
                     content[0] = anchor + content[0]
+                    result.extend(content)
+                elif content:
+                    if anchor:
+                        result.append(anchor)
                     result.extend(content)
                 elif anchor:
                     current.append(anchor)
@@ -530,44 +548,52 @@ def _html_to_blocks(html: str) -> list[str]:
     return html_to_text_blocks(html)
 
 
-def _add_html_to_document(document: Document, html: str) -> None:
+def _add_html_to_document(document: Document, html: str, *,
+                          illustrations: dict[str, CoverImage] | None = None) -> None:
     if not html.strip():
         return
     soup = BeautifulSoup(html, "lxml")
-    _add_blocks(document, soup.body or soup)
+    _add_blocks(document, soup.body or soup, illustrations=illustrations)
 
 
-def _add_blocks(document: Document, container: Tag, *, quote: bool = False) -> None:
+def _add_blocks(document: Document, container: Tag, *, quote: bool = False,
+                illustrations: dict[str, CoverImage] | None = None) -> None:
     for child in container.children:
         if isinstance(child, NavigableString):
             text = _normalize_text(str(child))
             if text:
                 _add_paragraph(document, text, quote=quote)
             continue
+        if child.name == 'img':
+            image = (illustrations or {}).get(str(child.get('src') or ''))
+            if image is not None:
+                _add_docx_illustration(document.add_paragraph(), image)
+            continue
         if child.name in SKIP_TAGS:
             continue
         if child.get('id') and child.name in CONTAINER_TAGS | {'blockquote', 'ul', 'ol'}:
             _add_docx_bookmark(document.add_paragraph(), str(child['id']))
         if child.name in CONTAINER_TAGS:
-            _add_blocks(document, child, quote=quote)
+            _add_blocks(document, child, quote=quote, illustrations=illustrations)
         elif child.name == "blockquote":
-            _add_blocks(document, child, quote=True)
+            _add_blocks(document, child, quote=True, illustrations=illustrations)
         elif child.name in {"ul", "ol"}:
-            _add_list(document, child, ordered=child.name == "ol", quote=quote)
+            _add_list(document, child, ordered=child.name == "ol", quote=quote, illustrations=illustrations)
         elif child.name == "p":
             paragraph = _add_paragraph(document, "", quote=quote, note_heading=_is_note_heading(_tag_text(child)))
             if child.get('id'):
                 _add_docx_bookmark(paragraph, str(child['id']))
-            _add_inline_runs(paragraph, child)
+            _add_inline_runs(paragraph, child, illustrations=illustrations)
         elif child.name == "br":
             document.add_paragraph()
         else:
             paragraph = _add_paragraph(document, "", quote=quote)
             fragment = BeautifulSoup(str(child), 'lxml')
-            _add_inline_runs(paragraph, fragment.body or fragment)
+            _add_inline_runs(paragraph, fragment.body or fragment, illustrations=illustrations)
 
 
-def _add_list(document: Document, list_node: Tag, *, ordered: bool, quote: bool) -> None:
+def _add_list(document: Document, list_node: Tag, *, ordered: bool, quote: bool,
+              illustrations: dict[str, CoverImage] | None = None) -> None:
     style = "List Number" if ordered else "List Bullet"
     for child in list_node.children:
         if not isinstance(child, Tag) or child.name != "li":
@@ -577,9 +603,9 @@ def _add_list(document: Document, list_node: Tag, *, ordered: bool, quote: bool)
             _add_docx_bookmark(paragraph, str(child['id']))
         if quote:
             paragraph.paragraph_format.left_indent = Inches(0.35)
-        _add_inline_runs(paragraph, child, skip_nested_lists=True)
+        _add_inline_runs(paragraph, child, skip_nested_lists=True, illustrations=illustrations)
         for nested in child.find_all(["ul", "ol"], recursive=False):
-            _add_list(document, nested, ordered=nested.name == "ol", quote=quote)
+            _add_list(document, nested, ordered=nested.name == "ol", quote=quote, illustrations=illustrations)
 
 
 def _add_paragraph(document: Document, text: str, *, quote: bool = False, note_heading: bool = False):
@@ -600,10 +626,16 @@ def _add_inline_runs(
     skip_nested_lists: bool = False,
     container: Any = None,
     vertical: str = '',
+    illustrations: dict[str, CoverImage] | None = None,
 ) -> None:
     for child in node.children:
         if isinstance(child, NavigableString):
             _add_run(paragraph, str(child), bold=bold, italic=italic, container=container, vertical=vertical)
+            continue
+        if child.name == 'img':
+            image = (illustrations or {}).get(str(child.get('src') or ''))
+            if image is not None:
+                _add_docx_illustration(paragraph, image, container)
             continue
         if child.name in SKIP_TAGS:
             continue
@@ -614,7 +646,8 @@ def _add_inline_runs(
         href = str(child.get('href') or '')
         if child.name == 'a' and href.startswith(('#', 'http://', 'https://')):
             hyperlink = _docx_hyperlink(paragraph, href, container)
-            _add_inline_runs(paragraph, child, bold=bold, italic=italic, container=hyperlink, vertical=vertical)
+            _add_inline_runs(paragraph, child, bold=bold, italic=italic, container=hyperlink, vertical=vertical,
+                             illustrations=illustrations)
             continue
         if child.name == "br":
             run = paragraph.add_run()
@@ -630,7 +663,24 @@ def _add_inline_runs(
             skip_nested_lists=skip_nested_lists,
             container=container,
             vertical=child.name if child.name in {'sup', 'sub'} else vertical,
+            illustrations=illustrations,
         )
+
+
+def _add_docx_illustration(paragraph: Any, image: CoverImage, container: Any = None) -> None:
+    data = _docx_cover_bytes(image.data)
+    if data is None:
+        return
+    try:
+        dimensions = DocxImage.from_blob(data)
+        scale = min(Inches(5.8) / dimensions.width, Inches(7) / dimensions.height, 1)
+        run = paragraph.add_run()
+        run.add_picture(BytesIO(data), width=int(dimensions.width * scale), height=int(dimensions.height * scale))
+        if container is not None:
+            container.append(run._r)
+    except (UnrecognizedImageError, InvalidImageStreamError, UnexpectedEndOfFileError,
+            OSError, ValueError, StructError):
+        logger.warning('DOCX chapter illustration could not be embedded')
 
 
 def _add_run(paragraph: Any, text: str, *, bold: bool, italic: bool, container: Any = None, vertical: str = '') -> None:

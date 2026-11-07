@@ -29,13 +29,16 @@ li { margin: 0.25em 0; }
 body.cover-page { margin: 0; padding: 0; text-align: center; }
 .cover { margin: 0; padding: 0; }
 .cover img { display: block; width: auto; height: auto; max-width: 100%; max-height: 95vh; margin: 0 auto; }
+.illustration { display: block; max-width: 100%; max-height: 90vh; margin: 0 auto; }
 """.strip()
 
 
 def build_epub(story: Story) -> bytes:
     story = xml_safe_story(story)
     book_id = str(uuid5(NAMESPACE_URL, story.source_url))
-    chapters = [_chapter_page(index, chapter) for index, chapter in enumerate(prepare_chapters(story), 1)]
+    prepared = prepare_chapters(story)
+    illustrations = {name: image for chapter in prepared for name, image in chapter.illustrations.items()}
+    chapters = [_chapter_page(index, chapter) for index, chapter in enumerate(prepared, 1)]
     intro = _page("intro.xhtml", "Аннотация", _intro_body(story))
     files = [intro, *chapters]
     if story.cover:
@@ -45,11 +48,13 @@ def build_epub(story: Story) -> bytes:
         archive.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
         archive.writestr("META-INF/container.xml", _container_xml(), compress_type=ZIP_DEFLATED)
         archive.writestr("OEBPS/styles/book.css", CSS, compress_type=ZIP_DEFLATED)
-        archive.writestr("OEBPS/content.opf", _opf(story, book_id, files), compress_type=ZIP_DEFLATED)
+        archive.writestr("OEBPS/content.opf", _opf(story, book_id, files, illustrations), compress_type=ZIP_DEFLATED)
         archive.writestr("OEBPS/toc.ncx", _ncx(story, book_id, files), compress_type=ZIP_DEFLATED)
         archive.writestr("OEBPS/nav.xhtml", _nav(story, files), compress_type=ZIP_DEFLATED)
         if story.cover:
             archive.writestr(_cover_archive_path(story), story.cover.data, compress_type=ZIP_DEFLATED)
+        for name, image in illustrations.items():
+            archive.writestr(f'OEBPS/images/{name}', image.data, compress_type=ZIP_STORED)
         for page in files:
             archive.writestr(f"OEBPS/{page['href']}", page["content"], compress_type=ZIP_DEFLATED)
     return buffer.getvalue()
@@ -63,7 +68,7 @@ def _chapter_page(index: int, chapter: Chapter) -> dict[str, str]:
         if match:
             target_index = int(match.group(1) or match.group(2))
             link['href'] = f'chapter-{target_index:04d}.xhtml#{destination}'
-    body = _clean_blocks((soup.body or soup).decode_contents()) or "<p></p>"
+    body = _clean_blocks((soup.body or soup).decode_contents(), images=chapter.illustrations.keys()) or "<p></p>"
     return _page(f"chapter-{index:04}.xhtml", chapter.title or f"Глава {index}", body, chapter_id(index))
 
 
@@ -101,63 +106,63 @@ def _page(href: str, title: str, body: str, anchor: str = '') -> dict[str, str]:
     return {"href": href, "title": title, "content": content}
 
 
-def _clean_blocks(html: str, css_class: str = "") -> str:
+def _clean_blocks(html: str, css_class: str = "", *, images=()) -> str:
     if not html.strip():
         return ""
     soup = BeautifulSoup(html, "lxml")
-    blocks = "".join(_render_block(child) for child in (soup.body or soup).children)
+    blocks = "".join(_render_block(child, images) for child in (soup.body or soup).children)
     if css_class and blocks:
         return f'<section class="{css_class}">{blocks}</section>'
     return blocks
 
 
-def _render_block(node: Tag | NavigableString) -> str:
+def _render_block(node: Tag | NavigableString, images=()) -> str:
     anchor = _anchor(node)
-    return anchor + _render_block_content(node)
+    return anchor + _render_block_content(node, images)
 
 
-def _render_block_content(node: Tag | NavigableString) -> str:
+def _render_block_content(node: Tag | NavigableString, images) -> str:
     if isinstance(node, NavigableString):
         text = _normalize_text(str(node))
         return f"<p>{escape(text)}</p>" if text else ""
-    if node.name in SKIP_TAGS:
+    if node.name in SKIP_TAGS and node.name != 'img':
         return ""
     if node.name in CONTAINER_TAGS:
-        return "".join(_render_block(child) for child in node.children)
+        return "".join(_render_block(child, images) for child in node.children)
     if node.name in {"ul", "ol"}:
-        items = "".join(_render_list_item(child) for child in node.children)
+        items = "".join(_render_list_item(child, images) for child in node.children)
         return f"<{node.name}>{items}</{node.name}>" if items else ""
     if node.name == "blockquote":
-        content = "".join(_render_block(child) for child in node.children) or _render_inline_children(node)
+        content = "".join(_render_block(child, images) for child in node.children) or _render_inline_children(node, images)
         return f"<blockquote>{content}</blockquote>" if content else ""
     if node.name == "p":
-        content = _render_inline_children(node)
+        content = _render_inline_children(node, images)
         css_class = ' class="note-title"' if _is_note_heading(node) else ""
         return f"<p{css_class}>{content}</p>" if content else ""
     if node.name == "br":
         return ""
-    content = _render_inline(node)
+    content = _render_inline(node, images)
     return f"<p>{content}</p>" if content else ""
 
 
-def _render_list_item(node: Tag | NavigableString) -> str:
+def _render_list_item(node: Tag | NavigableString, images) -> str:
     anchor = _anchor(node)
     if isinstance(node, NavigableString):
         text = escape(_normalize_text(str(node)))
         return f"<li>{anchor}{text}</li>" if text else ""
     if node.name != "li":
-        return anchor + _render_block(node)
-    content = _render_inline_children(node) or "".join(_render_block(child) for child in node.children)
+        return anchor + _render_block(node, images)
+    content = _render_inline_children(node, images) or "".join(_render_block(child, images) for child in node.children)
     return f"<li>{anchor}{content}</li>" if content or anchor else ""
 
 
-def _render_inline_children(node: Tag) -> str:
-    return "".join(_render_inline(child) for child in node.children)
+def _render_inline_children(node: Tag, images) -> str:
+    return "".join(_render_inline(child, images) for child in node.children)
 
 
-def _render_inline(node: Tag | NavigableString) -> str:
+def _render_inline(node: Tag | NavigableString, images) -> str:
     anchor = _anchor(node)
-    return anchor + _render_inline_content(node)
+    return anchor + _render_inline_content(node, images)
 
 
 def _anchor(node: Tag | NavigableString) -> str:
@@ -165,14 +170,18 @@ def _anchor(node: Tag | NavigableString) -> str:
     return f'<a id="{escape(str(value), quote=True)}"></a>' if value else ''
 
 
-def _render_inline_content(node: Tag | NavigableString) -> str:
+def _render_inline_content(node: Tag | NavigableString, images) -> str:
     if isinstance(node, NavigableString):
         return escape(re.sub(r"[ \t\r\n]+", " ", str(node)))
+    if node.name == 'img' and node.get('src') in images:
+        src = escape(str(node['src']), quote=True)
+        alt = escape(str(node.get('alt') or 'Иллюстрация'), quote=True)
+        return f'<img class="illustration" src="images/{src}" alt="{alt}"/>'
     if node.name in SKIP_TAGS:
         return ""
     if node.name == "br":
         return "<br />"
-    content = _render_inline_children(node)
+    content = _render_inline_children(node, images)
     mapped = INLINE_TAGS.get(node.name)
     if node.name in {'sup', 'sub'}:
         return f'<{node.name}>{content}</{node.name}>'
@@ -195,8 +204,11 @@ def _container_xml() -> str:
 </container>"""
 
 
-def _opf(story: Story, book_id: str, pages: list[dict[str, str]]) -> str:
+def _opf(story: Story, book_id: str, pages: list[dict[str, str]], illustrations) -> str:
     items = "".join(f'<item id="p{i}" href="{p["href"]}" media-type="application/xhtml+xml"/>' for i, p in enumerate(pages))
+    items += ''.join(f'<item id="illustration-{index}" href="images/{escape(name, quote=True)}" '
+                     f'media-type="{escape(image.mime, quote=True)}"/>'
+                     for index, (name, image) in enumerate(illustrations.items(), 1))
     order = [f'p{i}' for i, _ in enumerate(pages)]
     order.insert(int(bool(story.cover)) + int(story.opening_page == 'annotation'), 'nav')
     spine = ''.join(f'<itemref idref="{item}"/>' for item in order)

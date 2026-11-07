@@ -184,13 +184,13 @@ def check_chapter_count(count: int) -> None:
         raise ResourceLimitError('В произведении слишком много глав. Выбери отдельные главы для скачивания.')
 
 
-def account_chapter(html: str) -> None:
+def account_chapter(html: str, *, image_bytes: int = 0) -> None:
     check_deadline()
     budget = _budget.get()
     if budget is None:
         return
     budget.chapters += 1
-    budget.story_bytes += len(html.encode('utf-8'))
+    budget.story_bytes += len(html.encode('utf-8')) + image_bytes
     check_chapter_count(budget.chapters)
     if budget.story_bytes > budget.limits.max_story_bytes:
         raise ResourceLimitError()
@@ -199,6 +199,7 @@ def account_chapter(html: str) -> None:
 def validate_story(story) -> None:
     check_chapter_count(len(story.chapters))
     size = sum(len(chapter.html.encode('utf-8')) for chapter in story.chapters)
+    size += sum(len(image.data) for chapter in story.chapters for image in chapter.illustrations.values())
     size += len(story.annotation_html.encode('utf-8')) + len(story.description.encode('utf-8'))
     if story.cover:
         size += len(story.cover.data)

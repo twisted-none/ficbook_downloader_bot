@@ -12,11 +12,14 @@ class Chapter:
     title: str
     html: str
     source_url: str = ""
+    illustrations: dict[str, CoverImage] = field(default_factory=dict)
 
     @classmethod
-    def from_download(cls, title: str, html: str, source_url: str = '') -> 'Chapter':
-        account_chapter(html)
-        return cls(title, html, source_url)
+    def from_download(cls, title: str, html: str, source_url: str = '', *,
+                      illustrations: dict[str, CoverImage] | None = None) -> 'Chapter':
+        images = illustrations or {}
+        account_chapter(html, image_bytes=sum(len(image.data) for image in images.values()))
+        return cls(title, html, source_url, images)
 
 
 @dataclass(slots=True)

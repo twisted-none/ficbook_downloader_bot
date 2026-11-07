@@ -3,7 +3,7 @@
 from dataclasses import fields, replace
 import re
 
-from src.core.models import Chapter, Story
+from src.core.models import Story
 
 
 _INVALID_XML = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]')
@@ -20,8 +20,8 @@ def xml_safe_story(story: Story) -> Story:
         if isinstance(value, str):
             changes[field.name] = _clean(value)
         elif field.name == 'chapters':
-            changes[field.name] = [Chapter(_clean(chapter.title), _clean(chapter.html), _clean(chapter.source_url))
-                                   for chapter in value]
+            changes[field.name] = [replace(chapter, title=_clean(chapter.title), html=_clean(chapter.html),
+                                           source_url=_clean(chapter.source_url)) for chapter in value]
         elif isinstance(value, list):
             changes[field.name] = [_clean(text) for text in value]
     return replace(story, **changes)

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from html import escape
 from http.cookiejar import CookieJar
+from io import BytesIO
 import base64
 import hashlib
 import hmac
@@ -19,10 +20,14 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from urllib.request import Request
 
 from bs4 import BeautifulSoup
+from PIL import Image
 
 from src.core.models import Chapter, ChapterPreview, CoverImage, Story, StoryPreview
 from src.core.progress import report_title
-from src.core.limits import bounded_operation, bounded_sleep as sleep, check_chapter_count, read_bounded
+from src.core.limits import (
+    ResourceLimitError, bounded_operation, bounded_sleep as sleep, check_chapter_count,
+    check_deadline, current_limits, image_is_safe, read_bounded, request_timeout,
+)
 from src.sources.safe_http import SafeRedirectHandler, UnsafeRequestError, build_safe_opener, require_https_url
 
 API_ROOT = "https://api.cdnlibs.org/api/manga"
@@ -32,8 +37,11 @@ AUTH_TOKEN_URL = "https://api.cdnlibs.org/api/auth/oauth/token"
 AUTH_CALLBACK_URL = "https://ranobelib.me/ru/front/auth/oauth/callback"
 ALTCHA_CHALLENGE_URL = "https://auth.lib.social/altcha/challenge"
 MAX_COVER_BYTES = 8 * 1024 * 1024
+MAX_ILLUSTRATION_BYTES = 16 * 1024 * 1024
 API_HOSTS = frozenset({"api.cdnlibs.org"})
 AUTH_HOSTS = frozenset({"auth.lib.social"})
+ILLUSTRATION_HOSTS = frozenset({'ranobelib.me', 'cover.cdnlibs.org', 'api.cdnlibs.org'})
+_ILLUSTRATION_PATH = re.compile(r'/uploads/ranobe/[0-9]+/chapters/[0-9]+/[A-Za-z0-9_-]+\.[A-Za-z0-9]+')
 
 
 def _is_oauth_callback(url: str) -> bool:
@@ -137,6 +145,7 @@ class RanobelibClient:
         self._auth_opener = build_safe_opener(AUTH_HOSTS, cookie_jar=CookieJar(), redirect_handler=_OAuthRedirectHandler())
         self._api_opener = build_safe_opener(API_HOSTS)
         self._cover_opener = build_safe_opener()
+        self._illustration_opener = build_safe_opener(ILLUSTRATION_HOSTS)
 
     @bounded_operation
     def download(
@@ -151,17 +160,46 @@ class RanobelibClient:
         selected = self._select_chapters(self._chapters(slug), chapter_numbers)
         check_chapter_count(len(selected))
         chapters: list[Chapter] = []
+        image_bytes_left = min(current_limits().max_story_bytes // 2, MAX_ILLUSTRATION_BYTES)
+        image_requests_left = 64
         for position, chapter in enumerate(selected, 1):
             if progress:
                 progress(f"Скачиваю главы: {position}/{len(selected)}")
             data = self._chapter(slug, chapter)
             html = self._content_html(data.get("content"), data.get("attachments"))
-            if not BeautifulSoup(html, "lxml").get_text(" ", strip=True) and "<img" not in html:
+            soup = BeautifulSoup(html, 'lxml')
+            chapter_url = f'https://ranobelib.me/ru/{slug}/v{chapter.volume}/c{chapter.number}'
+            illustrations = {}
+            fallback_added = False
+            nodes = soup.find_all('img')
+            if not soup.get_text(' ', strip=True) and not nodes:
                 raise RanobelibError(
                     f"RanobeLIB вернул пустую главу {chapter.index}.",
                     user_message=f"Глава {chapter.index} сейчас недоступна на RanobeLIB.",
                 )
-            chapters.append(Chapter.from_download(chapter.title, html, f"https://ranobelib.me/{slug}/v{chapter.volume}/c{chapter.number}"))
+            for index, node in enumerate(nodes, 1):
+                pieces = ()
+                if image_requests_left and image_bytes_left:
+                    image_requests_left -= 1
+                    pieces = self._illustration(str(node.get('src') or ''), image_bytes_left)
+                if pieces:
+                    alt = str(node.get('alt') or 'Иллюстрация')
+                    for part, image in enumerate(pieces, 1):
+                        name = f'illustration-{chapter.index}-{index}-{part}.{image.extension}'
+                        illustrations[name] = image
+                        image_bytes_left -= len(image.data)
+                        node.insert_before(soup.new_tag('img', src=name, alt=alt))
+                    node.decompose()
+                elif not fallback_added:
+                    link = soup.new_tag('a', href=chapter_url)
+                    link.string = 'Иллюстрация недоступна. Открыть оригинал главы на RanobeLIB'
+                    node.replace_with(link)
+                    fallback_added = True
+                else:
+                    node.decompose()
+            if nodes:
+                html = (soup.body or soup).decode_contents()
+            chapters.append(Chapter.from_download(chapter.title, html, chapter_url, illustrations=illustrations))
         return self._story(url, info, chapters)
 
     @bounded_operation
@@ -605,6 +643,56 @@ class RanobelibClient:
         extension = (mimetypes.guess_extension(mime) or ".jpg").lstrip(".")
         return CoverImage(data, mime, extension)
 
+    def _illustration(self, value: str, byte_budget: int) -> tuple[CoverImage, ...]:
+        try:
+            url = urljoin('https://ranobelib.me/', value)
+            parts = require_https_url(url, ILLUSTRATION_HOSTS)
+            if parts.query or not _ILLUSTRATION_PATH.fullmatch(parts.path):
+                return ()
+            request = Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://ranobelib.me/',
+                                            'Accept': 'image/png,image/jpeg'})
+            with self._illustration_opener.open(request, timeout=request_timeout(15)) as response:
+                final = require_https_url(response.geturl(), ILLUSTRATION_HOSTS)
+                if final.path != parts.path or final.query:
+                    return ()
+                payload = read_bounded(response, min(byte_budget, current_limits().max_response_bytes))
+            if not image_is_safe(payload):
+                return ()
+            with Image.open(BytesIO(payload)) as image:
+                fmt = image.format
+                if fmt not in {'PNG', 'JPEG'}:
+                    return ()
+                image.load()
+                mime, extension = ('image/png', 'png') if fmt == 'PNG' else ('image/jpeg', 'jpg')
+                if image.height <= 2 * image.width:
+                    return (CoverImage(payload, mime, extension),)
+                # A long strip is unreadable when squeezed onto one print page.
+                strip_height = max(1, image.width * 4 // 3)
+                if image.height > strip_height * 32:
+                    return ()
+                pieces = []
+                remaining = byte_budget
+                for top in range(0, image.height, strip_height):
+                    check_deadline()
+                    with image.crop((0, top, image.width, min(image.height, top + strip_height))) as strip:
+                        transparency = strip.info.get('transparency')
+                        strip.info.clear()
+                        if fmt == 'PNG' and transparency is not None:
+                            strip.info['transparency'] = transparency
+                        with BytesIO() as buffer:
+                            strip.save(buffer, format=fmt, quality=95)
+                            data = buffer.getvalue()
+                    remaining -= len(data)
+                    if remaining < 0:
+                        return ()
+                    pieces.append(CoverImage(data, mime, extension))
+                return tuple(pieces)
+        except HTTPError as error:
+            error.close()
+        except (URLError, OSError, ValueError, SyntaxError, ResourceLimitError):
+            check_deadline()
+        return ()
+
     def _content_html(self, value: Any, attachments: Any = None) -> str:
         if isinstance(value, str):
             soup = BeautifulSoup(value, "lxml")
@@ -647,9 +735,12 @@ class RanobelibClient:
             return f"<hr{anchor}/>"
         if kind in {"image", "image_block"}:
             src = str(attrs.get("src") or attrs.get("url") or "")
-            src = attachments.get(src, src)
+            items = attrs.get('images')
+            refs = [str(item['image']) for item in (items if isinstance(items, list) else [])
+                    if isinstance(item, dict) and item.get('image')]
             alt = escape(str(attrs.get("alt") or attrs.get("title") or ""), quote=True)
-            return f'<p><img src="{escape(src, quote=True)}" alt="{alt}"/></p>' if src else ""
+            return ''.join(f'<p><img src="{escape(attachments.get(ref, ref), quote=True)}" alt="{alt}"/></p>'
+                           for ref in (refs or [src]) if ref)
         return f'<div{anchor}>{children}</div>' if anchor else children
 
     def _render_text(self, value: str, marks: Any) -> str:

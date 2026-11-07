@@ -39,6 +39,8 @@ def build_fb2(story: Story) -> bytes:
     language = _normalize_language(story.language)
     coverpage = _coverpage_xml(story)
     binary = _cover_binary_xml(story)
+    binary += ''.join(_binary_xml(name, image.mime, image.data)
+                      for chapter in prepared for name, image in chapter.illustrations.items())
     custom_pages = (
         f'<custom-info info-type="ficbook-pages">{escape(story.page_count)}</custom-info>'
         if story.page_count
@@ -56,6 +58,7 @@ def build_fb2(story: Story) -> bytes:
 
 def _chapter_to_xml(chapter: Chapter, index: int, notes: list[str]) -> str:
     soup = BeautifulSoup(chapter.html, 'lxml')
+    images = chapter.illustrations.keys()
     references = {str(link['href'])[1:] for link in soup.select('a[href^="#"]')}
     note_ids: set[str] = set()
     for container in soup.select('.interactive-footnotes'):
@@ -64,7 +67,7 @@ def _chapter_to_xml(chapter: Chapter, index: int, notes: list[str]) -> str:
             if note_id not in references or not node.get_text(strip=True):
                 continue
             # The section itself is the link target and contains the note text.
-            blocks = ''.join(_fragment_to_blocks(node.decode_contents()))
+            blocks = ''.join(_fragment_to_blocks(node.decode_contents(), images=images))
             if blocks:
                 notes.append(f'<section id="{escape(note_id, quote=True)}">{blocks}</section>')
                 note_ids.add(note_id)
@@ -73,7 +76,7 @@ def _chapter_to_xml(chapter: Chapter, index: int, notes: list[str]) -> str:
         if (note_ids and len(remaining) == 1
                 and container.get_text(strip=True) == 'Интерактивные примечания:'):
             container.decompose()
-    paragraphs = "".join(_soup_to_blocks(soup, note_ids))
+    paragraphs = "".join(_soup_to_blocks(soup, note_ids, images))
     return f'<section id="{chapter_id(index)}"><title><p>{escape(chapter.title or f"Глава {index}")}</p></title>{paragraphs or "<empty-line/>"}</section>'
 
 
@@ -122,8 +125,12 @@ def _coverpage_xml(story: Story) -> str:
 def _cover_binary_xml(story: Story) -> str:
     if not story.cover:
         return ""
-    payload = b64encode(story.cover.data).decode("ascii")
-    return f'<binary id="{_cover_id(story)}" content-type="{escape(story.cover.mime)}">{payload}</binary>'
+    return _binary_xml(_cover_id(story), story.cover.mime, story.cover.data)
+
+
+def _binary_xml(name: str, mime: str, data: bytes) -> str:
+    payload = b64encode(data).decode('ascii')
+    return f'<binary id="{escape(name, quote=True)}" content-type="{escape(mime, quote=True)}">{payload}</binary>'
 
 
 def _cover_id(story: Story) -> str:
@@ -131,33 +138,39 @@ def _cover_id(story: Story) -> str:
     return f"cover.{extension}"
 
 
-def _fragment_to_blocks(html: str) -> list[str]:
+def _fragment_to_blocks(html: str, *, images=()) -> list[str]:
     if not html.strip():
         return []
-    return _soup_to_blocks(BeautifulSoup(html, "lxml"), set())
+    return _soup_to_blocks(BeautifulSoup(html, "lxml"), set(), images)
 
 
-def _soup_to_blocks(soup: BeautifulSoup, note_ids: set[str]) -> list[str]:
+def _soup_to_blocks(soup: BeautifulSoup, note_ids: set[str], images) -> list[str]:
     root = soup.body or soup
     for node in list(root.select('[id]')):
         anchor = soup.new_tag('fb2-anchor', id=str(node['id']))
         block = node if node.name in BLOCK_TAGS else node.find_parent(list(BLOCK_TAGS))
         (block or node).insert_before(anchor)
-    return _blocks_from_container(root, note_ids)
+    return _blocks_from_container(root, note_ids, images)
 
 
-def _blocks_from_container(container: Tag, note_ids: set[str]) -> list[str]:
+def _blocks_from_container(container: Tag, note_ids: set[str], images) -> list[str]:
     blocks: list[str] = []
     current: list[str] = []
     for child in container.children:
-        _consume_node(child, blocks, current, note_ids)
+        _consume_node(child, blocks, current, note_ids, images)
     _flush_paragraph(blocks, current)
     return blocks
 
 
-def _consume_node(node: Tag | NavigableString, blocks: list[str], current: list[str], note_ids: set[str]) -> None:
+def _consume_node(node: Tag | NavigableString, blocks: list[str], current: list[str], note_ids: set[str], images) -> None:
     if isinstance(node, NavigableString):
         _consume_text(str(node), blocks, current)
+        return
+    if node.name == 'img':
+        image = _render_inline(node, note_ids, images)
+        if image:
+            _flush_paragraph(blocks, current)
+            blocks.append(image)
         return
     if node.name in SKIP_TAGS:
         return
@@ -175,9 +188,9 @@ def _consume_node(node: Tag | NavigableString, blocks: list[str], current: list[
         return
     if node.name in BLOCK_TAGS:
         _flush_paragraph(blocks, current)
-        blocks.extend(_blocks_from_container(node, note_ids))
+        blocks.extend(_blocks_from_container(node, note_ids, images))
         return
-    inline = _render_inline(node, note_ids)
+    inline = _render_inline(node, note_ids, images)
     if inline:
         current.append(inline)
 
@@ -199,12 +212,14 @@ def _flush_paragraph(blocks: list[str], current: list[str]) -> None:
     current.clear()
 
 
-def _render_inline(node: Tag | NavigableString, note_ids: set[str]) -> str:
+def _render_inline(node: Tag | NavigableString, note_ids: set[str], images) -> str:
     if isinstance(node, NavigableString):
         return escape(_normalize_text(str(node)))
+    if node.name == 'img' and node.get('src') in images:
+        return f'<image l:href="#{escape(str(node["src"]), quote=True)}"/>'
     if node.name in SKIP_TAGS or node.name == "br":
         return ""
-    content = "".join(_render_inline(child, note_ids) for child in node.children)
+    content = "".join(_render_inline(child, note_ids, images) for child in node.children)
     if node.name == 'a' and content.strip():
         href = str(node.get('href') or '')
         if href.startswith(('#', 'http://', 'https://')):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Tag
@@ -26,8 +27,11 @@ def prepare_chapters(story: Story) -> list[Chapter]:
     targets: dict[str, Tag] = {}
     for index, (chapter, soup) in enumerate(zip(story.chapters, soups), 1):
         root = soup.body or soup
-        for node in root.select('script, style, iframe, audio, video, img'):
+        for node in root.select('script, style, iframe, audio, video'):
             node.decompose()
+        for image in root.select('img'):
+            if image.get('src') not in chapter.illustrations:
+                image.decompose()
         mapping: dict[str, str] = {}
         for node in (soup.html, soup.body):
             if node and node.get('id'):
@@ -118,6 +122,6 @@ def prepare_chapters(story: Story) -> list[Chapter]:
                 backlink.string = f' [Назад {index}]'
 
     return [
-        Chapter(chapter.title, (soup.body or soup).decode_contents(), chapter.source_url)
+        replace(chapter, html=(soup.body or soup).decode_contents())
         for chapter, soup in zip(story.chapters, soups)
     ]
