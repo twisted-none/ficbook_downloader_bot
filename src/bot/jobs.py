@@ -12,7 +12,7 @@ from src.sources.registry import normalize_collection_url, normalize_url, is_fic
 
 
 def download_key(user_id: int, chat_id: int, url: str, formats: tuple[str, ...],
-                 cover_enabled: bool, chapter_numbers: set[int] | None) -> tuple:
+                 cover_enabled: bool, chapter_numbers: set[int] | None, opening_page: str = 'default') -> tuple:
     url = normalize_collection_url(url) if is_ficbook_collection_url(url) else normalize_url(url)
     parts = urlsplit(url)
     # AO3 chapter links still download the whole work unless chapters were selected.
@@ -20,8 +20,9 @@ def download_key(user_id: int, chat_id: int, url: str, formats: tuple[str, ...],
         match = re.match(r'/works/(\d+)(?:/|$)', parts.path)
         if match:
             url = 'https://archiveofourown.org/works/' + match.group(1)
-    return (user_id, chat_id, url, tuple(sorted(formats)), cover_enabled,
-            tuple(sorted(chapter_numbers)) if chapter_numbers is not None else None)
+    key = (user_id, chat_id, url, tuple(sorted(formats)), cover_enabled,
+           tuple(sorted(chapter_numbers)) if chapter_numbers is not None else None)
+    return key if opening_page == 'default' else (*key, opening_page)
 
 
 @dataclass(slots=True)

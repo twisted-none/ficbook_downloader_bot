@@ -1613,9 +1613,31 @@ class FicbookClient:
         return str(value or "").replace("\xa0", " ").strip()
 
 
+def _is_missing_wattpad_work(url: str, error: Exception) -> bool:
+    if _site_key(url) != 'www.wattpad.com' or not isinstance(error, HTTPErrorFFF):
+        return False
+    endpoint = urlsplit(error.url)
+    if endpoint.hostname not in {'www.wattpad.com', 'wattpad.com'}:
+        return False
+    part = re.fullmatch(r'/v4/parts/[0-9]+', endpoint.path)
+    story = re.fullmatch(r'/api/v3/stories/[0-9]+', endpoint.path)
+    if error.status_code in {404, 410} and (part or story):
+        return True
+    body = error.data
+    if error.status_code != 400 or not part or not isinstance(body, (bytes, str)) or len(body) > 4096:
+        return False
+    try:
+        data = json.loads(body)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(data, dict) and data.get('message') == 'Story part not found'
+
+
 def _friendly_download_error(url: str, error: Exception) -> FicbookError:
     if isinstance(error, ResourceLimitError):
         raise error
+    if _is_missing_wattpad_work(url, error):
+        return FicbookNotFoundError('Не удалось найти фанфик или главу на Wattpad.')
     site_name = _site_display_name(url)
     if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3MaintenanceError):
         return AO3SiteUnavailableError(str(error))
@@ -1653,6 +1675,8 @@ def _ficbook_site_unavailable_error(error: Exception) -> FicbookSiteUnavailableE
 
 
 def _friendly_preview_error(url: str, error: Exception) -> FicbookError:
+    if _is_missing_wattpad_work(url, error):
+        return FicbookNotFoundError('Не удалось найти фанфик или главу на Wattpad.')
     if _site_key(url) == 'archiveofourown.org' and isinstance(error, AO3MaintenanceError):
         return AO3SiteUnavailableError(str(error))
     site_name = _site_display_name(url)

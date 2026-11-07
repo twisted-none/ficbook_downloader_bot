@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 
 from src.core.limits import account_chapter
 
+OPENING_PAGES = ('default', 'annotation', 'contents')
+
 
 @dataclass(slots=True)
 class Chapter:
@@ -62,3 +64,4 @@ class Story:
     translator: str = ""
     # Full frontmatter already includes title, credits and size.
     annotation_complete: bool = False
+    opening_page: str = 'default'

@@ -32,6 +32,7 @@ from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, S
 from src.exporters.html_utils import html_to_text, html_to_text_blocks, normalize_inline_text, normalize_text, tag_text
 from src.core.models import Story
 from src.exporters.navigation import chapter_id, prepare_chapters
+from src.exporters.xml_text import xml_safe_story
 
 ALLOWED_FORMATS: tuple[str, ...] = ("fb2", "epub", "txt", "docx", "pdf")
 logger = logging.getLogger(__name__)
@@ -65,11 +66,12 @@ def build_txt(story: Story) -> bytes:
     if story.pairings and not story.annotation_complete:
         parts.append(f"Пейринг и персонажи: {_pairing_text(story)}")
     annotation = _html_to_text(story.annotation_html or story.description)
-    if annotation:
-        parts.extend(["Аннотация:", annotation])
+    annotation_parts = ['Аннотация:', annotation] if annotation else []
+    toc = []
     if story.chapters:
-        parts.append('Оглавление:')
-        parts.extend(f'{index}. {chapter.title or f"Глава {index}"}' for index, chapter in enumerate(story.chapters, 1))
+        toc = ['Оглавление:', *(f'{index}. {chapter.title or f"Глава {index}"}'
+                                for index, chapter in enumerate(story.chapters, 1))]
+    parts.extend(toc + annotation_parts if story.opening_page == 'contents' else annotation_parts + toc)
     for index, chapter in enumerate(story.chapters, 1):
         title = chapter.title or f"Глава {index}"
         body = _html_to_text(chapter.html)
@@ -78,10 +80,13 @@ def build_txt(story: Story) -> bytes:
 
 
 def build_docx(story: Story) -> bytes:
+    story = xml_safe_story(story)
     document = Document()
     _configure_docx(document, story)
     _add_docx_page_footer(document)
     _add_docx_cover(document, story)
+    if story.opening_page == 'contents':
+        _add_docx_toc(document, story)
     if not story.annotation_complete:
         document.add_heading(story.title, level=0)
         document.add_paragraph(f"Автор: {story.author}")
@@ -92,13 +97,14 @@ def build_docx(story: Story) -> bytes:
             document.add_paragraph(f"Слов: {story.word_count}")
         if story.pairings:
             document.add_paragraph(f"Пейринг и персонажи: {_pairing_text(story)}")
-        _add_docx_toc(document, story)
+        if story.opening_page == 'default':
+            _add_docx_toc(document, story)
     annotation = _html_to_blocks(story.annotation_html or story.description)
     if annotation:
         heading = document.add_heading("Аннотация", level=1)
         _add_docx_bookmark(heading, 'annotation')
         _add_html_to_document(document, story.annotation_html or story.description)
-    if story.annotation_complete:
+    if story.opening_page == 'annotation' or (story.opening_page == 'default' and story.annotation_complete):
         _add_docx_toc(document, story)
     for index, chapter in enumerate(prepare_chapters(story), 1):
         heading = document.add_heading(chapter.title or f"Глава {index}", level=1)
@@ -110,6 +116,7 @@ def build_docx(story: Story) -> bytes:
 
 
 def build_pdf(story: Story) -> bytes:
+    story = xml_safe_story(story)
     buffer = BytesIO()
     regular_font, bold_font = _register_pdf_fonts()
     styles = _pdf_styles(regular_font, bold_font)
@@ -141,14 +148,17 @@ def build_pdf(story: Story) -> bytes:
             flow.append(Paragraph(f"Пейринг и персонажи: {_pdf_escape(_pairing_text(story))}", styles["Meta"]))
     flow.append(Spacer(1, 0.5 * cm))
     annotation = _html_to_blocks(story.annotation_html or story.description)
+    annotation_flow: list[Any] = []
     if annotation:
-        flow.append(Paragraph("Аннотация", styles["Heading1"]))
-        _add_pdf_blocks(flow, annotation, styles)
+        annotation_flow.append(Paragraph("Аннотация", styles["Heading1"]))
+        _add_pdf_blocks(annotation_flow, annotation, styles)
+    toc = []
     if story.chapters:
-        flow.append(Paragraph('Оглавление', styles['Heading1']))
+        toc.append(Paragraph('Оглавление', styles['Heading1']))
         for index, chapter in enumerate(story.chapters, 1):
             title = _pdf_escape(chapter.title or f'Глава {index}')
-            flow.append(Paragraph(f'<link href="#{chapter_id(index)}" color="blue">{title}</link>', styles['Body']))
+            toc.append(Paragraph(f'<link href="#{chapter_id(index)}" color="blue">{title}</link>', styles['Body']))
+    flow.extend(toc + annotation_flow if story.opening_page == 'contents' else annotation_flow + toc)
     for index, chapter in enumerate(prepare_chapters(story), 1):
         if flow:
             flow.append(PageBreak())

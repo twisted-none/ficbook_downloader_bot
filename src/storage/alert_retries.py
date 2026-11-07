@@ -3,12 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+import json
 from secrets import token_urlsafe
 
 from psycopg import Connection
 
 from src.exporters.formats import ALLOWED_FORMATS
-from src.sources.registry import is_supported_story_url
+from src.core.models import OPENING_PAGES
+from src.sources.registry import is_ficbook_collection_url, is_supported_story_url
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +26,7 @@ class AlertRetry:
     delivered: bool = False
     username: str = ''
     full_name: str = ''
+    opening_page: str = 'default'
 
 
 def _release_connection(db: Connection, connection: AbstractContextManager, token: str, locked: bool) -> None:
@@ -90,25 +93,46 @@ class AlertRetryStore:
         # Nullable for old snapshots; their unexpired profile can supply the identity.
         db.execute('ALTER TABLE alert_retries ADD COLUMN IF NOT EXISTS username TEXT')
         db.execute('ALTER TABLE alert_retries ADD COLUMN IF NOT EXISTS full_name TEXT')
+        db.execute("ALTER TABLE alert_retries ADD COLUMN IF NOT EXISTS opening_page TEXT NOT NULL DEFAULT 'default'")
+        db.execute('ALTER TABLE alert_retries ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ NOT NULL DEFAULT now()')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_alert_retries_pending_user '
+                   'ON alert_retries(bot_id, admin_chat_id, user_id, chat_id) WHERE NOT delivered')
 
     def create(self, *, user_id: int, chat_id: int, url: str, formats: tuple[str, ...],
                cover_enabled: bool, chapter_numbers: set[int] | None,
-               bot_id: int, admin_chat_id: int, username: str = '', full_name: str = '') -> str:
+               bot_id: int, admin_chat_id: int, username: str = '', full_name: str = '',
+               opening_page: str = 'default') -> str | None:
         if (not formats or len(set(formats)) != len(formats) or not set(formats) <= set(ALLOWED_FORMATS)
-                or len(url) > 4096 or not is_supported_story_url(url) or user_id <= 0
+                or len(url) > 4096 or not (is_supported_story_url(url) or is_ficbook_collection_url(url)) or user_id <= 0
+                or opening_page not in OPENING_PAGES
                 or (chapter_numbers is not None and (not chapter_numbers or len(chapter_numbers) > 10000
                                                      or any(n < 1 for n in chapter_numbers)))):
             raise ValueError('Invalid retry request')
         token = token_urlsafe(18)
-        with self.connect() as db:
+        chapters = sorted(chapter_numbers) if chapter_numbers is not None else None
+        identity = json.dumps((bot_id, admin_chat_id, user_id, chat_id, url, sorted(formats),
+                               cover_enabled, chapters, opening_page))
+        with self.connect() as db, db.transaction():
+            db.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 78125))', (identity,))
+            existing = db.execute("""
+                SELECT 1 FROM alert_retries
+                WHERE bot_id = %s AND admin_chat_id = %s AND user_id = %s AND chat_id = %s AND url = %s
+                  AND formats @> %s::text[] AND formats <@ %s::text[] AND cover_enabled = %s
+                  AND chapter_numbers IS NOT DISTINCT FROM %s::integer[] AND opening_page = %s
+                  AND NOT delivered AND expires_at > now()
+                  AND (message_id IS NOT NULL OR reserved_at > now() - interval '2 minutes')
+                LIMIT 1
+                """, (bot_id, admin_chat_id, user_id, chat_id, url, list(formats), list(formats),
+                      cover_enabled, chapters, opening_page)).fetchone()
+            if existing:
+                return None
             db.execute("""
                 INSERT INTO alert_retries
                     (token, user_id, chat_id, url, formats, cover_enabled, chapter_numbers, bot_id, admin_chat_id,
-                     username, full_name)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     username, full_name, opening_page)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (token, user_id, chat_id, url, list(formats), cover_enabled,
-                      sorted(chapter_numbers) if chapter_numbers is not None else None, bot_id, admin_chat_id,
-                      username[:64], full_name[:256]))
+                      chapters, bot_id, admin_chat_id, username[:64], full_name[:256], opening_page))
         return token
 
     def bind_message(self, token: str, message_id: int) -> None:
@@ -127,7 +151,7 @@ class AlertRetryStore:
                 row = db.execute("""SELECT * FROM alert_retries WHERE token = %s AND bot_id = %s
                     AND admin_chat_id = %s AND message_id = %s AND expires_at > now()""",
                     (token, bot_id, admin_chat_id, message_id)).fetchone()
-                if row is not None:
+                if row is not None and is_supported_story_url(row['url']):
                     profile = {}
                     if row['full_name'] is None:
                         profile = db.execute('SELECT username, full_name FROM bot_users WHERE user_id = %s '
@@ -138,6 +162,7 @@ class AlertRetryStore:
                         tuple(row['sent_formats']), row['delivered'],
                         row['username'] or profile.get('username', ''),
                         row['full_name'] or profile.get('full_name', ''),
+                        row.get('opening_page', 'default'),
                     )
                     return RetryClaim(db, connection, request)
         except BaseException:

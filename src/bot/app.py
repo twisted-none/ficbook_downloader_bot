@@ -112,7 +112,7 @@ from src.sources.registry import (
 )
 from src.monitoring.metrics import run_metrics_server
 from src.storage.retention import run_history_retention
-from src.core.models import Story, StoryPreview
+from src.core.models import OPENING_PAGES, Story, StoryPreview
 from src.core.progress import ProgressReporter
 from src.core.covers import cover_for_story
 from src.storage.users import UserStore, UserStoreError
@@ -138,6 +138,7 @@ class FailedCollection:
     cover_enabled: bool
     user_id: int
     chat_id: int
+    opening_page: str = 'default'
 
 
 _failed_collections: ExpiringDict[str, FailedCollection] = ExpiringDict(max_entries=1000)
@@ -500,7 +501,7 @@ async def on_settings(message: Message, analytics_store: AnalyticsStore, admin_c
     if not message.from_user:
         return
     settings = await _get_user_download_settings(analytics_store, message.from_user.id)
-    draft = SettingsDraft(settings.formats, settings.chapter_selection_enabled, settings.cover_enabled)
+    draft = SettingsDraft(settings.formats, settings.chapter_selection_enabled, settings.cover_enabled, settings.opening_page)
     sent = await message.answer(_settings_menu_text(draft), reply_markup=_settings_menu_keyboard(draft))
     _settings_drafts[message.from_user.id] = SettingsSession(
         saved=draft, draft=draft, message_id=sent.message_id, chat_id=sent.chat.id,
@@ -716,6 +717,21 @@ async def on_settings_toggle_cover(callback: CallbackQuery, analytics_store: Ana
     enabled = (callback.data or "").rsplit(":", 1)[-1] == "on"
     session.draft = replace(session.draft, cover_enabled=enabled)
     session.view = "cover"
+    await callback.message.edit_text(_settings_cover_text(session.draft), reply_markup=_settings_cover_keyboard(session.draft))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('settings:opening:'))
+async def on_settings_opening_page(callback: CallbackQuery, analytics_store: AnalyticsStore) -> None:
+    session = await _settings_session(callback, analytics_store)
+    if not session or not callback.message:
+        return
+    opening_page = (callback.data or '').rsplit(':', 1)[-1]
+    if opening_page not in OPENING_PAGES:
+        await callback.answer('Неизвестный порядок страниц.', show_alert=True)
+        return
+    session.draft = replace(session.draft, opening_page=opening_page)
+    session.view = 'cover'
     await callback.message.edit_text(_settings_cover_text(session.draft), reply_markup=_settings_cover_keyboard(session.draft))
     await callback.answer()
 
@@ -956,6 +972,7 @@ async def on_chapter_selection_text(
         pending.formats,
         premium_queue_user_ids,
         cover_enabled=pending.cover_enabled,
+        opening_page=pending.opening_page,
         chapter_numbers=chapter_numbers,
         known_title=pending.preview.title,
     )
@@ -995,12 +1012,14 @@ async def on_link(
     )
     formats = settings.formats
     cover_enabled = settings.cover_enabled
+    opening_page = settings.opening_page
     chapter_selection_enabled = settings.chapter_selection_enabled
     if is_ficbook_collection_url(url):
         await _process_collection(
             message, ficbook_client, admin_chat_id, alert_bot, analytics_store,
             download_queues, url=url, formats=formats,
             premium_queue_user_ids=premium_queue_user_ids, cover_enabled=cover_enabled,
+            opening_page=opening_page,
             initial_status=initial_status,
         )
         return
@@ -1009,11 +1028,12 @@ async def on_link(
             await _ask_chapter_selection(
                 message, ficbook_client, admin_chat_id, alert_bot, url, formats, cover_enabled, download_queues,
                 initial_status=initial_status, retry_store=getattr(analytics_store, 'alert_retries', None),
+                opening_page=opening_page,
             )
         saved = getattr(download_queues, 'saved_jobs', None)
         if saved is not None and saved.paused:
             await _run_tracked(message, url, formats, cover_enabled, None, 'preview', initial_status,
-                               preview, saved_jobs=saved)
+                               preview, saved_jobs=saved, opening_page=opening_page)
         else:
             await preview()
         return
@@ -1028,6 +1048,7 @@ async def on_link(
         formats,
         premium_queue_user_ids,
         cover_enabled=cover_enabled,
+        opening_page=opening_page,
         initial_status=initial_status,
     )
 
@@ -1050,6 +1071,7 @@ async def _ask_chapter_selection(
     *,
     initial_status: Message | None = None,
     retry_store: AlertRetryStore | None = None,
+    opening_page: str = 'default',
 ) -> None:
     if initial_status is not None:
         try:
@@ -1112,7 +1134,7 @@ async def _ask_chapter_selection(
         return
     except FicbookError as exc:
         await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=True,
-                            retry_store=retry_store, formats=formats, cover_enabled=cover_enabled)
+                            retry_store=retry_store, formats=formats, cover_enabled=cover_enabled, opening_page=opening_page)
         await _replace_status_with_error(
             message,
             status,
@@ -1123,7 +1145,7 @@ async def _ask_chapter_selection(
     except Exception as exc:
         logger.exception("Unexpected error while previewing Ficbook chapters")
         await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False,
-                            retry_store=retry_store, formats=formats, cover_enabled=cover_enabled)
+                            retry_store=retry_store, formats=formats, cover_enabled=cover_enabled, opening_page=opening_page)
         await _replace_status_with_error(message, status, admin_chat_id, _developer_error_text())
         return
     finally:
@@ -1131,7 +1153,8 @@ async def _ask_chapter_selection(
     if not preview.chapters:
         await _replace_status_with_error(message, status, admin_chat_id, "Не удалось получить список глав.")
         return
-    _chapter_waiting[message.from_user.id] = PendingChapterSelection(preview.source_url, formats, cover_enabled, preview)
+    _chapter_waiting[message.from_user.id] = PendingChapterSelection(
+        preview.source_url, formats, cover_enabled, preview, opening_page)
     await status.edit_text(_chapter_selection_prompt(preview))
 
 
@@ -1151,9 +1174,10 @@ async def _run_tracked(
     operation: Callable[[], Awaitable[bool | None]],
     *, redelivery: Redelivery | None = None, saved_jobs: DownloadJobs | None = None,
     retry_collection: FicbookCollection | None = None,
+    opening_page: str = 'default',
 ) -> bool | None:
     user_id = message.from_user.id if message.from_user else message.chat.id
-    key = download_key(user_id, message.chat.id, url, formats, cover_enabled, chapter_numbers)
+    key = download_key(user_id, message.chat.id, url, formats, cover_enabled, chapter_numbers, opening_page)
     parent = current_job.get()
     restored = restoring_job.get() if parent is None else None
     entry = saved_jobs.entries.get(restored) if saved_jobs is not None and restored is not None else None
@@ -1198,7 +1222,7 @@ async def _run_tracked(
     job.owner = asyncio.current_task()
     if saved_jobs is not None and parent is None and entry is None:
         payload = dict(token=job.token, key=saved_key, kind=kind, url=normalize_collection_url(url) if kind == 'collection'
-                       else normalize_url(url), formats=list(formats), cover_enabled=cover_enabled,
+                       else normalize_url(url), formats=list(formats), cover_enabled=cover_enabled, opening_page=opening_page,
                        chapters=sorted(chapter_numbers) if chapter_numbers is not None else None,
                        message=message.model_dump(mode='json', exclude_none=True, include={
                            'message_id': True, 'date': True, 'message_thread_id': True, 'is_topic_message': True,
@@ -1329,7 +1353,7 @@ async def on_retry_collection(
     await _process_collection(
         pending.message, ficbook_client, admin_chat_id, alert_bot, analytics_store, download_queues,
         pending.collection.source_url, pending.formats, premium_queue_user_ids,
-        cover_enabled=pending.cover_enabled, retry_collection=pending.collection,
+        cover_enabled=pending.cover_enabled, retry_collection=pending.collection, opening_page=pending.opening_page,
     )
 
 
@@ -1338,6 +1362,7 @@ async def _process_collection(
     analytics_store: AnalyticsStore, download_queues: DownloadQueuePool, url: str,
     formats: tuple[str, ...], premium_queue_user_ids: frozenset[int], *, cover_enabled: bool = True,
     initial_status: Message | None = None, retry_collection: FicbookCollection | None = None,
+    opening_page: str = 'default',
 ) -> None:
     await _run_tracked(
         message, url, formats, cover_enabled, None, 'collection', initial_status,
@@ -1345,7 +1370,9 @@ async def _process_collection(
             message, ficbook_client, admin_chat_id, alert_bot, analytics_store, download_queues,
             url, formats, premium_queue_user_ids, cover_enabled=cover_enabled,
             initial_status=initial_status, retry_collection=retry_collection,
+            opening_page=opening_page,
         ), saved_jobs=getattr(download_queues, 'saved_jobs', None), retry_collection=retry_collection,
+        opening_page=opening_page,
     )
 
 
@@ -1363,6 +1390,7 @@ async def _process_collection_impl(
     cover_enabled: bool = True,
     initial_status: Message | None = None,
     retry_collection: FicbookCollection | None = None,
+    opening_page: str = 'default',
 ) -> None:
     user_id = message.from_user.id if message.from_user else message.chat.id
     if user_id in _collection_users:
@@ -1422,7 +1450,7 @@ async def _process_collection_impl(
             success = await _process_download(
                 message, ficbook_client, admin_chat_id, alert_bot, analytics_store,
                 download_queues, work_url, formats, premium_queue_user_ids,
-                cover_enabled=cover_enabled, raise_forbidden=True,
+                cover_enabled=cover_enabled, raise_forbidden=True, opening_page=opening_page,
             )
             if success is None:
                 cancelled += 1
@@ -1445,7 +1473,7 @@ async def _process_collection_impl(
             token = token_urlsafe(9)
             _failed_collections[token] = FailedCollection(
                 message, FicbookCollection(collection.title, url, tuple(failed)), formats,
-                cover_enabled, user_id, message.chat.id,
+                cover_enabled, user_id, message.chat.id, opening_page,
             )
             try:
                 await status.delete()
@@ -1477,7 +1505,9 @@ async def _process_collection_impl(
         raise
     except Exception as exc:
         logger.exception('Unexpected error while processing Ficbook collection')
-        await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False)
+        await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False,
+                            retry_store=getattr(analytics_store, 'alert_retries', None), formats=formats,
+                            cover_enabled=cover_enabled, opening_page=opening_page)
         await _replace_status_with_error(message, status, admin_chat_id, _developer_error_text())
     finally:
         if progress is not None:
@@ -1493,6 +1523,7 @@ async def _process_download(
     initial_status: Message | None = None,
     known_title: str = '',
     redelivery: Redelivery | None = None,
+    opening_page: str = 'default',
 ) -> bool | None:
     return await _run_tracked(
         message, url, formats, cover_enabled, chapter_numbers, 'work', initial_status,
@@ -1500,10 +1531,11 @@ async def _process_download(
             message, ficbook_client, admin_chat_id, alert_bot, analytics_store, download_queues,
             url, formats, premium_queue_user_ids, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers,
             raise_forbidden=raise_forbidden, initial_status=initial_status, known_title=known_title,
-            redelivery=redelivery,
+            redelivery=redelivery, opening_page=opening_page,
         ),
         redelivery=redelivery,
         saved_jobs=getattr(download_queues, 'saved_jobs', None),
+        opening_page=opening_page,
     )
 
 
@@ -1524,6 +1556,7 @@ async def _process_download_impl(
     initial_status: Message | None = None,
     known_title: str = '',
     redelivery: Redelivery | None = None,
+    opening_page: str = 'default',
 ) -> bool:
     job = current_job.get()
     root_job = (job.parent or job) if job else None
@@ -1669,6 +1702,7 @@ async def _process_download_impl(
                     progress_state.start_attempt()
                 if not cover_enabled:
                     story.cover = None
+                story = replace(story, opening_page=opening_page)
                 progress_state.set_title(story.title)
                 progress_state.set_stage('Создаю файлы')
                 await active_progress.set(progress_state.status(formats), force=True)
@@ -1803,7 +1837,8 @@ async def _process_download_impl(
         if redelivery is None:
             await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=True,
                                 retry_store=getattr(analytics_store, 'alert_retries', None),
-                                formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers)
+                                formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers,
+                                opening_page=opening_page)
         await report_failure(_user_error_message(exc), as_error=True, error=exc)
     except sqlite3.Error:
         logger.exception('Could not checkpoint file delivery; leaving it in the saved queue')
@@ -1815,7 +1850,8 @@ async def _process_download_impl(
         if redelivery is None:
             await _notify_admin(message, admin_chat_id, alert_bot, url, exc, expected=False,
                                 retry_store=getattr(analytics_store, 'alert_retries', None),
-                                formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers)
+                                formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers,
+                                opening_page=opening_page)
         await report_failure(_developer_error_text(), as_error=True, error=exc)
     finally:
         if progress is not None:
@@ -2133,7 +2169,7 @@ async def run_bot(settings: Settings) -> None:
             analytics_store, dispatcher['download_queues'], request.url, request.formats,
             settings.premium_queue_user_ids, cover_enabled=request.cover_enabled,
             chapter_numbers=set(request.chapter_numbers) if request.chapter_numbers is not None else None,
-            redelivery=delivery,
+            redelivery=delivery, opening_page=request.opening_page,
         )
 
     redelivery = AlertRedelivery(bot, settings.admin_chat_id, analytics_store.alert_retries, redownload)
@@ -2150,6 +2186,7 @@ async def run_bot(settings: Settings) -> None:
                 return
             payload = entry.payload
             url, formats = payload['url'], tuple(payload['formats'])
+            opening_page = payload.get('opening_page', 'default')
             message = Message.model_validate(payload['message']).as_(bot)
             client = dispatcher['ficbook_client']
             if alert := payload.get('alert'):
@@ -2164,18 +2201,20 @@ async def run_bot(settings: Settings) -> None:
                 selection = payload.get('collection')
                 await _process_collection(message, client, settings.admin_chat_id, alert_bot, analytics_store,
                     queues, url, formats, settings.premium_queue_user_ids, cover_enabled=payload['cover_enabled'],
+                    opening_page=opening_page,
                     retry_collection=(FicbookCollection(selection['title'], url, tuple(selection['urls']))
                                       if selection is not None else None))
             elif payload['kind'] == 'preview':
                 await _run_tracked(message, url, formats, payload['cover_enabled'], None, 'preview', None,
                     lambda: _ask_chapter_selection(message, client, settings.admin_chat_id, alert_bot, url,
-                        formats, payload['cover_enabled'], queues, retry_store=analytics_store.alert_retries),
-                    saved_jobs=saved)
+                        formats, payload['cover_enabled'], queues, retry_store=analytics_store.alert_retries,
+                        opening_page=opening_page),
+                    saved_jobs=saved, opening_page=opening_page)
             else:
                 chapters = payload['chapters']
                 await _process_download(message, client, settings.admin_chat_id, alert_bot, analytics_store,
                     queues, url, formats, settings.premium_queue_user_ids, cover_enabled=payload['cover_enabled'],
-                    chapter_numbers=set(chapters) if chapters is not None else None)
+                    chapter_numbers=set(chapters) if chapters is not None else None, opening_page=opening_page)
         except Exception as error:
             logger.error('Could not restore download job %s: %s', entry.id, type(error).__name__)
         finally:
@@ -2300,6 +2339,7 @@ async def _save_settings_session(user_id: int, session: SettingsSession, analyti
                 session.draft.formats,
                 session.draft.chapter_selection_enabled,
                 session.draft.cover_enabled,
+                session.draft.opening_page,
             ),
         )
     except Exception:
@@ -2454,8 +2494,9 @@ async def _notify_admin(
     formats: tuple[str, ...] | None = None,
     cover_enabled: bool = True,
     chapter_numbers: set[int] | None = None,
+    opening_page: str = 'default',
 ) -> None:
-    if admin_chat_id is None:
+    if admin_chat_id is None or isinstance(error, FicbookNotFoundError):
         return
     user = message.from_user
     user_name = (f'@{user.username}' if user.username else user.full_name) if user else "unknown"
@@ -2477,20 +2518,25 @@ async def _notify_admin(
     )
     sender = alert_bot or message.bot
     token = None
+    collection = is_ficbook_collection_url(url)
     if retry_store is not None and formats and user:
         try:
             token = await asyncio.to_thread(
-                retry_store.create, user_id=user.id, chat_id=message.chat.id, url=_public_story_url(url),
+                retry_store.create, user_id=user.id, chat_id=message.chat.id,
+                url=normalize_collection_url(url) if collection else _public_story_url(url),
                 formats=formats, cover_enabled=cover_enabled, chapter_numbers=chapter_numbers,
                 bot_id=sender.id, admin_chat_id=admin_chat_id,
-                username=user.username or '', full_name=user.full_name or '',
+                username=user.username or '', full_name=user.full_name or '', opening_page=opening_page,
             )
+            if token is None:
+                return
         except Exception as snapshot_error:
             logger.warning('Could not save admin redelivery request; sending alert without button type=%s',
                            type(snapshot_error).__name__)
-            text += '\n\nПовторная отправка недоступна: не удалось сохранить задание. Проверь логи бота.'
+            if not collection:
+                text += '\n\nПовторная отправка недоступна: не удалось сохранить задание. Проверь логи бота.'
     try:
-        kwargs = {'reply_markup': retry_keyboard(token)} if token else {}
+        kwargs = {'reply_markup': retry_keyboard(token)} if token and not collection else {}
         alert = await sender.send_message(admin_chat_id, text, **kwargs)
         if token is not None:
             await asyncio.to_thread(retry_store.bind_message, token, alert.message_id)

@@ -1,5 +1,6 @@
 import os
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from types import SimpleNamespace
 import unittest
@@ -40,7 +41,8 @@ class AlertRetryStorageTests(unittest.TestCase):
                       bot_id=123456, admin_chat_id=9)
         values.update(kwargs)
         token = self.store.create(**values)
-        self.store.bind_message(token, 12)
+        if token:
+            self.store.bind_message(token, 12)
         return token
 
     def claim(self, token):
@@ -50,7 +52,7 @@ class AlertRetryStorageTests(unittest.TestCase):
         return claim
 
     def test_snapshot_survives_store_restart_and_keeps_original_settings(self):
-        token = self.create()
+        token = self.create(opening_page='annotation')
         restarted = AnalyticsStore(self.dsn)
         self.addCleanup(restarted.close)
         claim = restarted.alert_retries.claim(token, 123456, 9, 12)
@@ -60,6 +62,22 @@ class AlertRetryStorageTests(unittest.TestCase):
         self.assertEqual(claim.request.formats, ('epub', 'fb2'))
         self.assertEqual(claim.request.chapter_numbers, (2, 4))
         self.assertFalse(claim.request.cover_enabled)
+        self.assertEqual(claim.request.opening_page, 'annotation')
+
+    def test_concurrent_duplicates_reserve_only_one_alert(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.create)
+            second = pool.submit(self.create, formats=('fb2', 'epub'))
+            tokens = [first.result(), second.result()]
+        self.assertEqual(sum(token is not None for token in tokens), 1)
+        self.assertIsNotNone(self.create(opening_page='annotation'))
+        self.assertIsNotNone(self.create(chapter_numbers={3}))
+
+    def test_delivered_alert_does_not_hide_later_failures(self):
+        claim = self.claim(self.create())
+        claim.record_sent('epub')
+        claim.record_sent('fb2')
+        self.assertIsNotNone(self.create())
 
     def test_claim_is_exclusive_and_released_when_connection_closes(self):
         token = self.create()

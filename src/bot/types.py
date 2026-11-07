@@ -12,6 +12,7 @@ class SettingsDraft:
     formats: tuple[str, ...]
     chapter_selection_enabled: bool = False
     cover_enabled: bool = True
+    opening_page: str = 'default'
 
 
 @dataclass(slots=True)
@@ -29,6 +30,7 @@ class PendingChapterSelection:
     formats: tuple[str, ...]
     cover_enabled: bool
     preview: StoryPreview
+    opening_page: str = 'default'
 
 
 @dataclass(slots=True)

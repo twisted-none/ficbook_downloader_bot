@@ -84,7 +84,8 @@ class SupportConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.message.text = "https://share.google/Ab123"
         target = "https://ficbook.net/readfic/123"
         for select_chapters in (False, True):
-            settings = UserDownloadSettings(formats=("txt",), cover_enabled=False, chapter_selection_enabled=select_chapters)
+            settings = UserDownloadSettings(formats=("txt",), cover_enabled=False,
+                                            chapter_selection_enabled=select_chapters, opening_page='annotation')
             with self.subTest(select_chapters=select_chapters), patch.object(
                 app, "resolve_share_url", new_callable=AsyncMock, return_value=target
             ) as resolve, patch.object(
@@ -98,11 +99,13 @@ class SupportConfirmationTests(unittest.IsolatedAsyncioTestCase):
                     select.assert_awaited_once_with(self.message, self.dependencies["ficbook_client"], 100, None,
                                                    target, ("txt",), False, self.dependencies['download_queues'],
                                                    initial_status=self.message.answer.return_value,
-                                                   retry_store=self.dependencies['analytics_store'].alert_retries)
+                                                   retry_store=self.dependencies['analytics_store'].alert_retries,
+                                                   opening_page='annotation')
                     download.assert_not_awaited()
                 else:
                     self.assertEqual(download.call_args.args[6:8], (target, ("txt",)))
                     self.assertFalse(download.call_args.kwargs["cover_enabled"])
+                    self.assertEqual(download.call_args.kwargs['opening_page'], 'annotation')
 
     async def test_google_failure_requests_direct_link_without_downloading(self):
         self.message.text = "https://share.google/Ab123"
@@ -209,7 +212,7 @@ class SupportConfirmationTests(unittest.IsolatedAsyncioTestCase):
             select.assert_awaited_once_with(self.message, self.dependencies["ficbook_client"], 100, None,
                                           "https://ficbook.net/readfic/123", ("epub",), False,
                                   self.dependencies['download_queues'], initial_status=self.message.answer.return_value,
-                                  retry_store=self.dependencies['analytics_store'].alert_retries)
+                                  retry_store=self.dependencies['analytics_store'].alert_retries, opening_page='default')
             download.assert_not_awaited()
 
     async def test_foreign_user_and_old_buttons_cannot_consume_new_request(self):

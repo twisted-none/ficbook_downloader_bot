@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 from src.core.models import Chapter, Story
 from src.exporters.navigation import chapter_id, prepare_chapters
+from src.exporters.xml_text import xml_safe_story
 
 SKIP_TAGS = {"audio", "iframe", "img", "script", "style", "video"}
 CONTAINER_TAGS = {"article", "div", "section"}
@@ -32,6 +33,7 @@ body.cover-page { margin: 0; padding: 0; text-align: center; }
 
 
 def build_epub(story: Story) -> bytes:
+    story = xml_safe_story(story)
     book_id = str(uuid5(NAMESPACE_URL, story.source_url))
     chapters = [_chapter_page(index, chapter) for index, chapter in enumerate(prepare_chapters(story), 1)]
     intro = _page("intro.xhtml", "Аннотация", _intro_body(story))
@@ -196,7 +198,7 @@ def _container_xml() -> str:
 def _opf(story: Story, book_id: str, pages: list[dict[str, str]]) -> str:
     items = "".join(f'<item id="p{i}" href="{p["href"]}" media-type="application/xhtml+xml"/>' for i, p in enumerate(pages))
     order = [f'p{i}' for i, _ in enumerate(pages)]
-    order.insert(1 if story.cover else 0, 'nav')
+    order.insert(int(bool(story.cover)) + int(story.opening_page == 'annotation'), 'nav')
     spine = ''.join(f'<itemref idref="{item}"/>' for item in order)
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     subjects = "".join(

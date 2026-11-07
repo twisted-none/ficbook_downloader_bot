@@ -13,6 +13,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from src.exporters.formats import DEFAULT_FORMATS, normalize_formats
+from src.core.models import OPENING_PAGES
 from src.sources.registry import is_supported_story_url, normalize_url
 from src.storage.alert_retries import AlertRetryStore
 
@@ -51,6 +52,7 @@ class UserDownloadSettings:
     formats: tuple[str, ...] = DEFAULT_FORMATS
     chapter_selection_enabled: bool = False
     cover_enabled: bool = True
+    opening_page: str = 'default'
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +234,7 @@ class AnalyticsStore:
                 normalize_formats(formats),
                 settings.chapter_selection_enabled,
                 settings.cover_enabled,
+                settings.opening_page,
             ),
         )
 
@@ -242,7 +245,7 @@ class AnalyticsStore:
         settings = self.get_user_download_settings(user_id)
         self.save_user_download_settings(
             user_id,
-            UserDownloadSettings(settings.formats, enabled, settings.cover_enabled),
+            UserDownloadSettings(settings.formats, enabled, settings.cover_enabled, settings.opening_page),
         )
 
     def get_cover_enabled(self, user_id: int) -> bool:
@@ -252,7 +255,7 @@ class AnalyticsStore:
         settings = self.get_user_download_settings(user_id)
         self.save_user_download_settings(
             user_id,
-            UserDownloadSettings(settings.formats, settings.chapter_selection_enabled, enabled),
+            UserDownloadSettings(settings.formats, settings.chapter_selection_enabled, enabled, settings.opening_page),
         )
 
     def get_user_download_settings(self, user_id: int) -> UserDownloadSettings:
@@ -265,7 +268,7 @@ class AnalyticsStore:
         with self._connect() as db:
             row = db.execute(
                 """
-                SELECT formats, chapter_selection_enabled, cover_enabled
+                SELECT formats, chapter_selection_enabled, cover_enabled, opening_page
                 FROM user_format_settings
                 WHERE user_id = %s
                 """,
@@ -275,6 +278,7 @@ class AnalyticsStore:
             formats=normalize_formats(list(row["formats"] or [])),
             chapter_selection_enabled=bool(row["chapter_selection_enabled"]),
             cover_enabled=bool(row["cover_enabled"]),
+            opening_page=row.get('opening_page', 'default'),
         )
         with self._settings_lock:
             if generation == self._settings_generation:
@@ -291,16 +295,19 @@ class AnalyticsStore:
 
     def _save_settings(self, user_id: int, settings: UserDownloadSettings) -> None:
         normalized = normalize_formats(settings.formats)
+        if settings.opening_page not in OPENING_PAGES:
+            raise ValueError('Invalid opening page setting')
         with self._connect() as db:
             db.execute(
                 """
                 INSERT INTO user_format_settings
-                    (user_id, formats, chapter_selection_enabled, cover_enabled, updated_at)
-                VALUES (%s, %s, %s, %s, now())
+                    (user_id, formats, chapter_selection_enabled, cover_enabled, opening_page, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
                 ON CONFLICT (user_id) DO UPDATE SET
                     formats = EXCLUDED.formats,
                     chapter_selection_enabled = EXCLUDED.chapter_selection_enabled,
                     cover_enabled = EXCLUDED.cover_enabled,
+                    opening_page = EXCLUDED.opening_page,
                     updated_at = now()
                 """,
                 (
@@ -308,13 +315,14 @@ class AnalyticsStore:
                     list(normalized),
                     settings.chapter_selection_enabled,
                     settings.cover_enabled,
+                    settings.opening_page,
                 ),
             )
 
         with self._settings_lock:
             self._settings_generation += 1
             self._cache_settings(user_id, UserDownloadSettings(
-                normalized, settings.chapter_selection_enabled, settings.cover_enabled,
+                normalized, settings.chapter_selection_enabled, settings.cover_enabled, settings.opening_page,
             ))
 
     def _cache_settings(self, user_id: int, settings: UserDownloadSettings) -> None:
@@ -466,6 +474,7 @@ class AnalyticsStore:
                 """
             )
             db.execute("CREATE INDEX IF NOT EXISTS idx_downloads_user_status ON downloads(user_id, status)")
+            db.execute("ALTER TABLE user_format_settings ADD COLUMN IF NOT EXISTS opening_page TEXT NOT NULL DEFAULT 'default'")
             db.execute("CREATE INDEX IF NOT EXISTS idx_downloads_attempted_at ON downloads(attempted_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_downloads_url_status ON downloads(url, status)")
             db.execute(

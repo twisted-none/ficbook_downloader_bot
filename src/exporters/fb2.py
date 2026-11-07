@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 from src.core.models import Chapter, Story
 from src.exporters.navigation import chapter_id, prepare_chapters
+from src.exporters.xml_text import xml_safe_story
 
 INLINE_TAGS = {"strong": "strong", "b": "strong", "em": "emphasis", "i": "emphasis"}
 BLOCK_TAGS = {"article", "blockquote", "div", "li", "ol", "p", "section", "ul"}
@@ -16,6 +17,7 @@ SKIP_TAGS = {"audio", "iframe", "img", "script", "style", "video"}
 
 
 def build_fb2(story: Story) -> bytes:
+    story = xml_safe_story(story)
     annotation = (
         _annotation_xml(story.description)
         if story.annotation_complete else
@@ -31,6 +33,7 @@ def build_fb2(story: Story) -> bytes:
         f'<p><a l:href="#{chapter_id(index)}">{escape(chapter.title or f"Глава {index}")}</a></p>'
         for index, chapter in enumerate(prepared, 1)
     ) + '</section>' if prepared else ''
+    frontmatter = toc + info if story.opening_page == 'contents' else info + toc
     genres = "".join(f"<genre>{escape(item)}</genre>" for item in story.genres)
     keywords = _keywords_xml(story)
     language = _normalize_language(story.language)
@@ -47,7 +50,7 @@ def build_fb2(story: Story) -> bytes:
   <book-title>{escape(story.title)}</book-title>{annotation}{keywords}{coverpage}<lang>{escape(language)}</lang>{translator}</title-info>
   <document-info><author><nickname>ficbook_bot</nickname></author><id>{uuid5(NAMESPACE_URL, story.source_url)}</id>
   <program-used>ficbook_bot</program-used><src-url>{escape(story.source_url)}</src-url></document-info>{custom_pages}</description>
-  <body>{info}{toc}{chapters}</body>{notes_body}{binary}</FictionBook>"""
+  <body>{frontmatter}{chapters}</body>{notes_body}{binary}</FictionBook>"""
     return fb2.encode("utf-8")
 
 
@@ -75,9 +78,10 @@ def _chapter_to_xml(chapter: Chapter, index: int, notes: list[str]) -> str:
 
 
 def _info_section_xml(story: Story) -> str:
+    heading = 'Информация' if story.opening_page == 'default' else 'Аннотация'
     if story.annotation_complete:
         paragraphs = "".join(_fragment_to_blocks(story.annotation_html or story.description))
-        return f"<section><title><p>Информация</p></title>{paragraphs}</section>"
+        return f"<section><title><p>{heading}</p></title>{paragraphs}</section>"
     rows = [
         ("Автор", story.author),
         ("Страниц", story.page_count),
@@ -86,9 +90,11 @@ def _info_section_xml(story: Story) -> str:
         ("Ссылка", story.source_url),
     ]
     paragraphs = "".join(f"<p>{escape(label)}: {escape(value)}</p>" for label, value in rows if value)
+    if story.opening_page != 'default':
+        paragraphs += ''.join(_fragment_to_blocks(story.annotation_html or story.description))
     if not paragraphs:
         return ""
-    return f"<section><title><p>Информация</p></title>{paragraphs}</section>"
+    return f"<section><title><p>{heading}</p></title>{paragraphs}</section>"
 
 
 def _keywords_xml(story: Story) -> str:

@@ -38,6 +38,7 @@ def main_keyboard(*, is_admin: bool = False) -> ReplyKeyboardMarkup:
     keyboard = [[KeyboardButton(text="/settings"), KeyboardButton(text="/help")]]
     if is_admin:
         keyboard.append([KeyboardButton(text="/broadcast"), KeyboardButton(text="/queue")])
+        keyboard.append([KeyboardButton(text="/stop"), KeyboardButton(text="/resume")])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
@@ -115,6 +116,13 @@ def settings_formats_keyboard(draft: SettingsDraft) -> InlineKeyboardMarkup:
     )
 
 
+_OPENING_PAGE_LABELS = {
+    'default': 'По умолчанию',
+    'annotation': 'Сначала аннотация',
+    'contents': 'Сначала оглавление',
+}
+
+
 def settings_cover_keyboard(draft: SettingsDraft) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -128,6 +136,9 @@ def settings_cover_keyboard(draft: SettingsDraft) -> InlineKeyboardMarkup:
                     callback_data="settings:cover:off",
                 ),
             ],
+            *[[InlineKeyboardButton(text=('✅ ' if page == draft.opening_page else '') + label,
+                                    callback_data=f'settings:opening:{page}')]
+              for page, label in _OPENING_PAGE_LABELS.items()],
             [InlineKeyboardButton(text="Сохранить настройки", callback_data="settings:save:cover")],
             [InlineKeyboardButton(text="Назад", callback_data="settings:back")],
         ]
@@ -178,6 +189,7 @@ def settings_cover_text(draft: SettingsDraft, *, saved: bool = False) -> str:
         "Обложка",
         "",
         "Обложка будет добавляться в поддерживаемые форматы." if draft.cover_enabled else "Файлы будут собираться без обложки.",
+        f"Порядок страниц внутри книги: {_OPENING_PAGE_LABELS[draft.opening_page]}.",
     ]
     if saved:
         lines.append("\nНастройки сохранены.")
