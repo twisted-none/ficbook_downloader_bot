@@ -343,8 +343,7 @@ class FicbookClient:
                 try:
                     _report(
                         progress,
-                        "Введите главы, которые хотите скачать, или 0 для всех.\n"
-                        "Формат: 1,2,5-10,17.\n"
+                        "Считываю список глав. Дождись сообщения с общим числом глав.\n"
                         f"Аккаунт: {index}/{len(accounts)}",
                     )
                     result = self._preview_once(normalized, account)

@@ -31,6 +31,8 @@ class PendingChapterSelection:
     cover_enabled: bool
     preview: StoryPreview
     opening_page: str = 'default'
+    chat_id: int | None = None
+    prompt_message_id: int | None = None
 
 
 @dataclass(slots=True)

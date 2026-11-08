@@ -126,6 +126,8 @@ _support_pending: ExpiringDict[int, PendingSupportMessage] = ExpiringDict()
 _reply_waiting: ExpiringDict[int, int] = ExpiringDict()
 _settings_drafts: ExpiringDict[int, SettingsSession] = ExpiringDict()
 _chapter_waiting: ExpiringDict[int, PendingChapterSelection] = ExpiringDict()
+_chapter_preparing: dict[tuple[int, int], asyncio.Task] = {}
+_CHAPTERS_LOADING = 'Считываю список глав. Дождись сообщения с общим числом глав.'
 _collection_users: set[int] = set()
 _jobs = JobRegistry()
 
@@ -622,7 +624,10 @@ async def on_cancel(message: Message, admin_chat_id: int | None) -> None:
         _broadcast_waiting.discard(message.from_user.id)
         await message.answer("Рассылка отменена.", reply_markup=_main_keyboard_for_message(message, admin_chat_id))
         cancelled = True
-    if _chapter_waiting.pop(message.from_user.id, None):
+    preparing = _chapter_preparing.pop((message.from_user.id, message.chat.id), None)
+    if preparing is not None:
+        preparing.cancel()
+    if _chapter_waiting.pop(message.from_user.id, None) or preparing is not None:
         await message.answer("Выбор глав отменен.", reply_markup=_main_keyboard_for_message(message, admin_chat_id))
         cancelled = True
     pending_support = _support_pending.pop(message.from_user.id, None)
@@ -933,7 +938,10 @@ async def on_broadcast_text(message: Message, admin_chat_id: int | None, user_st
     )
 
 
-@router.message(lambda message: message.from_user and message.from_user.id in _chapter_waiting)
+@router.message(lambda message: message.from_user and (
+    message.from_user.id in _chapter_waiting
+    or (message.from_user.id, message.chat.id) in _chapter_preparing
+))
 async def on_chapter_selection_text(
     message: Message,
     ficbook_client: FicbookClient,
@@ -943,8 +951,17 @@ async def on_chapter_selection_text(
     download_queues: DownloadQueuePool,
     premium_queue_user_ids: frozenset[int],
 ) -> None:
-    pending = _chapter_waiting.get(message.from_user.id)
+    user_id = message.from_user.id
+    if (user_id, message.chat.id) in _chapter_preparing:
+        await message.answer(_CHAPTERS_LOADING)
+        return
+    pending = _chapter_waiting.get(user_id)
     if pending is None:
+        return
+    if pending.chat_id is not None and pending.chat_id != message.chat.id:
+        return
+    if pending.prompt_message_id is not None and message.message_id <= pending.prompt_message_id:
+        await message.answer('Список глав готов. Отправь номера ещё раз или 0 для всех.')
         return
     text = (message.text or "").strip()
     try:
@@ -1073,15 +1090,44 @@ async def _ask_chapter_selection(
     retry_store: AlertRetryStore | None = None,
     opening_page: str = 'default',
 ) -> None:
+    user = getattr(message, 'from_user', None)
+    key = (user.id, message.chat.id) if user else None
+    if key in _chapter_preparing:
+        await message.answer(_CHAPTERS_LOADING)
+        return
+    task = asyncio.current_task()
+    if key is not None:
+        _chapter_preparing[key] = task
+        _chapter_waiting.pop(user.id, None)
+    try:
+        await _prepare_chapter_prompt(message, ficbook_client, admin_chat_id, alert_bot, url, formats,
+                                      cover_enabled, download_queues, initial_status, retry_store, opening_page)
+    except asyncio.CancelledError:
+        if key is None or _chapter_preparing.get(key) is task:
+            raise
+    finally:
+        if key is not None and _chapter_preparing.get(key) is task:
+            _chapter_preparing.pop(key, None)
+
+
+async def _delete_chapter_status(status: Message) -> None:
+    try:
+        await status.delete()
+    except (TelegramBadRequest, TelegramNetworkError, TelegramServerError,
+            TelegramForbiddenError, TelegramRetryAfter):
+        logger.debug('Could not delete chapter loading status')
+
+
+async def _prepare_chapter_prompt(
+    message: Message, ficbook_client: FicbookClient, admin_chat_id: int | None, alert_bot: Bot | None,
+    url: str, formats: tuple[str, ...], cover_enabled: bool, download_queues: DownloadQueuePool | None,
+    initial_status: Message | None, retry_store: AlertRetryStore | None, opening_page: str,
+) -> None:
     if initial_status is not None:
-        try:
-            await initial_status.delete()
-        except (TelegramBadRequest, TelegramNetworkError, TelegramServerError,
-                TelegramForbiddenError, TelegramRetryAfter):
-            logger.debug('Could not delete link acknowledgement')
+        await _delete_chapter_status(initial_status)
     try:
         status = await _answer_status_with_retry(message,
-            _chapter_selection_input_text("Подготавливаю список глав..."),
+            _CHAPTERS_LOADING,
             reply_markup=_cancel_keyboard(),
         )
     except (FicbookError, TelegramDeliveryError, TelegramForbiddenError):
@@ -1106,6 +1152,10 @@ async def _ask_chapter_selection(
             preview_job,
             user_id=message.from_user.id if message.from_user else None,
         )
+    except asyncio.CancelledError:
+        await progress.close()
+        await _delete_chapter_status(status)
+        raise
     except (ResourceLimitError, QueueFullError) as exc:
         await _replace_status_with_notice(message, status, admin_chat_id, _resource_error_text(exc))
         return
@@ -1153,9 +1203,17 @@ async def _ask_chapter_selection(
     if not preview.chapters:
         await _replace_status_with_error(message, status, admin_chat_id, "Не удалось получить список глав.")
         return
+    await _delete_chapter_status(status)
+    try:
+        prompt = await _answer_status_with_retry(
+            message, _chapter_selection_prompt(preview), reply_markup=_cancel_keyboard(),
+        )
+    except (FicbookError, TelegramDeliveryError, TelegramForbiddenError, TelegramBadRequest):
+        logger.warning('Telegram chapter selection prompt could not be sent')
+        return
     _chapter_waiting[message.from_user.id] = PendingChapterSelection(
-        preview.source_url, formats, cover_enabled, preview, opening_page)
-    await status.edit_text(_chapter_selection_prompt(preview))
+        preview.source_url, formats, cover_enabled, preview, opening_page, message.chat.id,
+        getattr(prompt, 'message_id', None))
 
 
 def _job_markup() -> dict[str, Any]:
@@ -2352,7 +2410,7 @@ async def _save_settings_session(user_id: int, session: SettingsSession, analyti
 def _chapter_selection_prompt(preview: StoryPreview) -> str:
     lines = [
         f"<b>{escape(preview.title)}</b>",
-        f"Глав: {len(preview.chapters)}.",
+        f"Всего глав в работе: {len(preview.chapters)}.",
         _chapter_selection_input_text(),
         "",
     ]
