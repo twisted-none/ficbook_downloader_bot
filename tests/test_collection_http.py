@@ -9,7 +9,7 @@ from curl_cffi import CurlECode, CurlOpt
 from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 from curl_cffi.requests.exceptions import RequestException
 
-from src.core.limits import ResourceLimitError, ResourceLimits, ResponseLimitError, resource_scope
+from src.core.limits import ResourceLimitError, ResourceLimits, ResponseLimitError, read_bounded, resource_scope
 from src.sources.collection_http import BrowserCollectionClient
 from src.sources.collections import _page_url
 
@@ -22,6 +22,16 @@ def address(ip='93.184.216.34'):
 
 
 class BrowserCollectionClientTests(unittest.TestCase):
+    def test_decoded_error_body_retains_http_status_and_challenge_header(self):
+        self.status = 403
+        self.headers = {'Content-Encoding': 'br', 'Content-Length': '9', 'CF-Mitigated': 'challenge'}
+        with self.assertRaises(HTTPError) as caught:
+            self.client.fetch(URL)
+        with caught.exception as error:
+            self.assertEqual(error.code, 403)
+            self.assertEqual(error.headers['CF-Mitigated'], 'challenge')
+            self.assertEqual(read_bounded(error), b'<html>page</html>')
+
     def setUp(self):
         self.session = Mock()
         self.session.curl_options = {}

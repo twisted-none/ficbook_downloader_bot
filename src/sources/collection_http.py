@@ -109,6 +109,11 @@ class BrowserCollectionClient:
                 url = urljoin(url, location)
                 continue
             if response.status_code != 200 or is_cloudflare_challenge(headers):
+                if headers.get('Content-Encoding', 'identity').lower() not in {'', 'identity'}:
+                    # libcurl decodes the callback body but leaves the wire headers intact.
+                    del headers['Content-Encoding']
+                    del headers['Content-Length']
+                    headers['Content-Length'] = str(len(body))
                 raise HTTPError(url, response.status_code, 'Public collection request failed', headers, BytesIO(body))
             declared = headers.get('Content-Length', '')
             if (declared.isdecimal() and headers.get('Content-Encoding', 'identity').lower() == 'identity'
