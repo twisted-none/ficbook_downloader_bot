@@ -13,7 +13,7 @@ from fanficfare.fetchers import RequestsFetcher
 from fanficfare.exceptions import HTTPErrorFFF
 from fanficfare.fetchers.base_fetcher import FetcherResponse
 from requests.adapters import HTTPAdapter
-from urllib3 import PoolManager
+from urllib3 import HTTPResponse, PoolManager
 from urllib3.connection import HTTPSConnection
 from urllib3.connectionpool import HTTPSConnectionPool
 from urllib3.exceptions import NewConnectionError, ProtocolError, TimeoutError as UrllibTimeoutError
@@ -254,7 +254,11 @@ class AO3RequestsFetcher(RequestsFetcher):
                     # Classify the body before retry, access-denied or not-found handling.
                     if isinstance(error, HTTPError):
                         try:
-                            require_no_maintenance(read_bounded(error))
+                            encoding = error.headers.get('Content-Encoding', '').lower()
+                            body = (_DecodedBody(HTTPResponse(
+                                body=error.fp, headers=error.headers, preload_content=False,
+                            )) if encoding in {'br', 'deflate'} else error)
+                            require_no_maintenance(read_bounded(body))
                         finally:
                             error.close()
                     else:

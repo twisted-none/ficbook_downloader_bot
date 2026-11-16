@@ -26,12 +26,15 @@ class MaintenanceRecognitionTests(unittest.TestCase):
 
     def test_public_transport_418_maintenance_is_detected_and_response_closed(self):
         import io
+        import brotli
         from urllib.error import HTTPError
         from src.sources.ao3_status import AO3MaintenanceError
         from src.sources.ficbook import FicbookClient, FicbookAccount
         fetcher = FicbookClient()._build_config(URL, FicbookAccount()).get_fetcher()
-        body = io.BytesIO(DENIED_MAINTENANCE)
-        error = HTTPError(URL, 418, 'Denied', {}, body)
+        compressed = brotli.compress(DENIED_MAINTENANCE)
+        body = io.BytesIO(compressed)
+        headers = {'Content-Encoding': 'br', 'Content-Length': str(len(compressed))}
+        error = HTTPError(URL, 418, 'Denied', headers, body)
         with patch('fanficfare.fetchers.RequestsFetcher.request',
                    side_effect=HTTPErrorFFF(URL, 525, 'TLS failure', b'')) as send, \
                 patch('src.sources.ao3_http.bounded_sleep'), \

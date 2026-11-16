@@ -179,9 +179,13 @@ class ZahlebClient:
                 raise ZahlebAccessError('Взахлёб не отдал главу. Неполная книга не будет отправлена.')
             _check_access(ep)
             owner = ep.get('story')
+            status = ep.get('status', chapter.get('status'))
+            published = status == 'published'
+            if 'status' not in ep and 'status' not in chapter:
+                published = bool(_string(chapter.get('releasedAt')))
             if (ep.get('objectId') != chapter['objectId'] or ep.get('order') != chapter['order']
                     or not isinstance(owner, dict) or owner.get('objectId') != book['objectId']
-                    or ep.get('status') != 'published'):
+                    or not published):
                 raise ZahlebError('Взахлёб вернул неверную или неопубликованную главу.')
             content = ep.get('content')
             if not isinstance(content, list) or not content:

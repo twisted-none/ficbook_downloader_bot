@@ -102,6 +102,14 @@ class ZahlebTests(unittest.TestCase):
             with self.subTest(selected=selected), self.assertRaises(ZahlebError):
                 FakeClient().download(ROOT, chapter_numbers=selected)
 
+    def test_missing_episode_status_requires_publication_in_contents(self):
+        client = FakeClient()
+        client.episodes[FIRST].pop('status')
+        self.assertEqual(len(client.download(ROOT).chapters), 2)
+        client.book['chapters'][1].pop('releasedAt')
+        with self.assertRaises(ZahlebError):
+            client.download(ROOT)
+
     def test_missing_duplicate_or_out_of_order_table_of_contents_fails(self):
         for change in ('missing', 'duplicate', 'gap', 'foreign-id'):
             client = FakeClient()
