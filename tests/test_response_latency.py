@@ -11,6 +11,22 @@ from tests.test_download_status_flow import IncomingMessage
 
 
 class ResponseLatencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ficbook_link_without_work_id_only_sends_a_notice(self):
+        for url in ('https://ficbook.net/readfic', 'https://www.ficbook.net/readfic/?x=1#part_content'):
+            with self.subTest(url=url):
+                message = IncomingMessage()
+                message.text = url
+                data = {}
+                with patch.object(app, '_acknowledge_link', new_callable=AsyncMock) as acknowledge, \
+                        patch.object(app, '_get_user_download_settings', new_callable=AsyncMock) as settings, \
+                        patch.object(app, '_notify_admin', new_callable=AsyncMock) as alert:
+                    await app.RegisterUserMiddleware()(AsyncMock(), message, data)
+                    await app.on_link(message, object(), None, None, object(), object(), frozenset(), **data)
+                self.assertEqual([status.text for status in message.statuses], [app.MISSING_FICBOOK_ID_TEXT])
+                acknowledge.assert_not_awaited()
+                settings.assert_not_awaited()
+                alert.assert_not_awaited()
+
     async def test_unavailable_acknowledgement_does_not_drop_link(self):
         message = IncomingMessage()
         message.text = 'https://ficbook.net/readfic/12531381'

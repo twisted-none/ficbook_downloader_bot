@@ -9,20 +9,23 @@ import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import ThreadedResolver
 
-from src.sources.registry import SUPPORTED_HOST_MARKERS, is_ficbook_collection_url, is_supported_story_url
+from src.sources.registry import (
+    SUPPORTED_HOST_MARKERS, is_ficbook_collection_url, is_ficbook_url_missing_work_id, is_supported_story_url,
+)
 from src.sources.safe_http import is_public_address
 
 MAX_RESPONSE_BYTES = 64 * 1024
 MAX_HOPS = 4
 TIMEOUT_SECONDS = 10
 ERROR_TEXT = "Не удалось безопасно раскрыть ссылку Google. Пришли прямую ссылку на фанфик."
+MISSING_FICBOOK_ID_TEXT = "В ссылке нет ID фанфика. Скопируй полную ссылку со страницы работы."
 _lookups = asyncio.Semaphore(4)
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 class ShareLinkError(Exception):
-    def __init__(self) -> None:
-        super().__init__(ERROR_TEXT)
+    def __init__(self, text: str = ERROR_TEXT) -> None:
+        super().__init__(text)
 
 
 def _parts(url: str) -> SplitResult:
@@ -54,7 +57,7 @@ def extract_download_url(text: str) -> str | None:
         candidate = chunk.strip("()[]<>,.!?\"'")
         try:
             if (is_google_share_url(candidate) or is_ficbook_collection_url(candidate)
-                    or is_supported_story_url(candidate)):
+                    or is_ficbook_url_missing_work_id(candidate) or is_supported_story_url(candidate)):
                 return candidate
         except ValueError:
             continue
@@ -63,6 +66,8 @@ def extract_download_url(text: str) -> str | None:
 
 def _kind(url: str) -> str:
     parts = _parts(url)
+    if is_ficbook_url_missing_work_id(url):
+        raise ShareLinkError(MISSING_FICBOOK_ID_TEXT)
     if is_google_share_url(url):
         return "google"
     if parts.scheme == "https" and parts.hostname in {"google.com", "www.google.com"} and parts.path == "/share.google":

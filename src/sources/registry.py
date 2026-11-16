@@ -182,6 +182,15 @@ def site_key(url: str) -> str:
     return host
 
 
+def is_ficbook_url_missing_work_id(url: str) -> bool:
+    try:
+        parts = _story_parts(url)
+    except ValueError:
+        return False
+    return (parts.hostname.removeprefix('www.') in {'ficbook.net', 'ficbook.com'}
+            and parts.path.lower().rstrip('/') == '/readfic')
+
+
 def is_ficbook_url(url: str) -> bool:
     return site_key(url) == "ficbook.net"
 

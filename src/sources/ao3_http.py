@@ -256,7 +256,7 @@ class AO3RequestsFetcher(RequestsFetcher):
                         try:
                             encoding = error.headers.get('Content-Encoding', '').lower()
                             body = (_DecodedBody(HTTPResponse(
-                                body=error.fp, headers=error.headers, preload_content=False,
+                                body=error.fp, headers=error.headers.items(), preload_content=False,
                             )) if encoding in {'br', 'deflate'} else error)
                             require_no_maintenance(read_bounded(body))
                         finally:

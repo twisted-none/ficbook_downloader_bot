@@ -104,10 +104,13 @@ from src.sources.ficbook import (
 )
 from src.sources.ao3_status import AO3SiteStatus, probe_status as probe_ao3_status
 from src.exporters.formats import ALLOWED_FORMATS, build_docx, build_pdf, build_txt, normalize_formats
-from src.sources.share_links import ShareLinkError, extract_download_url, is_google_share_url, resolve_share_url
+from src.sources.share_links import (
+    MISSING_FICBOOK_ID_TEXT, ShareLinkError, extract_download_url, is_google_share_url, resolve_share_url,
+)
 from src.sources.collections import CollectionError, FicbookCollection
 from src.sources.registry import (
-    SUPPORTED_HOST_MARKERS, is_ficbook_collection_url, normalize_collection_url, normalize_url,
+    SUPPORTED_HOST_MARKERS, is_ficbook_collection_url, is_ficbook_url_missing_work_id,
+    normalize_collection_url, normalize_url,
     site_display_name, site_key,
 )
 from src.monitoring.metrics import run_metrics_server
@@ -418,7 +421,8 @@ class RegisterUserMiddleware(BaseMiddleware):
             _support_waiting, _broadcast_waiting, _reply_waiting, _chapter_waiting,
         ))
         text = getattr(event, 'text', None) or ''
-        if not waiting and not text.lstrip().startswith('/') and extract_download_url(text):
+        url = extract_download_url(text) if not waiting and not text.lstrip().startswith('/') else None
+        if url and not is_ficbook_url_missing_work_id(url):
             status = await _acknowledge_link(event)
             data['initial_status'] = status
             data['acknowledgement_attempted'] = True
@@ -1013,6 +1017,9 @@ async def on_link(
             "Нужна ссылка на Ficbook, Fikbooks, AO3, Wattpad, Hogwartsnet, RanobeLIB, Взахлёб (zahleb.me) или Litnet.",
             reply_markup=_main_keyboard_for_message(message, admin_chat_id),
         )
+        return
+    if is_ficbook_url_missing_work_id(url):
+        await _replace_status_with_notice(message, initial_status, admin_chat_id, MISSING_FICBOOK_ID_TEXT)
         return
     if initial_status is None and not acknowledgement_attempted:
         initial_status = await _acknowledge_link(message)
