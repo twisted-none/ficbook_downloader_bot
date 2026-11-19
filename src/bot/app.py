@@ -1360,7 +1360,7 @@ async def _run_tracked(
     job.task = asyncio.create_task(execute())
     try:
         result = await job.task
-        if entry is not None:
+        if entry is not None and not (redelivery and redelivery.alert and redelivery.alert.get('queued')):
             saved_jobs.finish(entry)
         return result
     except asyncio.CancelledError:
@@ -2290,11 +2290,11 @@ async def run_bot(settings: Settings) -> None:
             redelivery=delivery, opening_page=request.opening_page,
         )
 
-    redelivery = AlertRedelivery(bot, settings.admin_chat_id, analytics_store.alert_retries, redownload)
-    dispatcher['alert_redelivery'] = redelivery
     saved = DownloadJobs(settings.data_dir / 'download-queue.sqlite3', bot.id,
                          limits.max_queue_jobs, limits.max_collection_batches)
     queues.saved_jobs = saved
+    redelivery = AlertRedelivery(bot, settings.admin_chat_id, analytics_store.alert_retries, redownload, saved_jobs=saved)
+    dispatcher['alert_redelivery'] = redelivery
     restore_tasks: dict[int, asyncio.Task] = {}
 
     async def restore(entry):
@@ -2313,8 +2313,13 @@ async def run_bot(settings: Settings) -> None:
                 if source.id != alert['bot_id'] or admin_message.chat.id != settings.admin_chat_id:
                     logger.error('Cannot restore alert retry %s: alert bot or admin chat changed', entry.id)
                     return
-                if await redelivery.retry(admin_message, alert['token']):
-                    saved.finish(entry)
+                while entry.id in saved.entries:
+                    if await redelivery.retry(admin_message, alert['token']):
+                        saved.finish(entry)
+                        break
+                    if saved.paused:
+                        break
+                    await asyncio.sleep(30)
             elif payload['kind'] == 'collection':
                 selection = payload.get('collection')
                 await _process_collection(message, client, settings.admin_chat_id, alert_bot, analytics_store,
@@ -2347,6 +2352,7 @@ async def run_bot(settings: Settings) -> None:
                 restore_tasks[entry.id] = asyncio.create_task(restore(entry))
 
     dispatcher['restore_downloads'] = restore_downloads
+    redelivery.schedule = restore_downloads
     try:
         await _set_bot_commands(bot, settings.admin_chat_id)
         restore_downloads()

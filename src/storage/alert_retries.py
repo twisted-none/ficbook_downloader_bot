@@ -140,6 +140,16 @@ class AlertRetryStore:
             db.execute('UPDATE alert_retries SET message_id = %s WHERE token = %s AND message_id IS NULL',
                        (message_id, token))
 
+    def replace_message(self, token: str, previous_id: int, message_id: int) -> None:
+        with self.connect() as db:
+            row = db.execute(
+                'UPDATE alert_retries SET message_id = %s, expires_at = now() + interval \'30 days\' '
+                'WHERE token = %s AND message_id IN (%s, %s) RETURNING token',
+                (message_id, token, previous_id, message_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError('Retry alert could not be rebound')
+
     def claim(self, token: str, bot_id: int, admin_chat_id: int, message_id: int) -> RetryClaim | None:
         connection = self.connect()
         db = connection.__enter__()

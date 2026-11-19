@@ -64,6 +64,18 @@ class AlertRetryStorageTests(unittest.TestCase):
         self.assertFalse(claim.request.cover_enabled)
         self.assertEqual(claim.request.opening_page, 'annotation')
 
+    def test_replacement_alert_invalidates_old_button_and_preserves_receipts(self):
+        token = self.create()
+        claim = self.store.claim(token, 123456, 9, 12)
+        claim.record_sent('epub')
+        claim.close()
+        self.store.replace_message(token, 12, 55)
+        self.store.replace_message(token, 12, 55)
+        self.assertIsNone(self.store.claim(token, 123456, 9, 12))
+        replacement = self.store.claim(token, 123456, 9, 55)
+        self.addCleanup(replacement.close)
+        self.assertEqual(replacement.request.sent_formats, ('epub',))
+
     def test_concurrent_duplicates_reserve_only_one_alert(self):
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(self.create)
