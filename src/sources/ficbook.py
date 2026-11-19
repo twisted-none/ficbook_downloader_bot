@@ -26,7 +26,7 @@ from fanficfare.configurable import Configuration
 from fanficfare.exceptions import HTTPErrorFFF
 
 from src.sources.ao3 import AO3WorkUnavailableError, download_html_chapters
-from src.sources.ao3_status import AO3MaintenanceError
+from src.sources.ao3_status import AO3MaintenanceError, AO3RateLimitError
 from src.sources.collections import FicbookCollection, load_collection
 from src.sources.fikbooks import FikbooksClient, FikbooksError, FikbooksNotFoundError, FikbooksRateLimitError
 from src.sources.zahleb import ZahlebClient, ZahlebError, ZahlebNotFoundError, ZahlebRateLimitError
@@ -296,6 +296,8 @@ class FicbookClient:
                     validate_story(result)
                     return result
                 except FicbookRateLimitError as exc:
+                    if _site_key(normalized) == 'archiveofourown.org':
+                        raise
                     last_rate_limit = exc
                     logger.warning(
                         "%s rate limit for account %s/%s, attempt %s/%s",
@@ -350,6 +352,8 @@ class FicbookClient:
                     validate_preview(result)
                     return result
                 except FicbookRateLimitError as exc:
+                    if _site_key(normalized) == 'archiveofourown.org':
+                        raise
                     last_rate_limit = exc
                     if attempt >= attempts:
                         break
@@ -378,6 +382,8 @@ class FicbookClient:
             raise
         except AO3MaintenanceError as exc:
             raise AO3SiteUnavailableError(str(exc)) from exc
+        except AO3RateLimitError as exc:
+            raise FicbookRateLimitError(str(exc), retry_after=exc.retry_after) from exc
         except AO3WorkUnavailableError as exc:
             raise FicbookError(str(exc)) from exc
         except Exception as exc:
@@ -664,7 +670,8 @@ class FicbookClient:
             raise FicbookNotFoundError("Не удалось найти фанфик по этой ссылке.") from exc
         except Exception as exc:
             if _is_rate_limited(exc):
-                raise FicbookRateLimitError("Сайт временно ограничил запросы.", technical=repr(exc)) from exc
+                raise FicbookRateLimitError("Сайт временно ограничил запросы.", technical=repr(exc),
+                                           retry_after=getattr(exc, 'retry_after', None)) from exc
             raise _friendly_download_error(normalized, exc) from exc
         return self._story_from_fanficfare_metadata(story, normalized, chapters)
 
@@ -712,7 +719,8 @@ class FicbookClient:
             raise FicbookNotFoundError("Не удалось найти фанфик по этой ссылке.") from exc
         except Exception as exc:
             if _is_rate_limited(exc):
-                raise FicbookRateLimitError("Сайт временно ограничил запросы.", technical=repr(exc)) from exc
+                raise FicbookRateLimitError("Сайт временно ограничил запросы.", technical=repr(exc),
+                                           retry_after=getattr(exc, 'retry_after', None)) from exc
             raise _friendly_preview_error(normalized, exc) from exc
         return StoryPreview(
             title=story.getMetadata("title") or "fanfic",

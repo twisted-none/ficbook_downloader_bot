@@ -17,7 +17,7 @@ from src.core.limits import (ResourceLimitError, check_chapter_count, check_dead
 from src.core.models import Chapter, ChapterPreview, Story, StoryPreview
 from src.core.progress import report_title
 from src.sources.ao3 import parse_download, require_available_work
-from src.sources.ao3_status import AO3MaintenanceError, require_no_maintenance
+from src.sources.ao3_status import AO3MaintenanceError, AO3RateLimitError, require_no_maintenance
 from src.sources.safe_http import require_https_url
 
 logger = logging.getLogger(__name__)
@@ -96,7 +96,10 @@ def fetch_bundle(url: str) -> dict:
             data = json.loads(read_bounded(response))
     except HTTPError as error:
         status = error.code
+        limited = AO3RateLimitError(error.headers) if status == 429 else None
         error.close()
+        if limited is not None:
+            raise limited from None
         if status == 409:
             raise AO3MaintenanceError('AO3 сейчас на техническом обслуживании.') from None
         if status == 503:

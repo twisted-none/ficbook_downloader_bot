@@ -22,7 +22,7 @@ from src.core.limits import (ResponseLimitError, bounded_sleep, check_deadline, 
                              read_bounded, request_timeout)
 from src.sources.fanficfare_http import SafeFanficFareFetcher
 from src.sources.ao3 import require_available_work
-from src.sources.ao3_status import require_no_maintenance
+from src.sources.ao3_status import AO3RateLimitError, require_no_maintenance
 from src.sources.collection_http import BrowserCollectionClient
 from src.sources.safe_http import (DeadlineHTTPResponse, UnsafeRequestError,
                                    require_https_url, resolve_addresses)
@@ -139,6 +139,9 @@ class AO3Adapter(HTTPAdapter):
                 payload = read_bounded(_DecodedBody(response.raw))
             response._content = payload
             response._content_consumed = True
+            if response.status_code == 429:
+                require_no_maintenance(payload)
+                raise AO3RateLimitError(response.headers)
             return response
         finally:
             response.close()
@@ -263,6 +266,8 @@ class AO3RequestsFetcher(RequestsFetcher):
                             error.close()
                     else:
                         require_no_maintenance(getattr(error, 'data', None) or b'')
+                    if getattr(error, 'code', getattr(error, 'status_code', None)) == 429:
+                        raise AO3RateLimitError(getattr(error, 'headers', None) or {}) from error
                     failures.append(_failure_summary(transport, error))
                     if isinstance(error, HTTPError):
                         error.close()

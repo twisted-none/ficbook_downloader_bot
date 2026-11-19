@@ -21,6 +21,11 @@ class Maintenance(Exception):
     pass
 
 
+class RateLimited(Exception):
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+
+
 def work_document(page):
     return page.evaluate('''() => {
       const root = document.querySelector('#main');
@@ -104,7 +109,9 @@ def run(identifier):
                     /(?:ao3|the archive|archive of our own) (?:is )?(?:temporarily |currently )?down for (?:scheduled )?maintenance/.test(text);
                 }'''):
                     raise Maintenance()
-                if response and response.status in {401, 404, 429}:
+                if response and response.status == 429:
+                    raise RateLimited(response.headers.get('retry-after', ''))
+                if response and response.status in {401, 404}:
                     raise ValueError(f'AO3 HTTP {response.status}')
                 if response and response.status == 403 and not response.headers.get('cf-mitigated') == 'challenge':
                     raise ValueError('AO3 denied public access')
@@ -177,6 +184,8 @@ if __name__ == '__main__':
         bundle = run(identifier)
     except Maintenance:
         bundle = {'work_id': identifier, 'maintenance': True}
+    except RateLimited as error:
+        bundle = {'work_id': identifier, 'rate_limited': True, 'retry_after': error.retry_after}
     result = json.dumps(bundle, ensure_ascii=False).encode('utf-8')
     if len(result) > MAX_BYTES:
         raise SystemExit(3)

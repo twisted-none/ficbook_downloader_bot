@@ -4,10 +4,24 @@ from enum import Enum
 import logging
 import os
 import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+
+class AO3RateLimitError(Exception):
+    def __init__(self, headers):
+        super().__init__('AO3 HTTP 429: запросы временно ограничены.')
+        value = headers.get('Retry-After', '')
+        try:
+            delay = float(value) if value.strip().isdigit() else (
+                parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+            self.retry_after = max(1, delay)
+        except (ValueError, TypeError, OverflowError):
+            self.retry_after = None
 
 
 class AO3MaintenanceError(Exception):

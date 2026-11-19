@@ -239,7 +239,15 @@ def queue_status(
     *,
     ficbook_unavailable: bool = False,
     ao3_maintenance: bool = False,
+    ao3_rate_limited: bool = False,
 ) -> str:
+    if ao3_rate_limited:
+        return progress_text('\n'.join([
+            f'Место в очереди: {position}.',
+            'AO3 временно ограничил запросы.',
+            'Работа сохранена в очереди. Загрузка продолжится автоматически после паузы.',
+            '', f'Форматы: {format_list(formats)}.',
+        ]), 0)
     if ao3_maintenance:
         return progress_text('\n'.join([
             f'Место в очереди: {position}.',

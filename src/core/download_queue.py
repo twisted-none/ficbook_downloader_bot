@@ -354,6 +354,8 @@ class DownloadQueuePool:
         self._site_state_lock = Lock()
         self._unavailable_sites: set[str] = set()
         self.ao3_recovery = SiteRecovery(interval=300)
+        self.ao3_request_lock = asyncio.Lock()
+        self.ao3_retry_at = 0.0
         self.saved_jobs: DownloadJobs | None = None
 
     async def counts_by_site(self) -> dict[str, tuple[int, int]]:

@@ -8,6 +8,7 @@ from fanficfare.fetchers.base_fetcher import FetcherResponse
 
 from src.sources.ficbook import (FicbookAccount, FicbookClient, _friendly_download_error,
                                  _friendly_preview_error, _is_ao3_transient_failure)
+from src.sources.ao3_status import AO3RateLimitError
 
 URL = 'https://archiveofourown.org/works/14860466?view_adult=true'
 
@@ -64,7 +65,8 @@ class AO3RecoveryTests(unittest.TestCase):
         for code in (401, 403, 404, 429, 526):
             self.browser.reset_mock()
             with self.subTest(code=code), patch('fanficfare.fetchers.RequestsFetcher.request',
-                    side_effect=HTTPErrorFFF(URL, code, 'Denied')) as send, self.assertRaises(HTTPErrorFFF):
+                    side_effect=HTTPErrorFFF(URL, code, 'Denied')) as send, \
+                    self.assertRaises(AO3RateLimitError if code == 429 else HTTPErrorFFF):
                 self.fetcher.request('GET', URL)
             self.assertEqual(send.call_count, 1)
             self.browser.assert_not_called()
@@ -89,7 +91,7 @@ class AO3RecoveryTests(unittest.TestCase):
         from urllib.error import HTTPError
         self.browser.return_value.fetch.side_effect = HTTPError(URL, 429, 'Limit', {}, None)
         with patch('fanficfare.fetchers.RequestsFetcher.request', side_effect=requests.Timeout('timeout')) as send:
-            with self.assertRaises(requests.Timeout):
+            with self.assertRaises(AO3RateLimitError):
                 self.fetcher.request('GET', URL)
         self.assertEqual(send.call_count, 1)
 

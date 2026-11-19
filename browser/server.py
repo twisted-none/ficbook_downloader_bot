@@ -54,6 +54,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
+        if code == 429:
+            retry_after = json.loads(body).get('retry_after')
+            if isinstance(retry_after, str) and len(retry_after) <= 128 and '\r' not in retry_after and '\n' not in retry_after:
+                self.send_header('Retry-After', retry_after)
         self.send_header('Connection', 'close')
         self.end_headers()
         self.wfile.write(body)
@@ -68,7 +72,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(503, b'{"error":"busy"}')
         try:
             payload = download('status' if self.path == '/status' else match[1])
-            self.respond(409 if json.loads(payload).get('maintenance') is True else 200, payload)
+            result = json.loads(payload)
+            code = 409 if result.get('maintenance') is True else 200
+            if result.get('rate_limited') is True:
+                code = 429
+            self.respond(code, payload)
         except subprocess.TimeoutExpired:
             try:
                 self.respond(502, b'{"error":"timeout"}')

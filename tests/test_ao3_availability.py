@@ -73,7 +73,8 @@ class AO3AvailabilityTests(unittest.TestCase):
         for method, code, body in (('GET', 403, b'Forbidden'), ('POST', 525, b''), ('GET', 429, b'')):
             with self.subTest(method=method, code=code):
                 with patch('fanficfare.fetchers.RequestsFetcher.request', side_effect=HTTPErrorFFF(URL, code, 'Denied', body)) as send:
-                    with self.assertRaises(HTTPErrorFFF):
+                    from src.sources.ao3_status import AO3RateLimitError
+                    with self.assertRaises(AO3RateLimitError if code == 429 else HTTPErrorFFF):
                         fetcher.request(method, URL)
                 self.assertEqual(send.call_count, 1)
 
@@ -94,7 +95,8 @@ class AO3AvailabilityTests(unittest.TestCase):
         for method, code in (('POST', 525), ('GET', 429)):
             with self.subTest(method=method, code=code), \
                     patch('fanficfare.fetchers.RequestsFetcher.request', side_effect=HTTPErrorFFF(URL, code, 'Denied')):
-                with self.assertRaises(HTTPErrorFFF):
+                from src.sources.ao3_status import AO3RateLimitError
+                with self.assertRaises(AO3RateLimitError if code == 429 else HTTPErrorFFF):
                     fetcher.request(method, URL)
         self.browser.assert_not_called()
 
