@@ -8,7 +8,9 @@ import zipfile
 
 VERSION = '156.0.1-beta.36'
 SHA256 = '72637885ee67c93466ad377831c647192f8f08fb5c6fd9279de1320b49dd2b53'
-URL = f'https://github.com/daijro/camoufox/releases/download/v{VERSION}/camoufox-{VERSION}-lin.x86_64.zip'
+# Backup of the original release, with the same pinned SHA256.
+URL = ('https://github.com/jo-inc/camofox-browser/releases/download/'
+       f'camoufox-backup-404310733/camoufox-{VERSION}-lin.x86_64.zip')
 ARCHIVE = Path(f'/opt/browser-asset-cache/camoufox-{VERSION}.zip')
 DESTINATION = Path('/opt/camoufox')
 LIMIT = 1_500_000_000
