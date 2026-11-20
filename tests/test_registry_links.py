@@ -17,6 +17,8 @@ class RegistryLinkTests(unittest.TestCase):
              'https://archiveofourown.org/works/123/chapters/456'),
             ('https://www.wattpad.com/story/123-name', 'https://www.wattpad.com/story/123-name'),
             ('https://www.wattpad.com/123-chapter', 'https://www.wattpad.com/123-chapter'),
+            ('https://www.wattpad.com/amp/692164426', 'https://www.wattpad.com/692164426'),
+            ('http://wattpad.com/amp/692164426-title/', 'https://www.wattpad.com/692164426'),
             ('https://hogwartsnet.ru/mfanf/ffshowfic.php?fid=123',
              'https://hogwartsnet.ru/mfanf/ffshowfic.php?fid=123'),
             ('https://litnet.com/ru/book/title-b123', 'https://litnet.com/ru/reader/title-b123'),

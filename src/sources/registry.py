@@ -19,6 +19,7 @@ FICBOOK_ID_PATTERN = r'(?:[0-9]+|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})'
 _COLLECTION_PATH = re.compile(rf'/collections/({FICBOOK_ID_PATTERN})(?:/(?:page|p)/[0-9]{{1,9}})?/?', re.I)
 FIKBOOKS_HOSTS = frozenset({'fikbooks.ru', 'www.fikbooks.ru'})
 FIKBOOKS_PATH = re.compile(r'/readfic/([1-9][0-9]{0,17})(?:/([1-9][0-9]{0,17}))?/?')
+WATTPAD_AMP_PATH = re.compile(r'/amp/([0-9]+)(?:-[^/]+)?/?', re.I)
 ZAHLEB_HOSTS = frozenset({'zahleb.me', 'www.zahleb.me'})
 ZAHLEB_PATH = re.compile(r'/story/((?:[A-Za-z0-9][A-Za-z0-9_-]{0,240}-)?([A-Za-z0-9]{10}))'
                          r'(?:/([A-Za-z0-9]{10}))?/?')
@@ -98,6 +99,10 @@ def normalize_url(url: str) -> str:
         scheme = "https"
         host = "ranobelib.me"
     path = parts.path.rstrip("/")
+    if host.removeprefix('www.') == 'wattpad.com':
+        amp = WATTPAD_AMP_PATH.fullmatch(path)
+        if amp:
+            scheme, host, path = 'https', 'www.wattpad.com', '/' + amp.group(1)
     # Keep only parameters with meaning for the downloader. Never forward arbitrary
     # user parameters (including redirect destinations) to a source site.
     query = ''
@@ -155,7 +160,8 @@ def is_supported_story_url(url: str) -> bool:
     if host == "archiveofourown.org":
         return "/works/" in path
     if host == "wattpad.com":
-        return path.startswith("/story/") or bool(re.match(r"/[0-9]+", path))
+        return (path.startswith("/story/") or bool(re.match(r"/[0-9]+", path))
+                or WATTPAD_AMP_PATH.fullmatch(path) is not None)
     if host == "hogwartsnet.ru":
         return "/mfanf/ffshowfic.php" in path and bool(parse_qs(parts.query).get("fid"))
     if host == "litnet.com":
